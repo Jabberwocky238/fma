@@ -6,10 +6,12 @@ wall time and SHA-256 for both directions. No Docker or local fma spool.
 """
 import argparse
 import base64
+from datetime import datetime, timezone
 import hashlib
 import http.client
 import json
 import os
+import random
 import re
 from pathlib import Path
 import signal
@@ -49,6 +51,7 @@ class Measurement:
         self.pid = pid
         self.peak, self.cpu_start = process_usage(pid)
         self.rss_start = self.peak
+        self.started_utc = datetime.now(timezone.utc).isoformat()
         self.started = time.monotonic()
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.sample, daemon=True)
@@ -67,7 +70,9 @@ class Measurement:
         elapsed = time.monotonic() - self.started
         cpu_used = cpu - self.cpu_start
         peak = max(rss, self.peak)
-        return {'elapsed_seconds': round(elapsed, 3),
+        return {'started_utc': self.started_utc,
+                'finished_utc': datetime.now(timezone.utc).isoformat(),
+                'elapsed_seconds': round(elapsed, 3),
                 'cpu_seconds': round(cpu_used, 3),
                 'average_cpu_percent_one_core': round(100 * cpu_used / elapsed, 2),
                 'peak_rss_bytes': peak, 'initial_rss_bytes': self.rss_start,
@@ -75,7 +80,7 @@ class Measurement:
                 'rss_sample_interval_seconds': .05}
 
 
-def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_transfer):
+def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_transfer, repeat_jmap=False):
     """Real MIME attachment IO, with no full-message client buffers."""
     import imaplib
     import smtplib
@@ -195,6 +200,9 @@ def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_
         copy_exact(response, size, attachment_hash.hexdigest())
         assert response.read(1) == b''
     phase('jmap_attachment_download', attachment_download)
+    if repeat_jmap:
+        assert phase('jmap_repeat_metadata', attachment_metadata) == blob_id
+        phase('jmap_repeat_download', attachment_download)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -204,10 +212,12 @@ def main():
     parser.add_argument('--mail', action='store_true', help='also send and receive a real MIME attachment through SMTP, IMAP, POP3 and JMAP')
     parser.add_argument('--data', choices=['compressible', 'incompressible'], default='incompressible')
     parser.add_argument('--smtp-transfer', choices=['data', 'bdat'], default='data', help='SMTP DATA or advertised CHUNKING/BDAT; reports them separately')
+    parser.add_argument('--repeat-jmap', action='store_true', help='repeat metadata and attachment download to separate locator reuse from first-download work')
+    parser.add_argument('--seed', type=int, help='reproducible random fixture seed for paired performance comparisons')
     args = parser.parse_args()
     # Repeat a random 1 MiB block: its period exceeds gzip's 32 KiB window.
     # Generate it outside the timed phase, keeping client memory bounded.
-    block = BLOCK if args.data == 'compressible' else os.urandom(1 << 20)
+    block = BLOCK if args.data == 'compressible' else (random.Random(args.seed).randbytes(1 << 20) if args.seed is not None else os.urandom(1 << 20))
     assert args.size_mib > 0
     size = args.size_mib << 20
     fals3y_requested = os.environ.get('FALS3Y_BIN', str(Path.home() / '.local/bin/fals3y'))
@@ -215,7 +225,7 @@ def main():
     with open(fals3y, 'rb') as executable:
         fals3y_sha256 = hashlib.file_digest(executable, 'sha256').hexdigest()
     fals3y_version = subprocess.run([fals3y, 'version'], capture_output=True, text=True, timeout=10)
-    results = {'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
+    results = {'fixture_seed': args.seed, 'repeat_jmap': args.repeat_jmap, 'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
                'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                'pop3_module': json.loads(subprocess.check_output(
                    ['go', 'list', '-m', '-json', 'github.com/Jabberwocky238/go-pop3'], cwd=ROOT, text=True)),
@@ -228,6 +238,8 @@ def main():
         tmp = Path(directory)
         binary = tmp / 'fma'
         subprocess.run(['go', 'build', '-trimpath', '-o', str(binary), '.'], cwd=ROOT, check=True)
+        with binary.open('rb') as executable:
+            results['binary_sha256'] = hashlib.file_digest(executable, 'sha256').hexdigest()
         s3port, port = free_port(), free_port()
         endpoint = f'http://127.0.0.1:{s3port}'
         def s3request(key, method='GET', data=None):
@@ -332,7 +344,7 @@ def main():
             results['phases']['download'] = measure.finish()
             assert received == size and digest.hexdigest() == results['sha256'], (received, digest.hexdigest())
             if args.mail:
-                mail_benchmark(proc, mail_ports, conn, auth, account, size, block, results, args.smtp_transfer)
+                mail_benchmark(proc, mail_ports, conn, auth, account, size, block, results, args.smtp_transfer, args.repeat_jmap)
             conn.close()
             assert list(work.iterdir()) == [], 'fma wrote local temporary data'
             assert max(phase['peak_rss_bytes'] for phase in results['phases'].values()) <= args.max_rss_mib << 20, results

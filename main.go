@@ -4075,8 +4075,53 @@ func (s jmapBlobs) openPart(ctx context.Context, acct jmap.Id, part jmapPartMani
 			body = p
 		}
 	}
-	return &sectionReadCloser{Reader: decodeMIME(body, h), Closer: source}, nil
+	return &jmapDownloadReader{ctx: ctx, reader: decodeMIME(body, h), Closer: source}, nil
 }
+
+// Fill the caller's buffer before returning decoded attachment bytes. Base64
+// produces short reads (at most 768 bytes), which otherwise become millions of
+// small HTTP writes. No attachment-sized allocation or read-ahead is needed.
+type jmapDownloadReader struct {
+	io.Closer
+	ctx    context.Context
+	reader io.Reader
+	err    error
+}
+
+// Keep HTTP's ReaderFrom fast path from choosing a smaller output buffer. Both
+// wrappers deliberately expose only Read/Write, preventing io.Copy recursion.
+// The shared pool bounds memory across concurrent transfers.
+func (r *jmapDownloadReader) WriteTo(w io.Writer) (int64, error) {
+	return copyStream(r.ctx, struct{ io.Writer }{w}, struct{ io.Reader }{r})
+}
+
+func (r *jmapDownloadReader) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	p = p[:min(len(p), 128<<10)]
+	for empty := 0; n < len(p); {
+		if r.err != nil {
+			return n, r.err
+		}
+		if r.err = r.ctx.Err(); r.err != nil {
+			return n, r.err
+		}
+		var k int
+		k, r.err = r.reader.Read(p[n:])
+		n += k
+		if k == 0 && r.err == nil {
+			empty++
+			if empty == 100 {
+				r.err = io.ErrNoProgress
+			}
+		} else {
+			empty = 0
+		}
+	}
+	return n, r.err
+}
+
 func (a *jmapAccount) findPart(ctx context.Context, h textproto.MIMEHeader, r io.Reader, wanted, source jmap.Id, indices []int) (jmapPartManifest, bool, error) {
 	var empty jmapPartManifest
 	if err := ctx.Err(); err != nil {

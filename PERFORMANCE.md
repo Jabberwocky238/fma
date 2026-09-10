@@ -937,3 +937,146 @@ from the measurement artifact's creation/last-write metadata. Evidence:
 /tmp/fma-bottleneck-repeat.json. All hashes and the 256 MiB RSS ceiling passed.
 The only repository change from this investigation is this documentation;
 experimental runtime and library changes remain in temporary files for follow-up.
+
+
+## JMAP attachment output batching: implemented and paired 2 GiB results
+
+This follow-up implements bounded decoded-output aggregation in `main.go`.
+`openPart` now returns `jmapDownloadReader`: short Base64 reads fill the caller's
+buffer, and its `WriteTo` uses the existing shared 128 KiB copy-buffer pool.
+Explicit Read/Write-only wrappers prevent recursive `io.Copy` dispatch and stop
+HTTP's `ReaderFrom` from selecting a smaller output buffer. The reader preserves
+partial data and terminal errors, checks cancellation between reads, bounds
+consecutive empty reads, and delegates Close to the original source. It does not
+retain a decoded attachment. The pool has 32 slots shared with existing copy
+operations; JMAP HTTP admission remains four concurrent requests.
+
+Baseline runtime is the `main.go` at commit `6c9db2c` (unchanged since `077b404`),
+compiled through a Go overlay pointing at its saved source. The after variant
+contains this output change. Both use Go 1.25.3 on the same Apple M4 darwin/arm64
+host and Fals3y 0.3.1-dev.b8e48bf. Dependencies are unchanged: naust-jmap core
+v0.4.2, mail v0.3.3, POP3 fork v0.1.6, SMTP fork
+v0.25.1-0.20260910174640-b0673510e580, and klauspost/compress v1.20.0.
+Repository and upstream PR links are retained in the earlier version tables.
+
+The updated `scripts/test_streaming.py` supports `--repeat-jmap` and `--seed`.
+Reproduce the after runs with `python3 scripts/test_streaming.py --mail
+--repeat-jmap --seed 20260910 --report /tmp/fma-jmap.json` (one shell command;
+default size is 2048 MiB). Add `--data compressible` for the compressed fixture.
+The low-compressibility fixture repeats a seeded random 1 MiB block, whose period
+exceeds gzip's window; each before/after pair has identical attachment and MIME
+SHA-256 values. Each run starts a fresh server and storage fixture, runs
+sequentially without a CPU profiler or concurrent test suite, then downloads the
+same attachment twice. First download includes locator discovery; repeat download
+reuses the locator. Both still read, decode, transfer and hash all 2 GiB.
+
+CPU is fma process CPU time, excluding Fals3y and the Python client; 100% average
+CPU means one logical core. RSS is the whole fma process sampled every 50 ms,
+not an allocation count or an attributable per-buffer measurement. Every run
+passed the 256 MiB sampled peak ceiling, complete content hashes, protocol checks,
+interrupted-upload checks, and the no-local-spool assertion. Two low-compressibility
+pairs and one compressible pair establish the observed improvement, not a broad
+statistical latency guarantee.
+
+### Paired JMAP results
+
+All durations are seconds. Metadata precedes the first download and is **not**
+included in the download column; the combined column includes both.
+
+| Run | Metadata | First download | Metadata + first download | Repeat metadata | Repeat download |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| before-1 | 5.128 | 13.863 | 18.991 | 5.153 | 9.558 |
+| after-1 | 5.125 | 8.422 | 13.547 | 5.123 | 3.976 |
+| before-2 | 5.228 | 13.830 | 19.058 | 5.134 | 9.563 |
+| after-2 | 5.176 | 8.505 | 13.681 | 5.150 | 3.981 |
+| before-compressed | 5.520 | 15.630 | 21.150 | 6.413 | 15.897 |
+| after-compressed | 5.576 | 9.417 | 14.993 | 5.596 | 4.498 |
+
+| Run | Download | CPU (s) | Average one-core CPU | Initial RSS (bytes) | Peak RSS (bytes) | Sampled increase (bytes) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| before-1 | first | 16.880 | 121.76% | 190480384 | 190578688 | 98304 |
+| before-1 | repeat | 12.340 | 129.11% | 190611456 | 190611456 | 0 |
+| after-1 | first | 9.040 | 107.34% | 185057280 | 187858944 | 2801664 |
+| after-1 | repeat | 4.330 | 108.89% | 188760064 | 190234624 | 1474560 |
+| before-2 | first | 17.010 | 122.99% | 198590464 | 198623232 | 32768 |
+| before-2 | repeat | 12.480 | 130.51% | 198656000 | 198672384 | 16384 |
+| after-2 | first | 9.150 | 107.59% | 185384960 | 188022784 | 2637824 |
+| after-2 | repeat | 4.360 | 109.53% | 188891136 | 190316544 | 1425408 |
+| before-compressed | first | 18.630 | 119.19% | 108068864 | 108068864 | 0 |
+| before-compressed | repeat | 20.380 | 128.20% | 108101632 | 108118016 | 16384 |
+| after-compressed | first | 9.470 | 100.56% | 108347392 | 108445696 | 98304 |
+| after-compressed | repeat | 4.590 | 102.05% | 108478464 | 108658688 | 180224 |
+
+First download, low-compressibility two-run mean: **13.8465 → 8.4635 s** (38.9% less wall time); CPU **16.945 → 9.095 s** (46.3% less CPU time).
+
+Repeat download, low-compressibility two-run mean: **9.5605 → 3.9785 s** (58.4% less wall time); CPU **12.410 → 4.345 s** (65.0% less CPU time).
+
+The 3-second target is still unmet, including for repeat attachment downloads.
+Metadata parsing and the first-download `findPart` full decode/hash pass are
+unchanged. Eliminating that extra scan needs trusted attachment identity and MIME
+locator information shared from the metadata parser; the current mail library's
+public EmailConfig has no hook exposing that parse result. Metadata caching also
+needs account/source scoping and parser-version invalidation. The output change
+makes no claim to have implemented either cache or to have eliminated Base64/gzip
+work. The earlier temporary aggregation measurements remain historical and are
+not substituted for the implemented reader's paired results.
+
+### Other protocol measurements from the same runs
+
+These are controls, not speedup claims for unchanged protocols. Durations are
+seconds; the complete reports retain CPU/RSS and stream-stage timings.
+
+| Run | Raw upload | Raw download | SMTP DATA | IMAP download | IMAP APPEND | POP3 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| before-1 | 1.925 | 0.873 | 5.586 | 2.041 | 4.161 | 1.884 |
+| after-1 | 1.828 | 0.887 | 5.457 | 2.018 | 3.884 | 1.854 |
+| before-2 | 1.813 | 0.869 | 5.433 | 1.957 | 3.937 | 1.842 |
+| after-2 | 1.818 | 0.886 | 5.420 | 1.951 | 3.885 | 1.789 |
+| before-compressed | 1.429 | 0.857 | 7.062 | 2.096 | 4.891 | 2.236 |
+| after-compressed | 1.428 | 0.868 | 7.063 | 2.103 | 4.921 | 2.254 |
+
+### UTC and executable provenance
+
+The following bounds are actual UTC timestamps captured at each JMAP measurement
+boundary, from the first metadata request through the end of repeat download.
+They are not inferred from log creation times. Individual phase timestamps,
+monotonic elapsed durations, fixture hashes and executable hashes are in
+`/tmp/fma-jmap-paired-{before,after}-{1,2,compressed}.json`. Console output is kept
+outside the document in the matching `.log` files. These local artifacts are
+supplementary; the measured tables remain here.
+
+| Run | JMAP start UTC | JMAP finish UTC |
+| --- | --- | --- |
+| before-1 | 2026-09-10T19:30:36.423225+00:00 | 2026-09-10T19:31:10.134084+00:00 |
+| after-1 | 2026-09-10T19:31:39.730065+00:00 | 2026-09-10T19:32:02.384072+00:00 |
+| before-2 | 2026-09-10T19:32:35.149339+00:00 | 2026-09-10T19:33:08.913006+00:00 |
+| after-2 | 2026-09-10T19:33:28.781198+00:00 | 2026-09-10T19:33:51.600964+00:00 |
+| before-compressed | 2026-09-10T19:34:14.402681+00:00 | 2026-09-10T19:34:57.871185+00:00 |
+| after-compressed | 2026-09-10T19:36:39.784611+00:00 | 2026-09-10T19:37:04.880286+00:00 |
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Baseline main.go | c36bf5d7f995eab8e0a2f86cc4168e83134124af3aca144df91e57f524f0657d |
+| Optimized main.go | d651e78e444f2148ad70aeb0b205dd36bc2a531ff5cd5854d87c81980fe4359c |
+| before executable | ce46a4736155d1fb04383755ab6d94a77f817df42a82dba70e9e785685b61543 |
+| after executable | 9a3705bcf108091cf9bc5d207e3c6ff598b109a29eb8169bf31958c6c3074eac |
+| Fals3y executable | 1298e405c1631fbded92892eadc7252d8e2e319dfdf42f48c188ae3fd82ffb4b |
+| incompressible attachment | 70ee1bb08fc817e52cdde811bfd8860d092fdefef4cd1a07038510a71da71acc |
+| incompressible MIME | a3096ef28f2bb06b8fc473710cc19bbe046a14bcd2f94c6dd889fad10c866e59 |
+| compressible attachment | 36a084c480d42b87482e186b191c8d0a26e088205a6278d100c092e9bc166f65 |
+| compressible MIME | 4636132035f0177dc958563b65a003ba7bf8af10f57015e75c0f157796edcb2b |
+
+One after/compressible attempt failed before measurements because Fals3y could
+not bind port 61894. Its startup failure is retained at
+`/tmp/fma-jmap-paired-after-compressed-startup-failure.log`; the table contains
+the completed retry, not a selectively discarded measured sample.
+
+Validation: `make test` and `make build` passed after the implementation. The
+new Go regressions check decoded byte equality and 128 KiB write batching even
+when the destination exposes ReaderFrom, partial EOF/corruption errors,
+cancellation and source closure, bounded read-ahead, empty-reader termination,
+and short/failed writes with pooled-buffer return. The full suite also passed
+race detection, JMAP exact binary/empty attachment downloads, account isolation,
+restart and cross-protocol checks, plus the existing 32 MiB streaming test.
+Validation output remains outside the document in
+`/tmp/fma-jmap-optimized-tests.log` and `/tmp/fma-jmap-optimized-build.log`.

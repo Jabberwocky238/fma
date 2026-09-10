@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -1873,5 +1874,116 @@ func TestS3NamedObjectCollisionAndLegacyRead(t *testing.T) {
 	checkError(t, err)
 	if n != 8 || string(data) != "old blob" {
 		t.Fatal("legacy blob no longer readable")
+	}
+}
+
+// Exercise the actual HTTP copy pattern, including malformed MIME and readers
+// that return data together with an error. A bounded number of writes is the
+// regression check for the short-read bottleneck.
+type jmapReadFunc func([]byte) (int, error)
+
+func (f jmapReadFunc) Read(p []byte) (int, error) { return f(p) }
+
+type jmapCountingWriter struct {
+	bytes.Buffer
+	writes int
+}
+
+func (w *jmapCountingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return w.Buffer.Write(p)
+}
+
+func TestJMAPDownloadReader(t *testing.T) {
+	t.Run("base64 HTTP writes", func(t *testing.T) {
+		want := bytes.Repeat([]byte("attachment\x00\xff"), 100000)
+		encoded := base64.StdEncoding.EncodeToString(want)
+		reader := &jmapDownloadReader{ctx: context.Background(), reader: base64.NewDecoder(base64.StdEncoding, strings.NewReader(encoded))}
+		writer := new(jmapCountingWriter)
+		// The destination also exposes ReadFrom. WriteTo must keep writes
+		// on the bounded copy path instead of dispatching into it.
+		n, err := io.Copy(writer, reader)
+		checkError(t, err)
+		if n != int64(len(want)) || !bytes.Equal(writer.Bytes(), want) {
+			t.Fatal("decoded content changed")
+		}
+		if writer.writes != (len(want)+(128<<10)-1)/(128<<10) {
+			t.Fatalf("short reads escaped to HTTP: %d writes", writer.writes)
+		}
+	})
+	t.Run("errors retain partial bytes", func(t *testing.T) {
+		for _, terminal := range []error{io.EOF, io.ErrUnexpectedEOF, base64.CorruptInputError(3)} {
+			source := jmapReadFunc(func(p []byte) (int, error) { return copy(p, "abc"), terminal })
+			reader := &jmapDownloadReader{ctx: context.Background(), reader: source}
+			p := make([]byte, 20)
+			n, err := reader.Read(p)
+			if n != 3 || string(p[:n]) != "abc" || err != terminal {
+				t.Fatalf("%d %q %v", n, p[:n], err)
+			}
+			n, err = reader.Read(p)
+			if n != 0 || err != terminal {
+				t.Fatalf("terminal error lost: %d %v", n, err)
+			}
+			n, err = reader.Read(nil)
+			if n != 0 || err != nil {
+				t.Fatalf("empty read: %d %v", n, err)
+			}
+		}
+	})
+	t.Run("cancellation and close", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		source := &closeTrackingReader{Reader: jmapReadFunc(func(p []byte) (int, error) {
+			cancel()
+			return copy(p, "abc"), nil
+		})}
+		reader := &jmapDownloadReader{ctx: ctx, reader: source, Closer: source}
+		p := make([]byte, 20)
+		n, err := reader.Read(p)
+		if n != 3 || string(p[:n]) != "abc" || !errors.Is(err, context.Canceled) {
+			t.Fatalf("%d %q %v", n, p[:n], err)
+		}
+		checkError(t, reader.Close())
+		if !source.closed {
+			t.Fatal("source not closed")
+		}
+	})
+	t.Run("no progress", func(t *testing.T) {
+		reader := &jmapDownloadReader{ctx: context.Background(), reader: jmapReadFunc(func([]byte) (int, error) { return 0, nil })}
+		n, err := reader.Read(make([]byte, 20))
+		if n != 0 || err != io.ErrNoProgress {
+			t.Fatalf("%d %v", n, err)
+		}
+	})
+	t.Run("bounded read ahead", func(t *testing.T) {
+		source := &shortErrorReader{left: 1 << 20, err: io.EOF}
+		reader := &jmapDownloadReader{ctx: context.Background(), reader: source}
+		n, err := reader.Read(make([]byte, 1<<20))
+		checkError(t, err)
+		if n != 128<<10 || source.left != (1<<20)-(128<<10) {
+			t.Fatalf("read ahead: %d", n)
+		}
+	})
+}
+
+type jmapWriteFunc func([]byte) (int, error)
+
+func (f jmapWriteFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestJMAPDownloadWriterFailure(t *testing.T) {
+	for _, terminal := range []error{nil, io.ErrClosedPipe} {
+		reader := &jmapDownloadReader{ctx: context.Background(), reader: strings.NewReader(strings.Repeat("x", 1<<20))}
+		before := copyBufferPool.outstanding()
+		n, err := reader.WriteTo(jmapWriteFunc(func(p []byte) (int, error) { return 13, terminal }))
+		want := terminal
+		if want == nil {
+			want = io.ErrShortWrite
+		}
+		if n != 13 || err != want {
+			t.Fatalf("partial write: %d %v", n, err)
+		}
+		if copyBufferPool.outstanding() != before {
+			t.Fatal("writer failure leaked pooled buffer")
+		}
 	}
 }
