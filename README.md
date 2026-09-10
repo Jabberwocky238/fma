@@ -1,6 +1,20 @@
 # fma
 
-A small SMTP, POP3, and IMAP server backed by a single S3 bucket.
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+**fma is a lightweight mail service whose only external service dependency is S3.**
+It supports SMTP, POP3 and IMAP, with a single S3 bucket holding all durable state.
+
+- **High availability:** multiple nodes share one bucket; persisted delivery tasks
+  can be reclaimed after a node crashes.
+- **Concurrent operation:** protocol connections run concurrently, while conditional
+  S3 writes coordinate task ownership and mailbox updates across nodes.
+- **Small footprint:** one Go binary, with no local database, Redis, spool, or Docker
+  requirement. Memory usage and throughput depend on message size, active connections
+  and S3 latency; this project does not yet publish production benchmarks.
+
+Availability depends on S3 and routing clients to healthy nodes. Existing connections
+must reconnect after a node fails.
 
 Accounts, certificates, messages, folders, outbound jobs, and leases live in S3.
 The mail binary has no registration API, user management commands, CSV import,
@@ -9,11 +23,10 @@ liveness endpoint. Logs go to stderr.
 
 ## Install a release
 
-Download the root installer and run it locally:
+Install the latest release directly:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh -o install.sh
-bash install.sh
+curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh | bash
 ```
 
 The installer downloads the latest stable GitHub Release for Linux or macOS
@@ -24,6 +37,28 @@ version prompts `Update? [y/N]`; only `y` proceeds. Download or verification fai
 preserve the existing binary. Add `~/.local/bin` to your PATH if needed.
 `FMA_INSTALL_DIR` overrides the installation directory; `FMA_REPO` selects a fork.
 Windows binaries are available as ZIP archives on the Releases page.
+
+To install the binary and a **systemd user service** on Linux, use:
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh) --systemd
+```
+
+This uses the release's deployment templates and interactive generator, then installs,
+enables and starts `fma.service`. It needs a working systemd user session and existing
+S3 bucket/certificate objects. The generator and its `generated/` configuration are
+kept in `~/.config/fma/deploy` (`FMA_DEPLOY_DIR` overrides this location). To reuse
+configuration generated in a checkout:
+
+```sh
+bash install.sh --systemd --config-dir deploy/generated
+```
+
+Generated paths and service identity take precedence over `FMA_INSTALL_DIR` in this
+mode. An up-to-date binary can still have its service installed. Declining a binary
+update also skips service changes. Inspect it with `systemctl --user status fma` and
+`journalctl --user -u fma`; persistent operation after logout requires user lingering
+configured on the host. Without `--systemd`, the installer only installs the binary.
 
 ## Run locally
 
@@ -68,6 +103,13 @@ newlines; trailing CR/LF characters are stripped. Password objects contain plain
 credentials, protected by the bucket's access controls. Authentication and local
 recipient checks read S3 on every request, without an account list or password cache.
 
+Alias accounts are provisioned externally: put the root username in `<alias>/.alias`.
+The alias keeps its own prefix and uses the root account password and mailbox.
+Alias chains are resolved on each login and recipient lookup; cycles and missing
+accounts are rejected. Hidden metadata objects such as `.profile.json` are excluded
+from mail listings. Protocol logins retain the login ID separately from the root ID;
+SMTP, POP3 and IMAP do not expose an avatar/profile management API.
+
 ## Connect to S3
 
 Build with Go 1.25 or newer. The bucket must already exist and support consistent
@@ -93,6 +135,12 @@ Upload a TLS certificate chain and private key as `cert.pem` and `key.pem` befor
 starting. The `-cert` and `-key` flags specify object keys, not filesystem paths.
 `FMA_RELAY_PASSWORD_FILE` and `FMA_RELAY_CA_FILE` also name objects in the same bucket.
 Certificates and relay configuration are loaded once at startup.
+
+Logging uses the global structured logger. Set `LOG_LEVEL=debug|info|warn|error`
+(default `info`); this variable has no `FMA_` prefix and is read before configuration.
+Startup validates the complete configuration before connecting to S3 or opening
+listeners, failing on missing required values and reporting warnings such as disabled
+outbound delivery. `--version` needs no S3 configuration; `--queue` only needs S3.
 
 ## Queue ownership and recovery
 
@@ -133,6 +181,7 @@ conditional S3 writes to avoid concurrent nodes overwriting each other.
 | Object key | Contents |
 | --- | --- |
 | `<user>/.password` | Account password |
+| `<alias>/.alias` | Root username for a shared account |
 | `<user>/<uid>.json`, `<user>/next` | Inbox messages and UID counter |
 | `<user>/folders` | Folder catalog, UIDVALIDITY, subscriptions, storage IDs |
 | `<user>/.folders/<id>/` | Other folders' messages and counters |
@@ -160,6 +209,11 @@ make install
 The generator asks for the domain, Linux service user and UID, installation paths,
 S3 connection and credentials, certificate object keys, outbound settings, retry
 delay, local protocol ports, and Certbot paths. Secret input is hidden on a terminal.
+Each field is checked before continuing. Malformed domains, IPv4/IPv6 addresses,
+endpoint URLs, relay addresses, paths and ports show an error and repeat that prompt.
+Non-secret surrounding whitespace is trimmed and mail domains are lowercased.
+Press Enter to accept defaults such as region `us-east-1`; secrets are preserved
+verbatim. Validation checks syntax, while the server checks S3 access at startup.
 Templates live in `deploy/template/` and use `@@NAME@@` placeholders. Generated
 files live in `deploy/generated/`, which is ignored by Git and excluded from release
 archives. Files are private by default; the generator asks before replacing existing
@@ -220,7 +274,7 @@ git push origin v0.1.0
 GoReleaser builds Linux, macOS, and Windows binaries for amd64 and arm64 without
 CGO. GoReleaser injects the tag version, full commit and UTC release-build time;
 snapshot builds use `dev-{datetime}`. This time identifies the build, which precedes
-the GitHub Release publication. Releases include tar.gz archives (ZIP on Windows), the README, MIT license,
+the GitHub Release publication. Releases include tar.gz archives (ZIP on Windows), both READMEs, MIT license,
 deployment examples, and SHA-256 checksums. Version tags with prerelease suffixes
 produce prereleases. Publishing uses the workflow's built-in `GITHUB_TOKEN` with
 `contents: write`; no personal token or Docker daemon is required.
@@ -238,15 +292,12 @@ These workflows expect this project directory to be the GitHub repository root.
 
 [MIT](LICENSE). Copyright © 2026 Jabberwocky238.
 
-Alias accounts are provisioned externally: put the root username in `<alias>/.alias`.
-The alias keeps its own prefix and uses the root account password and mailbox.
-Alias chains are resolved on each login and recipient lookup; cycles and missing
-accounts are rejected. Hidden metadata objects such as `.profile.json` are excluded
-from mail listings. Protocol logins retain the login ID separately from the root ID;
-SMTP, POP3 and IMAP do not expose an avatar/profile management API.
+## Acknowledgements
 
-Logging uses the global structured logger. Set `LOG_LEVEL=debug|info|warn|error`
-(default `info`); this variable has no `FMA_` prefix and is read before configuration.
-Startup validates the complete configuration before connecting to S3 or opening
-listeners, failing on missing required values and reporting warnings such as disabled
-outbound delivery. `--version` needs no S3 configuration; `--queue` only needs S3.
+Thanks to the projects that make fma possible:
+
+- [emersion/go-smtp](https://github.com/emersion/go-smtp) — SMTP server and client.
+- [emersion/go-imap](https://github.com/emersion/go-imap) — IMAP protocol and server.
+- [migadu/go-pop3](https://github.com/migadu/go-pop3) — POP3 protocol and server.
+- [Fals3y](https://github.com/LukeOfEarth/fals3y) — the native S3-compatible service
+  used for local development and integration tests.

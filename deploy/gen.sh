@@ -17,9 +17,18 @@ ask() {
         else
             IFS= read -r input || { printf '\nInput cancelled.\n' >&2; exit 1; }
         fi
+        if [[ "$secret" != true ]]; then
+            input="${input#"${input%%[![:space:]]*}"}"
+            input="${input%"${input##*[![:space:]]}"}"
+        fi
         input=${input:-$fallback}
+        case "$name" in DOMAIN|OUTBOUND|RELAY_TLS) input=$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]') ;; esac
         if [[ "$input" == *$'\r'* || "$input" == *$'\n'* ]]; then
             printf 'Newlines are not allowed.\n' >&2
+            continue
+        fi
+        if ! valid_input "$name" "$input"; then
+            printf 'Invalid %s. %s Please try again.\n' "$name" "$input_hint" >&2
             continue
         fi
         printf -v "$name" '%s' "$input"
@@ -33,6 +42,102 @@ safe_path() {
 safe_key() {
     [[ "${!1}" =~ ^[a-zA-Z0-9_./-]+$ && "${!1}" != /* && "${!1}" != *'..'* ]] || { printf '%s must be a relative object key using letters, digits, /, ., _, or -.\n' "$1" >&2; exit 1; }
 }
+valid_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
+valid_ipv4() {
+    local part parts
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a parts <<< "$1"
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9]{1,3}$ ]] && ((10#$part <= 255)) || return 1
+    done
+}
+valid_domain() {
+    local part parts
+    [[ ${#1} -le 253 && "$1" == *.* && "$1" != *..* && "$1" != *. && ! "$1" =~ ^[0-9.]+$ ]] || return 1
+    IFS=. read -r -a parts <<< "$1"
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || return 1
+    done
+}
+valid_ipv6() {
+    local value=$1 tail part parts count=0 compressed=false
+    [[ "$value" == *:* && "$value" != *:::* ]] || return 1
+    [[ "$value" != :* || "$value" == ::* ]] || return 1
+    [[ "$value" != *: || "$value" == *:: ]] || return 1
+    if [[ "$value" == *.* ]]; then
+        tail=${value##*:}; valid_ipv4 "$tail" || return 1
+        value=${value%:*}:0:0
+    fi
+    [[ "$value" =~ ^[a-fA-F0-9:]+$ ]] || return 1
+    if [[ "$value" == *::* ]]; then
+        compressed=true
+        tail=${value#*::}; [[ "$tail" != *::* ]] || return 1
+    else
+        [[ "$value" != :* && "$value" != *: ]] || return 1
+    fi
+    IFS=: read -r -a parts <<< "$value"
+    for part in "${parts[@]}"; do
+        [[ -n "$part" ]] || continue
+        [[ "$part" =~ ^[a-fA-F0-9]{1,4}$ ]] || return 1
+        count=$((count + 1))
+    done
+    if [[ "$compressed" == true ]]; then ((count < 8)); else ((count == 8)); fi
+}
+valid_host() {
+    [[ "$1" == localhost ]] || valid_ipv4 "$1" || valid_domain "$1"
+}
+valid_authority() {
+    local value=$1 required_port=$2 host port=
+    if [[ "$value" == \[* ]]; then
+        [[ "$value" == *\]* ]] || return 1
+        host=${value#\[}; host=${host%%\]*}
+        valid_ipv6 "$host" || return 1
+        value=${value#*\]}
+        [[ -z "$value" || "$value" == :* ]] || return 1
+        port=${value#:}
+        [[ "$value" != : ]] || return 1
+    else
+        host=${value%%:*}; valid_host "$host" || return 1
+        if [[ "$value" == *:* ]]; then port=${value#*:}; [[ -n "$port" ]] || return 1; fi
+    fi
+    if [[ -n "$port" ]]; then valid_port "$port"; else [[ "$required_port" == false ]]; fi
+}
+valid_input() {
+    local name=$1 value=$2 authority
+    input_hint='A nonempty value is required.'
+    case "$name" in
+        DOMAIN) input_hint='Enter a DNS domain such as example.com, without a scheme or path.'; valid_domain "$value" ;;
+        S3_ENDPOINT)
+            input_hint='Use http(s)://domain-or-IP[:port], with brackets around IPv6; no credentials, query or fragment.'
+            [[ -n "$value" ]] || return 0
+            [[ "$value" == http://* || "$value" == https://* ]] || return 1
+            [[ "$value" != *[[:space:]]* && "$value" != *\?* && "$value" != *\#* && "$value" != *@* && "$value" != *\\* ]] || return 1
+            authority=${value#*://}; authority=${authority%%/*}
+            valid_authority "$authority" false ;;
+        RELAY_ADDR) input_hint='Use domain:port, IPv4:port, or [IPv6]:port.'; valid_authority "$value" true ;;
+        *_PORT)
+            input_hint='Use a distinct integer port from 1 to 65535, without leading zeroes.'
+            [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] && valid_port "$value" && [[ "$used_ports" != *" $value "* ]] ;;
+        DEPLOY_USER) input_hint='Use a Unix username (letters, digits, underscores and hyphens).'; [[ "$value" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] ;;
+        DEPLOY_UID) input_hint='Use a numeric UID.'; [[ "$value" =~ ^[0-9]{1,10}$ ]] && ((10#$value <= 4294967294)) ;;
+        DEPLOY_HOME|BINDIR|CONFIG_DIR|SYSTEMD_USER_DIR|LINEAGE|WEBROOT)
+            input_hint='Use an absolute path containing letters, digits, /, ., _ or -; no .. segments.'
+            [[ "$value" =~ ^/[a-zA-Z0-9_./-]+$ && "$value/" != *'/../'* ]] ;;
+        CERT_KEY|KEY_KEY|RELAY_PASSWORD_KEY|RELAY_CA_KEY)
+            input_hint='Use a relative S3 object key containing letters, digits, /, ., _ or -; no .. segments.'
+            if [[ -z "$value" && ( "$name" == RELAY_PASSWORD_KEY || "$name" == RELAY_CA_KEY ) ]]; then return 0; fi
+            [[ "$value" =~ ^[a-zA-Z0-9_./-]+$ && "$value" != /* && "$value" != *'..'* ]] ;;
+        S3_BUCKET) input_hint='Use a bucket name containing lowercase letters, digits, dots or hyphens.'; [[ "$value" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ && "$value" != *..* ]] ;;
+        S3_REGION) input_hint='Use a region identifier such as us-east-1.'; [[ "$value" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] ;;
+        OUTBOUND) input_hint='Choose disabled, direct or relay.'; [[ "$value" == disabled || "$value" == direct || "$value" == relay ]] ;;
+        RELAY_TLS) input_hint='Choose starttls or implicit.'; [[ "$value" == starttls || "$value" == implicit ]] ;;
+        QUEUE_RETRY) input_hint='Use a positive integer followed by ms, s, m or h.'; [[ "$value" =~ ^[1-9][0-9]{0,8}(ms|s|m|h)$ ]] ;;
+        overwrite) input_hint='Choose yes or no.'; [[ "$value" == yes || "$value" == no ]] ;;
+        SESSION_TOKEN) return 0 ;;
+        *) [[ -n "$value" ]] ;;
+    esac
+}
+
 # Quote once for both systemd EnvironmentFile and Bash sourcing in the hook.
 quote_env() {
     local value=${!1}

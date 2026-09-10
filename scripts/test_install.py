@@ -56,9 +56,42 @@ else:
         f.chmod(0o755)
         return f.read_bytes()
 
-    def run_installer(self, answer=''):
-        return subprocess.run(['bash', str(ROOT / 'install.sh')], env=self.env,
+    def run_installer(self, answer='', args=()):
+        return subprocess.run(['bash', str(ROOT / 'install.sh'), *args], env=self.env,
                               input=answer, capture_output=True, text=True)
+
+    def test_systemd_with_existing_binary(self):
+        self.existing('1.2.0')
+        generated = self.root / 'generated'
+        generated.mkdir()
+        config = self.root / 'config'
+        units = self.root / 'units'
+        import getpass
+        (generated / 'install.mk').write_text(
+            f'DEPLOY_USER := {getpass.getuser()}\nDEPLOY_UID := {os.getuid()}\n'
+            f'BINDIR := {self.bin}\nCONFIG_DIR := {config}\nSYSTEMD_USER_DIR := {units}\n')
+        for name in ['s3.env', 'outbound.env', 'fma.service']:
+            (generated / name).write_text('# test configuration\n')
+        for name, body in {
+            'uname': 'echo Linux',
+            'systemctl': 'printf "%s\\n" "$*" >> "$INSTALL_TEST_ROOT/systemctl.log"',
+        }.items():
+            script = self.mock / name
+            script.write_text('#!/bin/bash\n' + body + '\n')
+            script.chmod(0o755)
+        # uname must still report the native CPU for archive selection.
+        (self.mock / 'uname').write_text('#!/bin/bash\nif [[ "$1" == -s ]]; then echo Linux; else echo x86_64; fi\n')
+        result = self.run_installer(args=('--systemd', '--config-dir', str(generated)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((units / 'fma.service').exists())
+        self.assertEqual((config / 's3.env').stat().st_mode & 0o777, 0o600)
+        self.assertIn('--user restart fma.service', (self.root / 'systemctl.log').read_text())
+        self.assertNotIn('/download/', (self.root / 'requests').read_text())
+
+    def test_unknown_option(self):
+        result = self.run_installer(args=('--unknown',))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'requests').exists())
 
     def test_first_install(self):
         result = self.run_installer()

@@ -37,6 +37,7 @@ archives:
       - install.sh
       - LICENSE
       - README.md
+      - README.zh-CN.md
       - deploy/gen.sh
       - deploy/template/*
 

@@ -1,0 +1,187 @@
+# fma
+
+[English](README.md) | [简体中文](README.zh-CN.md)
+
+**fma 是一个轻量邮件服务，唯一需要的外部服务依赖是 S3。**
+支持 SMTP、POP3 和 IMAP，所有持久化数据均保存在同一个 S3 桶中。
+
+- **高可用**：多个节点共享一个桶，节点宕机后，其他节点可以接管持久化的投递任务。
+- **高并发设计**：并行处理协议连接，通过 S3 条件写协调跨节点任务归属和邮箱更新。
+- **占用小**：单个 Go 二进制，无需本地数据库、Redis、邮件暂存目录或 Docker。实际内存和吞吐取决于邮件大小、连接数与 S3 延迟，目前没有公布生产环境基准数据。
+
+可用性依赖 S3，以及将客户端流量导向健康节点的接入设施。节点故障后，原有连接需要重连。
+账户、证书、邮件、文件夹、任务队列和租约全部存放在 S3。邮件二进制不提供注册、用户管理、CSV 导入、本地数据库、磁盘缓存或临时文件管理能力。HTTP 只提供存活检查，日志输出到 stderr。
+
+## 安装发行版
+
+直接安装最新稳定版：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh | bash
+```
+
+支持 Linux、macOS 的 amd64 和 arm64，默认安装到 `~/.local/bin/fma`。下载后校验 SHA-256 和二进制版本号。运行 `fma --version` 查看版本；如有需要，将 `~/.local/bin` 加入 PATH。
+
+已安装相同或更新版本时保持不变；旧版本或无法识别的版本会询问 `Update? [y/N]`，只有输入 `y` 才更新。下载、校验失败保留原二进制。`FMA_INSTALL_DIR` 可修改安装目录，`FMA_REPO` 可选择 fork 仓库。Windows 二进制通过 Releases 的 ZIP 提供。
+
+在 Linux 上同时安装 **systemd 用户服务**：
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh) --systemd
+```
+
+该模式使用发行包内的部署模板，交互生成配置，然后安装、启用并启动 `fma.service`。需要可用的 systemd 用户会话，并提前准备好 S3 桶和证书对象。生成器保存在 `~/.config/fma/deploy`，配置位于其 `generated/` 子目录；可通过 `FMA_DEPLOY_DIR` 修改位置。
+
+复用仓库内已经生成的配置：
+
+```sh
+bash install.sh --systemd --config-dir deploy/generated
+```
+
+此时以生成配置中的用户和路径为准，优先于 `FMA_INSTALL_DIR`。二进制已是最新版仍可安装服务；拒绝更新二进制时也跳过服务变更。不带 `--systemd` 只安装二进制。
+
+使用 `systemctl --user status fma` 查看状态，`journalctl --user -u fma` 查看日志。需要退出登录后持续运行时，在主机上配置该用户的 lingering。
+
+## 本地运行
+
+安装原生 [Fals3y](https://github.com/LukeOfEarth/fals3y) 二进制后执行：
+
+```sh
+make build
+python3 scripts/local.py
+```
+
+脚本启动 Fals3y，按需创建 `fma` 桶和测试证书，再启动邮件服务；不创建账户，不使用 Docker。Fals3y 数据目录默认为 `~/.local/share/fals3y/data`，邮件进程只通过 S3 访问数据。按 Ctrl+C 停止两个服务。
+
+`--bucket <name>` 选择已有桶，`--data` 修改 Fals3y 数据目录。该本地环境使用无鉴权 S3 端点和自签名 TLS 证书。
+
+POP3/STLS 和 POP3S 使用 migadu/go-pop3，由库管理协议、TLS、SASL PLAIN 和连接，fma 提供 S3 认证及邮箱会话。`DELE` 标记删除，`RSET` 撤销标记，`QUIT` 提交删除；未执行 `QUIT` 就断开连接会保留邮件。
+
+## 账户与别名
+
+用户名就是桶根目录下的前缀，`<user>/.password` 内容就是密码。直接通过 S3 创建账户：
+
+```sh
+printf '%s' 'your-password' | curl -f -X PUT --data-binary @- \
+  http://127.0.0.1:9000/fma/alice/.password
+```
+
+创建对象启用账户，覆盖对象修改密码，删除对象后新的登录与本地 SMTP 收件人检查会被拒绝，无需重启。已认证会话不会自动撤销。
+
+用户名为 1–64 个小写字母、数字、点、连字符或下划线，首字符必须是字母或数字。密码不能为空或包含内嵌换行，末尾 CR/LF 会被去除。密码以明文对象存储，依靠桶的访问控制保护。每次认证和本地收件人检查均读取 S3，没有账户列表或密码缓存。
+
+在 `<alias>/.alias` 中写入根用户名，即可在外部配置别名。别名保留自己的前缀，使用根账户密码并共享根邮箱。每次登录和收件人检查都会解析别名链，拒绝循环引用和不存在的账户。`.profile.json` 等隐藏元信息对象不会被当作邮件。协议会话区分登录 ID 与根 ID；SMTP、POP3 和 IMAP 不提供头像或个人资料管理 API。
+
+## 连接 S3
+
+编译需要 Go 1.25 或更高版本。桶必须提前存在，并支持一致的读取和列表操作、ETag，以及原子的条件 PUT（`If-None-Match`、`If-Match`）。
+
+```sh
+export FMA_S3_ENDPOINT=http://127.0.0.1:9000
+export FMA_S3_BUCKET=fma
+export FMA_S3_REGION=us-east-1
+export FMA_S3_ACCESS_KEY_ID=local
+export FMA_S3_SECRET_ACCESS_KEY=local
+./fma
+```
+
+Fals3y 接受任意凭证，但 SDK 仍需要密钥对。其他 S3 服务应使用真实凭证，临时凭证可设置 `FMA_S3_SESSION_TOKEN`。邮件服务不读取本地 AWS 配置文件。邮件配置统一自动添加 `FMA_` 前缀；命令行 `-s3-endpoint`、`-s3-bucket`、`-s3-region` 优先于环境变量。桶不可用时启动失败。默认监听回环地址，使用 `./fma -h` 查看端口。
+
+启动前将 TLS 证书链和私钥上传为 `cert.pem`、`key.pem`。`-cert`、`-key` 指定桶内对象键，不是本地路径。`FMA_RELAY_PASSWORD_FILE`、`FMA_RELAY_CA_FILE` 同样指向桶内对象。证书和中继配置只在启动时加载。
+
+全局结构化 logger 使用 **`LOG_LEVEL`**，不带 `FMA_` 前缀，在加载邮件配置前读取。支持 `debug`、`info`、`warn`、`error`，默认 `info`。启动时先检查完整配置，关键配置缺失直接退出，然后才连接 S3 和监听端口；关闭外发等可运行的情况输出 warning。`--version` 不需要 S3 配置，`--queue` 只需要 S3。
+
+## 任务归属与故障恢复
+
+多个节点可以共享同一个桶。`.lock` 只控制外发任务扫描与领取，不阻塞协议流量或已领取任务。租约记录持有者、启动时间、续期时间和过期时间，每 15 秒续期，30 秒过期。释放时使用条件写标记过期，防止删掉后继节点的锁。节点时钟需要同步。
+
+锁持有者立即扫描 `.outbox/`，之后每 15 秒补扫一次。执行前使用条件 PUT 写入 preclaim。每节点最多持有 1024 个活动任务；一批领取 1024 个或达到容量时，立即释放扫描锁，下一轮扫描时再竞争。已经领取的任务继续执行。
+
+Preclaim 记录持有者、开始时间和固定 20 秒超时，不续期。到期取消执行，任务留在 S3，供下一轮重新领取；扫描节点宕机还需等待扫描锁过期。旧执行者无法通过过期 ETag 覆盖新执行者。
+
+临时 SMTP 错误会保存每个收件人的重试状态，从 `-queue-retry` 开始指数退避。已确认成功的收件人不会重复重试；永久失败在本地退信存储完成后结束。
+
+Preclaim 内嵌于任务对象，删除任务会同时删除 preclaim。完成时先通过条件写保存不可再次领取的终态，再删除对象；如果删除失败或期间宕机，后续扫描只重试删除，不再次发送。`-queue` 查看未清理任务，不保留已完成任务历史。
+
+S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节点超时或未能保存确认时，重新投递可能产生重复邮件。因此投递语义是至少一次，不是恰好一次。邮箱 UID 分配和目录更新通过 S3 条件写避免节点之间互相覆盖。
+
+## 桶布局
+
+| 对象键 | 内容 |
+| --- | --- |
+| `<user>/.password` | 账户密码 |
+| `<alias>/.alias` | 共享账户的根用户名 |
+| `<user>/<uid>.json`、`<user>/next` | 收件箱邮件、UID 计数器 |
+| `<user>/folders` | 文件夹目录、UIDVALIDITY、订阅、存储 ID |
+| `<user>/.folders/<id>/` | 其他文件夹邮件和计数器 |
+| `.outbox/<id>.json` | 任务正文、收件人状态、归档状态、preclaim |
+| `.lock` | 扫描租约 |
+| `cert.pem`、`key.pem` | TLS 证书、私钥 |
+
+文件夹改名只更新目录，不复制邮件正文；删除后重建会分配新存储 ID。清理失败可能留下不可达对象。旧布局应在停止旧服务后通过外部工具迁移，二进制不提供导入功能。
+
+## 外发与部署
+
+默认关闭外发。设置 `FMA_OUTBOUND_MODE=direct` 使用 MX 直投，或设置为 `relay` 使用 SMTP 中继。
+
+```sh
+bash deploy/gen.sh
+make install
+```
+
+生成器询问域名、Linux 服务用户及 UID、安装路径、S3 连接与凭证、证书对象键、外发配置、重试间隔、本地协议端口和 Certbot 路径。终端内输入密钥时隐藏内容。
+
+每一项输入均先校验，域名、IPv4/IPv6、端点 URL、中继地址、路径或端口有误时提示错误，并重新询问当前项。非密钥输入去除首尾空白，域名转为小写；密钥内容原样保留。Region 等字段有默认值，直接回车即可使用 `us-east-1` 等默认值。生成器检查格式，S3 访问能力在服务启动时检查。
+
+模板位于 `deploy/template/`，使用 `@@NAME@@` 占位符；输出到 `deploy/generated/`，Git 忽略该目录，发行包不包含生成配置。默认私有权限，覆盖前询问，取消输入不会破坏已有配置。
+
+在 Linux 目标机上以生成配置中选定的用户执行 `make install`，它读取生成配置、编译二进制、安装 systemd 用户服务和环境文件，再启用并重启服务。配置缺失会在编译或安装前报错。安装路径取自生成的 `install.mk`，修改路径需要重新生成。
+
+将生成的 `nginx-http.conf`、`nginx-https.conf` 放入 Nginx HTTP 上下文；`nginx-stream.conf` 放在顶层，位于 `http {}` 外。公开端口为标准邮件端口，上游回环端口与服务一致。HTTPS 证书需覆盖域名、`www.<domain>` 和 `mail.<domain>`。服务启动前上传初始证书和账户密码对象。
+
+将生成的 `renew-hook.sh` 安装为 root 执行的 Certbot deploy hook，使用服务用户的 S3 配置上传续期证书并重启用户服务。该集成需要 Bash、AWS CLI、Nginx、`runuser` 和 systemd；生成器本身只需要 Bash 和常规 Unix 工具。Nginx 配置和 root hook 需单独安装。
+
+## 测试与构建
+
+```sh
+make test
+```
+
+运行格式检查、`go vet`、Go race 测试，以及原生 Fals3y 上的 S3/SMTP/POP3/IMAP 集成测试。覆盖并发领取、超时接管、旧执行者完成写入拒绝、1024 任务让出锁、清理中断、并发 UID 分配、超过 1000 个对象的列表、外发重试、文件夹和进程重启。也覆盖附件、抄送和密送场景。邮件测试进程运行在空的只读工作目录中，无需 Docker。`FALS3Y_BIN` 可覆盖默认的 `~/.local/bin/fals3y`。
+
+构建时通过链接参数分别注入 `version`、`commit` 和 `releaseTime`。`make build`、`make test` 默认使用 `dev-20260910T120000Z` 形式的 UTC 版本号、完整 commit 和 RFC3339 UTC 构建时间。可通过 `VERSION`、`COMMIT`、`RELEASE_TIME` 覆盖。请用 Make 构建以填充这些信息；`fma --version` 第一行为版本，后续为 commit 和发布时间字段。
+
+## CI 与发布
+
+GitHub Actions 在分支 push 和 PR 上使用 Go 1.25 及当前稳定版，执行格式、vet、race、原生 Fals3y 集成测试、构建和 GoReleaser 配置检查。
+
+推送新的语义版本 tag，检查通过后自动发布 GitHub Release：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GoReleaser 无 CGO 构建 Linux、macOS、Windows 的 amd64/arm64 二进制，注入 tag 版本、完整 commit 和 UTC 发行构建时间。该时间发生在 GitHub Release 实际发布之前。快照版本为 `dev-{datetime}`。发行包包含二进制、两种语言的 README、MIT 许可证、部署模板及 SHA-256 校验文件；Windows 为 ZIP，其他平台为 tar.gz。带预发布后缀的 tag 生成预发布版本。发布使用工作流自带、拥有 `contents: write` 权限的 `GITHUB_TOKEN`，无需个人 token 或 Docker。
+
+本地验证打包：
+
+```sh
+goreleaser check
+goreleaser release --snapshot --clean
+```
+
+工作流要求本项目目录就是 GitHub 仓库根目录。
+
+## 许可证
+
+[MIT](LICENSE)，Copyright © 2026 Jabberwocky238。
+
+## 鸣谢
+
+感谢以下项目为 fma 提供基础能力：
+
+- [emersion/go-smtp](https://github.com/emersion/go-smtp)：SMTP 服务端与客户端。
+- [emersion/go-imap](https://github.com/emersion/go-imap)：IMAP 协议与服务端。
+- [migadu/go-pop3](https://github.com/migadu/go-pop3)：POP3 协议与服务端。
+- [Fals3y](https://github.com/LukeOfEarth/fals3y)：本地开发和集成测试使用的原生 S3 兼容服务。

@@ -80,6 +80,37 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn('go build', result.stdout)
         self.assertNotIn('go vet', result.stdout)
 
+    def test_invalid_input_reprompts_and_defaults(self):
+        answers = self.answers()
+        answers[0] = '  EXAMPLE.NET  '
+        for index, bad in sorted([(0, 'https://example.net'), (7, 'http://999.1.2.3:9000'),
+                                  (8, 'bad/bucket'), (9, 'not a region'),
+                                  (17, '70000'), (18, '2525')], reverse=True):
+            answers.insert(index, bad)
+        result = self.generate(answers)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreaterEqual(result.stderr.count('Please try again'), 6)
+        generated = self.root / 'deploy/generated'
+        self.assertIn('-domain example.net', (generated / 'fma.service').read_text())
+        self.assertIn('us-east-1', (generated / 's3.env').read_text())
+
+    def test_endpoint_parsing(self):
+        for endpoint in ['http://127.0.0.1:9000', 'https://s3.example.net',
+                         'http://[::1]:9000', 'http://[2001:db8::1]/s3']:
+            with self.subTest(endpoint=endpoint):
+                answers = self.answers()
+                answers[7] = endpoint
+                result = self.generate(answers + ['yes'])
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for endpoint in ['https://', 'http://bad_host', 'http://[1::2::3]',
+                         'http://[:1::]', 'http://host.example:65536', 'http://user@host.example']:
+            with self.subTest(endpoint=endpoint):
+                answers = self.answers()
+                answers.insert(7, endpoint)
+                result = self.generate(answers + ['yes'])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('Invalid S3_ENDPOINT', result.stderr)
+
     def test_invalid_port_does_not_generate(self):
         answers = self.answers()
         answers[17] = '70000'  # First loopback port, after retry delay.
