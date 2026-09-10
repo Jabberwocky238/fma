@@ -1517,3 +1517,76 @@ Production `main.go` SHA-256: `d453f5dd131d5ca4dad82c9da4b8180b88099b29ba4ff4f65
 Reports are `/tmp/fma-fanout-{1,2,profile}.json` and `/tmp/fma-fanout-compressed-one.json`; the temporary CPU profile is `/tmp/fma-fanout-smtp.cpu`. Probe code and logs are not committed. Reproduce normal runs with `python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --report /tmp/fma-fanout.json`; add `--data compressible --stream-workers 1` for the minimum-worker compression check. Tests cover genuinely overlapping writers, byte ordering/ownership across multiple blocks, cancellation, failed and short writes, and the existing first-read/restart/account-isolation checks.
 
 **`make test` and `make build` passed** for the final implementation, including race tests and native protocol integration. Validation records are `/tmp/fma-fanout-final-tests.log` and `/tmp/fma-fanout-build.log`.
+
+
+## Receive-branch timing and buffer-pool experiments (2026-09-10)
+
+Five new 2 GiB runs compared larger shared rings, independent rings and separately timed receive branches. These are temporary source-overlay experiments on application commit `8b774f6ce1eab0ed4364948c4a9fdac3ba562d33`; production remains at three shared 1 MiB blocks pending a demonstrated latency/memory tradeoff. No repeated-read cache was used. The independent-ring variant gives the parser 16 private blocks and the raw hash/gzip consumers 16 shared blocks, requiring one extra full-MIME copy into the parser ring. Merely allocating separate pools while retaining the same shared-block lifetime would not remove the dependency on the slowest consumer.
+
+### A–F branch measurements
+
+The two timing runs use the same instrumentation, without CPU sampling. A is the complete protocol-facing Read, not isolated socket time. E is measured around decoder Read calls and separately around its underlying MIME body Read calls. F's hash is measured inside the library identity writer; F's gzip/object Write and Commit are measured at the application part writer. C and D are measured in their separate ordered consumers. All values are elapsed call durations including preemption; none should be presented as pure CPU work.
+
+| Branch / interval | Shared 3 blocks, s | Shared 16 blocks, s |
+| --- | ---: | ---: |
+| A: protocol Read calls (TCP + SMTP framing/line checks) | 3.231492 | 3.309177 |
+| B: receiver wait for a reusable block | 0.668871 | 0.535851 |
+| A+B: receiver overall, including writer completion | 3.909045 | 3.853964 |
+| C: raw MIME SHA-256 Write calls | 1.175537 | 1.214616 |
+| C: wait for input / queue closure | 2.732749 | 2.638575 |
+| D: raw MIME gzip/object Write calls | 1.019026 | 1.174804 |
+| D: wait for input / queue closure | 2.888406 | 2.677674 |
+| E: decoded Read calls, including boundary/input reads | 2.738991 | 2.687303 |
+| E child: boundary/input Read calls | 0.625965 | 0.539812 |
+| E remainder: decode/filter calls excluding body Read | 2.113025 | 2.147491 |
+| F: decoded attachment SHA-256 calls | 0.759396 | 0.765358 |
+| F: decoded attachment gzip/object Write calls | 0.396406 | 0.401813 |
+| F: attachment Commit | 0.026989 | 0.027210 |
+| Parser child: wait for input blocks / EOF | 0.096581 | 0.000562 |
+| Parser child: input Read calls including wait and copy | 0.180882 | 0.092572 |
+| E+F: complete parser task before admission-release wait | 3.938597 | 3.900574 |
+| Final raw Commit plus metadata publication | 0.009179 | 0.009847 |
+
+The E and F operations run sequentially within the attachment parser: for the three-block run, **2.738991 + 0.759396 + 0.396406 + 0.026989 = 3.921782 s**, compared with **3.935741 s** measured for the complete attachment leaf. Remaining time includes other sinks, loop/timing overhead and finalization. The 21-byte text leaf adds 0.002649 s. Do not add the boundary/input child duration to the decoder parent, or add C/D to E+F: the raw consumers overlap parsing. The final application parser duration also includes MIME headers, structure handling and the epilogue/EOF drain. The ready channel closes only after the raw writers finish, so parser duration alone cannot identify the slowest consumer.
+
+The raw hash and gzip streams overlap almost completely. In timed3 their first/last Write timestamps are **2026-09-10T21:24:20.138174Z–21:24:24.047059Z** and **21:24:20.138131Z–21:24:24.047061Z** respectively. Each spans approximately 3.909 s, but most of that span is waiting for input. In timed16 both span approximately 3.854 s, starting around **21:24:47.48764Z** and ending around **21:24:51.34147Z**.
+
+Increasing the shared ring from 3 to 16 blocks reduced parser input wait from **0.096581 to 0.000562 s** and receiver free-block wait from **0.668871 to 0.535851 s**. Yet SMTP changed only **3.968 → 3.932 s**, a **0.9%** difference in this instrumented pair. The parser is essentially no longer starved for incoming blocks, while its decode/filter, identity hash and attachment-write chain still runs for nearly 3.9 s. This supports a modest buffering benefit; it does not support the claim that buffer capacity alone explains the remaining seconds. Receiver waits are not yet attributed to the identity of the last consumer releasing each block.
+
+### Capacity comparison and resource results
+
+The uninstrumented larger-ring runs measured SMTP **3.887 s** (shared16), **3.867 s** (shared32) and **3.917 s** (split16+16), against the preceding three-block mean of 4.050 s. Each new capacity/layout currently has one uninstrumented sample, so the 20–50 ms differences do not establish a reliable winner. Splitting the rings did not demonstrate a throughput advantage and added a 2,938,662,361-byte copy. Increasing capacity did not materially reduce SMTP CPU work.
+
+The shared16 run failed the existing **256 MiB** RSS assertion at **285.203125 MiB** during the later whole-protocol sequence, after transfer/content checks but before interruption checks. Its JSON was reconstructed from the emitted assertion; it is retained as a failed run. Subsequent diagnostic runs explicitly used `--max-rss-mib 512` to complete the measurements and interruption checks; this changes the diagnostic assertion only, not production limits. Passing those diagnostics must not be described as passing the original 256 MiB criterion. Per-phase and whole-run memory values follow. The existing 1 GiB limit applies to active S3 part capacity, not total process RSS.
+
+| Run | Raw up s | Raw down s | SMTP s | IMAP down s | APPEND s | POP3 s | JMAP metadata s | First JMAP down s | Whole-run peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| shared16 | 1.838 | 0.875 | 3.887 | 1.950 | 4.139 | 1.840 | 0.004 | 0.909 | 285.20312 |
+| shared32 | 1.830 | 0.898 | 3.867 | 2.024 | 4.180 | 1.852 | 0.004 | 0.884 | 285.81250 |
+| split16+16 | 1.850 | 0.875 | 3.917 | 1.917 | 4.222 | 1.854 | 0.004 | 0.883 | 288.84375 |
+| timed3 | 1.813 | 0.876 | 3.968 | 1.894 | 4.168 | 1.857 | 0.004 | 0.904 | 234.20312 |
+| timed16 | 1.793 | 0.877 | 3.932 | 1.976 | 4.157 | 1.868 | 0.004 | 0.888 | 271.59375 |
+
+| Run | SMTP start UTC | SMTP end UTC | SMTP CPU s / average % | SMTP peak MiB |
+| --- | --- | --- | ---: | ---: |
+| shared16 | 2026-09-10T21:21:03.834092Z | 2026-09-10T21:21:07.720947Z | 12.890 / 331.63% | 214.60938 |
+| shared32 | 2026-09-10T21:21:43.444300Z | 2026-09-10T21:21:47.311469Z | 12.900 / 333.58% | 252.68750 |
+| split16+16 | 2026-09-10T21:22:17.336345Z | 2026-09-10T21:22:21.249402Z | 13.160 / 335.97% | 265.17188 |
+| timed3 | 2026-09-10T21:24:20.133287Z | 2026-09-10T21:24:24.101604Z | 12.790 / 322.30% | 198.93750 |
+| timed16 | 2026-09-10T21:24:47.481893Z | 2026-09-10T21:24:51.413870Z | 12.900 / 328.08% | 214.59375 |
+
+All runs use four workers, incompressible seed 20260910, 2,147,483,648 decoded attachment bytes, 2,938,662,361 MIME bytes and JMAP first, before IMAP/POP3. Go 1.25.3, Apple M4/macOS arm64, Fals3y 0.3.1-dev.b8e48bf, SMTP b0673510e580, POP3 v0.1.6, AWS core v1.41.5 / S3 v1.97.3 and klauspost/compress v1.20.0 are unchanged. CPU/RSS measure fma only, with 100% = one core and RSS sampled every 50 ms.
+
+The timing overlay uses a temporary modfile selecting the local [MIME fork ea6016819f55](https://github.com/Jabberwocky238/naust-jmap/commit/ea6016819f557258bc1adf95488dca474c37e846), with its `sinks.go` verified byte-identical to the pinned published module before instrumentation. Go prohibits overlays beneath GOMODCACHE, hence the local module selection. No production dependency files or upstream PRs were changed. The first timing launch was rejected by that overlay restriction before any benchmark ran; no timing result is assigned to it.
+
+| Run | Executable SHA-256 |
+| --- | --- |
+| shared16 | `25e6a00b203d0fe1a3ed54df740b9c4e6f64c6fb519a2e9ead66ded4b1690163` |
+| shared32 | `300ea5f69b5f2a2398bd8166b4336effe953eb9b094cc971676bd7c1f12903b6` |
+| split16+16 | `7a7dba6596b0eb1004bbe3e0b8d5153670aadf18ca9d7707a26a121cf1eee86c` |
+| timed3 | `5f90fdd555d48f0390d624993a2c3529f68c1959859923028db31106e5e343e0` |
+| timed16 | `a662c780f2fdf6a23569e9062afb9744e4f1331a162124ad35a29e6c0d87ee29` |
+
+Reports: `/tmp/fma-buffer-16-failed.json`, `/tmp/fma-buffer-32.json`, `/tmp/fma-buffer-split.json`, `/tmp/fma-branches.json`, `/tmp/fma-branches-16.json`. Each successful report retains SMTP and IMAP APPEND timing diagnostics; tables above isolate SMTP. The failed shared16 report retains the emitted transfer data. Timer code, modfiles and full logs remain temporary and are not embedded or committed. Application production source remains unchanged; this update records experiments and measurements.
+
+The timing overlay passed targeted race tests for MIME streaming and stored-part first reads (`/tmp/fma-branches-race.log`). All four diagnostics with the explicit 512 MiB assertion completed content, protocol and interruption checks. This commit changes documentation only; production code remains the previously tested `8b774f6` implementation.
