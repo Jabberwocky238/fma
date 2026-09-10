@@ -4,6 +4,7 @@ metadata:
   namespace: fma
   name: fma-config
 data:
+  FMA_JMAP_URL: https://mail.example.com
   FMA_DOMAIN: example.com
   FMA_S3_ENDPOINT: https://s3.example.com
   FMA_S3_BUCKET: fma

@@ -36,8 +36,10 @@ archives:
     files:
       - install.sh
       - LICENSE
+      - CONTRIBUTING.md
+      - CODE_OF_CONDUCT.md
       - README.md
-      - README.zh-CN.md
+      - README.ZH-CN.md
       - deploy/gen.sh
       - deploy/template/*
       - deploy/kubernetes/*

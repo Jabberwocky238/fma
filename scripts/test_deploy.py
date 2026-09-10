@@ -26,7 +26,7 @@ class DeploymentTests(unittest.TestCase):
         if mode == 'relay':
             answers += ['smtp.example.net:587', '', 'test-user', '', secret, '']
         answers += ['', '', '', '', '', '', '', '', '', '', '']
-        return answers + ['']
+        return answers + ['', '']
 
     def generate(self, answers):
         return subprocess.run(['bash', 'deploy/gen.sh'], cwd=self.root,

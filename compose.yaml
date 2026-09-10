@@ -13,6 +13,7 @@ services:
     security_opt: [no-new-privileges:true]
     stop_grace_period: 120s
     environment:
+      FMA_JMAP_URL: ${FMA_JMAP_URL:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       FMA_S3_ENDPOINT: ${FMA_S3_ENDPOINT:-}
       FMA_S3_BUCKET: ${FMA_S3_BUCKET:?Set FMA_S3_BUCKET in .env}

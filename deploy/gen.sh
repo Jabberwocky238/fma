@@ -148,6 +148,12 @@ valid_input() {
     input_hint='A nonempty value is required.'
     case "$name" in
         DOMAIN) input_hint='Enter a DNS domain such as example.com, without a scheme or path.'; valid_domain "$value" ;;
+        JMAP_URL)
+            input_hint='Use an HTTPS origin, without a path, credentials, query or fragment.'
+            [[ "$value" == https://* ]] || return 1
+            authority=${value#https://}
+            [[ "$authority" != */* && "$authority" != *[[:space:]]* && "$authority" != *\?* && "$authority" != *\#* && "$authority" != *@* ]] || return 1
+            valid_authority "$authority" false ;;
         S3_ENDPOINT)
             input_hint='Use http(s)://domain-or-IP[:port], with brackets around IPv6; no credentials, query or fragment.'
             [[ -n "$value" ]] || return 0
@@ -289,6 +295,8 @@ ask WEBROOT 'ACME webroot directory' /var/www/certbot
 safe_path LINEAGE; safe_path WEBROOT
 ask LOG_LEVEL 'Log level: debug, info, warn, error' info
 quote_env LOG_LEVEL
+ask JMAP_URL 'Public JMAP HTTPS origin' "https://mail.$DOMAIN"
+quote_env JMAP_URL
 
 for name in S3_ENDPOINT S3_BUCKET S3_REGION ACCESS_KEY SECRET_KEY SESSION_TOKEN OUTBOUND RELAY_ADDR RELAY_TLS RELAY_USER RELAY_PASSWORD RELAY_PASSWORD_KEY RELAY_CA_KEY; do quote_env "$name"; done
 if [[ -e "$root/generated" ]]; then

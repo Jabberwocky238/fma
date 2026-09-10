@@ -1,9 +1,34 @@
 # fma
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [Chinese](README.ZH-CN.md)
 
-**fma is a lightweight mail service whose only external service dependency is S3.**
-It supports SMTP, POP3 and IMAP, with a single S3 bucket holding all durable state.
+**fma is a lightweight mail service whose only external service dependency is S3.** It serves SMTP, POP3, IMAP and JMAP, with a design for high availability, concurrent connections and a small footprint.
+
+Quick install and start (prepare an existing bucket, account and TLS certificate first; replace the credentials below):
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh) --systemd
+```
+
+**Contents**
+
+1. [Introduction](#fma)
+2. [Philosophy and design](#design)
+3. [How to run](#run)
+   - [3.1. Direct startup](#run-direct)
+   - [3.2. systemd startup and gen.sh](#run-systemd)
+   - [3.3. Docker startup](#run-docker)
+   - [3.4. Kubernetes startup](#run-kubernetes)
+4. [Using JMAP](#jmap)
+5. [CI, testing and Fals3y](#testing)
+6. [Bucket layout](#bucket)
+7. [License and acknowledgements](#credits)
+
+<a id="design"></a>
+
+## 2. Philosophy and design
+
+All runtime code stays in `main.go`, with Go tests in `main_test.go`. Reuse protocol libraries and connect them to S3 through explicit types and JSON fields; scripts, deployment templates and documentation may live separately. PRs for any part of the project, additions and AI-assisted programming are welcome. The one non-negotiable architectural rule is the single-file philosophy; see [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 - **High availability:** multiple nodes share one bucket; persisted delivery tasks
   can be reclaimed after a node crashes.
@@ -19,10 +44,144 @@ must reconnect after a node fails.
 Accounts, messages, folders, outbound jobs and leases live in S3. TLS certificates
 come from S3 by default, or a read-only mounted TLS Secret in Kubernetes.
 The mail binary has no registration API, user management commands, CSV import,
-local database, disk cache, or temporary file management. HTTP provides only a
-liveness endpoint. DEBUG/INFO/WARN logs go to stdout; ERROR/FATAL go to stderr.
+local database, disk cache, or temporary file management. HTTP serves JMAP and a liveness endpoint. DEBUG/INFO/WARN logs go to stdout; ERROR/FATAL go to stderr.
 
-## Install a release
+JMAP and the other protocols share account metadata and MIME objects. One conditional S3 write commits an account metadata transaction atomically; MIME bytes are stored separately. Writes within one account are serialized, and metadata update cost grows with mailbox size. No unmeasured throughput or memory numbers are claimed.
+
+### Supported RFCs and scope
+
+| RFC | Protocol | Current scope |
+| --- | --- | --- |
+| [RFC 5321](https://www.rfc-editor.org/rfc/rfc5321.html) | SMTP | Inbound delivery and external SMTP transport |
+| [RFC 6409](https://www.rfc-editor.org/rfc/rfc6409.html) | SMTP Submission | Authenticated application/client submission; public port 587 |
+| [RFC 4954](https://www.rfc-editor.org/rfc/rfc4954.html) | SMTP AUTH | Authentication on TLS-protected submission connections |
+| [RFC 3207](https://www.rfc-editor.org/rfc/rfc3207.html) | SMTP STARTTLS | Upgrade SMTP connections to TLS |
+| [RFC 1939](https://www.rfc-editor.org/rfc/rfc1939.html) | POP3 | Download, UIDL, deferred DELE and QUIT commit |
+| [RFC 3501](https://www.rfc-editor.org/rfc/rfc3501.html) | IMAP4rev1 | Mailbox reads/writes, search, flags, folders and subscriptions |
+| [RFC 2595](https://www.rfc-editor.org/rfc/rfc2595.html) | IMAP/POP3 TLS | IMAP STARTTLS and POP3 STLS |
+| [RFC 4616](https://www.rfc-editor.org/rfc/rfc4616.html) | SASL PLAIN | Password authentication inside TLS |
+| [RFC 2045](https://www.rfc-editor.org/rfc/rfc2045.html) | MIME | Preserve raw MIME, encoded bodies and attachments |
+| [RFC 2046](https://www.rfc-editor.org/rfc/rfc2046.html) | MIME media types | Multipart messages and attachments |
+| [RFC 8620](https://www.rfc-editor.org/rfc/rfc8620.html) | JMAP Core | Session, HTTP/JSON methods, result references, blobs and state-based synchronization; push subscriptions are not implemented |
+| [RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html) | JMAP Mail | Mailbox, Email, Thread, SearchSnippet, Identity and EmailSubmission; reading, writing, search, attachments and changes |
+
+### Queue ownership and recovery
+
+Multiple nodes may share a bucket. `.lock` controls outbound scanning and claiming;
+it does not block protocol traffic or previously claimed jobs. The lease records
+its owner, start time, renewal time, and expiry. It renews every 15 seconds and expires
+after 30 seconds, allowing one interval of renewal slack. Release conditionally marks
+the lease expired, avoiding deletion of a successor's lock. Keep node clocks synchronized.
+
+The holder scans `.outbox/` immediately and every 15 seconds. Before execution, it
+claims each eligible task with a conditional PUT. A node holds at most 1024 active
+tasks. Claiming a batch of 1024 or reaching capacity immediately releases the scanner
+lease; the node waits until the next scan interval before competing again. Already
+claimed tasks continue running after release.
+
+Each preclaim records its owner, start time, and a fixed 20-second expiry. It is not
+renewed. Expiry cancels execution and leaves the task in S3 for another claim. Recovery
+occurs on a subsequent scan; a crashed scanner also requires lease expiry. An old
+worker cannot overwrite a successor using a stale ETag.
+
+Temporary SMTP errors persist per-recipient retry state with exponential backoff,
+starting at `-queue-retry`. Confirmed recipients are skipped on retries. Permanent
+failures complete after a local delivery-failure notice is stored.
+
+The preclaim is embedded in the task object, so deleting the task removes both.
+Completion first conditionally writes a terminal state that cannot be claimed again,
+then deletes the object. If deletion fails or the process crashes between these steps,
+a later scan retries deletion without sending again. `-queue` lists outstanding tasks;
+completed tasks are not retained as queue history.
+
+S3 and remote SMTP do not share a transaction. If a remote accepts a message but the
+worker times out or cannot persist confirmation, redelivery may duplicate it. Delivery
+is at least once, not exactly once. Mailbox UID allocation and catalog updates use
+conditional S3 writes to avoid concurrent nodes overwriting each other.
+
+<a id="run"></a>
+
+## 3. How to run
+
+### Parameters
+
+Command-line values override the corresponding environment variables, then defaults apply. `—` means there is no corresponding binary environment input or flag. Generator-only variables are listed separately. Logging uses unprefixed `LOG_LEVEL`.
+
+| Flag | Environment read by the binary | Default | Meaning |
+| --- | --- | --- | --- |
+| `-domain` | `—` | `t12e.cc` | Local mail domain |
+| `-s3-endpoint` | `FMA_S3_ENDPOINT` | `empty` | S3 endpoint; empty selects AWS |
+| `-s3-bucket` | `FMA_S3_BUCKET` | `required` | Existing bucket |
+| `-s3-region` | `FMA_S3_REGION` | `us-east-1` | S3 region |
+| `—` | `FMA_S3_ACCESS_KEY_ID` | `required` | S3 access key |
+| `—` | `FMA_S3_SECRET_ACCESS_KEY` | `required` | S3 secret key |
+| `—` | `FMA_S3_SESSION_TOKEN` | `empty` | Optional temporary credential token |
+| `-cert` | `—` | `cert.pem` | Certificate chain object key in S3 |
+| `-key` | `—` | `key.pem` | Private key object key in S3 |
+| `-tls-dir` | `—` | `empty` | Read tls.crt and tls.key from a mounted directory instead of S3 |
+| `-smtp` | `—` | `127.0.0.1:2525` | Inbound SMTP |
+| `-submission` | `—` | `127.0.0.1:1587` | Authenticated SMTP with STARTTLS |
+| `-smtps` | `—` | `127.0.0.1:1465` | Authenticated SMTP over TLS |
+| `-pop3` | `—` | `127.0.0.1:1110` | POP3 with STLS |
+| `-pop3s` | `—` | `127.0.0.1:1995` | POP3 over TLS |
+| `-imap` | `—` | `127.0.0.1:1143` | IMAP with STARTTLS |
+| `-imaps` | `—` | `127.0.0.1:1993` | IMAP over TLS |
+| `-http` | `—` | `127.0.0.1:8080` | JMAP HTTP backend and / health check; publish through HTTPS |
+| `-jmap-url` | `FMA_JMAP_URL` | `https://mail.<domain>` | Public HTTPS origin advertised to JMAP clients |
+| `-outbound` | `FMA_OUTBOUND_MODE` | `disabled` | disabled, direct (MX), or relay (another SMTP server) |
+| `—` | `FMA_RELAY_ADDR` | `required in relay` | Relay host:port |
+| `—` | `FMA_RELAY_USER` | `required in relay` | Relay authentication username |
+| `—` | `FMA_RELAY_PASSWORD` | `empty` | Relay password; required unless PASSWORD_FILE is set |
+| `—` | `FMA_RELAY_PASSWORD_FILE` | `empty` | S3 object key containing the relay password |
+| `—` | `FMA_RELAY_TLS` | `starttls` | starttls or implicit |
+| `—` | `FMA_RELAY_CA_FILE` | `empty` | Optional CA certificate object key in S3 |
+| `-queue-retry` | `—` | `1m` | Initial retry delay for SMTP delivery jobs |
+| `-queue` | `—` | `false` | Inspect SMTP delivery jobs without message bodies |
+| `-version` | `—` | `false` | Print version, commit and release time; no S3 needed |
+| `-h` | `—` | `—` | Print command-line help |
+| `—` | `LOG_LEVEL` | `info` | debug, info, warn, error; read before mail configuration |
+
+The generator also reads the table below. S3, relay, outbound and logging environment variables from the binary table work in the generator too; its bucket default is `fma`, while other shared defaults match above.
+
+| Generator environment variable | Default | Purpose |
+| --- | --- | --- |
+| `FMA_DOMAIN` | `required` | Mail domain |
+| `FMA_JMAP_URL` | `https://mail.<domain>` | Public JMAP origin |
+| `FMA_DEPLOY_USER` | `current user` | Service user |
+| `FMA_DEPLOY_UID` | `selected user UID` | Service UID |
+| `FMA_DEPLOY_HOME` | `selected user home` | Service home |
+| `FMA_BINDIR` | `root: /usr/local/bin; user: ~/.local/bin` | Binary directory |
+| `FMA_CONFIG_DIR` | `root: /etc/fma; user: ~/.config/fma` | Configuration directory |
+| `FMA_SYSTEMD_USER_DIR` | `root: /etc/systemd/system; user: ~/.config/systemd/user` | Unit directory for the selected mode |
+| `FMA_CERT_KEY` | `cert.pem` | Maps to -cert |
+| `FMA_KEY_KEY` | `key.pem` | Maps to -key |
+| `FMA_QUEUE_RETRY` | `1m` | Maps to -queue-retry |
+| `FMA_SMTP_PORT` | `2525` | Loopback listener port |
+| `FMA_SUBMISSION_PORT` | `1587` | Loopback listener port |
+| `FMA_SMTPS_PORT` | `1465` | Loopback listener port |
+| `FMA_POP3_PORT` | `1110` | Loopback listener port |
+| `FMA_POP3S_PORT` | `1995` | Loopback listener port |
+| `FMA_IMAP_PORT` | `1143` | Loopback listener port |
+| `FMA_IMAPS_PORT` | `1993` | Loopback listener port |
+| `FMA_HTTP_PORT` | `8080` | Loopback listener port |
+| `FMA_LINEAGE` | `/etc/letsencrypt/live/mail.<domain>` | Certbot certificate directory |
+| `FMA_WEBROOT` | `/var/www/certbot` | ACME webroot |
+| `FMA_OVERWRITE` | `no` | Allow replacing generated configuration |
+
+Installer options are fixed as follows:
+
+| Option / environment variable | Default | Purpose |
+| --- | --- | --- |
+| `--systemd` | off | Install binary and service |
+| `--config-dir PATH` | generated by installer | Reuse generated configuration with --systemd |
+| `--uninstall` | off | Remove this execution mode's installation |
+| `FMA_INSTALL_DIR` | root: /usr/local/bin; user: ~/.local/bin | Binary installation directory |
+| `FMA_DEPLOY_DIR` | root: /etc/fma/deploy; user: ~/.config/fma/deploy | Generator workspace |
+| `FMA_REPO` | Jabberwocky238/fma | Release repository |
+
+<a id="run-direct"></a>
+
+### 3.1. Direct startup
 
 Install the latest release directly:
 
@@ -40,6 +199,41 @@ preserve the existing binary. Add `~/.local/bin` to your PATH if needed.
 Windows installation uses Git Bash/MSYS/Cygwin with Bash, curl and unzip; the installer
 detects Windows and installs `fma.exe` from the matching ZIP. Linux/macOS use tar.gz.
 `--systemd` is Linux-only. Architecture is detected using `uname -m`.
+
+Build with Go 1.25 or newer. The bucket must already exist and support consistent
+reads and listings, ETags, and atomic conditional PUTs (`If-None-Match` and `If-Match`).
+
+```sh
+export FMA_S3_ENDPOINT=http://127.0.0.1:9000
+export FMA_S3_BUCKET=fma
+export FMA_S3_REGION=us-east-1
+export FMA_S3_ACCESS_KEY_ID=local
+export FMA_S3_SECRET_ACCESS_KEY=local
+./fma
+```
+
+Fals3y accepts arbitrary credentials, but the SDK requires a key pair. Use real
+credentials for other S3 services; `FMA_S3_SESSION_TOKEN` supports temporary credentials.
+The binary does not load local AWS configuration files. Mail configuration environment settings use the `FMA_` prefix, which is added centrally by the
+configuration reader. Flags `-s3-endpoint`,
+`-s3-bucket`, and `-s3-region` override connection settings. Startup fails if the bucket
+is unavailable. Listeners bind to loopback by default; see `./fma -h` for ports.
+
+Upload a TLS certificate chain and private key as `cert.pem` and `key.pem` before
+starting. The `-cert` and `-key` flags specify object keys, not filesystem paths.
+`FMA_RELAY_PASSWORD_FILE` and `FMA_RELAY_CA_FILE` also name objects in the same bucket.
+Certificates and relay configuration are loaded once at startup. `-tls-dir /run/fma/tls`
+reads `tls.crt` and `tls.key` from a read-only mounted Secret instead of S3.
+
+Logging uses the global structured logger. Set `LOG_LEVEL=debug|info|warn|error`
+(default `info`). DEBUG/INFO/WARN use stdout and ERROR/FATAL use stderr; this variable has no `FMA_` prefix and is read before configuration.
+Startup validates the complete configuration before connecting to S3 or opening
+listeners, failing on missing required values and reporting warnings such as disabled
+outbound delivery. `--version` needs no S3 configuration; `--queue` only needs S3.
+
+<a id="run-systemd"></a>
+
+### 3.2. systemd startup and gen.sh
 
 To install the binary and a **systemd service** on Linux, use:
 
@@ -88,7 +282,273 @@ Root installation also creates `/bin/fma` as a symlink to the installed binary. 
 uninstallation removes this link only when it points to that binary. An unrelated
 existing `/bin/fma` is never overwritten.
 
-## Run locally
+Outbound delivery is disabled by default. Set `FMA_OUTBOUND_MODE=direct` to use MX
+delivery, or `relay` to use an SMTP relay. A relay is another SMTP server that
+accepts outbound mail from fma and delivers it to the recipient's mail provider;
+configure its address and credentials. These modes affect external delivery only,
+not receiving mail or reading local mailboxes.
+
+Generate deployment configuration interactively:
+
+```sh
+bash deploy/gen.sh
+make install
+```
+
+The generator asks for the domain, Linux service user and UID, installation paths,
+S3 connection and credentials, certificate object keys, outbound settings, retry
+delay, local protocol ports, and Certbot paths. Secret input is hidden on a terminal.
+Each field is checked before continuing. Malformed domains, IPv4/IPv6 addresses,
+endpoint URLs, relay addresses, paths and ports show an error and repeat that prompt.
+Non-secret surrounding whitespace is trimmed and mail domains are lowercased.
+Press Enter to accept defaults such as region `us-east-1`; secrets are preserved
+verbatim. Validation checks syntax, while the server checks S3 access at startup.
+Templates live in `deploy/template/` and use `@@NAME@@` placeholders. Generated
+files live in `deploy/generated/`, which is ignored by Git and excluded from release
+archives. Files are private by default; the generator asks before replacing existing
+configuration and preserves it if input is cancelled.
+
+The generator checks environment variables **before each prompt**. Set values are
+validated and used without asking; invalid environment values fail immediately and
+secrets are not echoed. For unattended deployments (including Kubernetes setup):
+
+```sh
+export FMA_DOMAIN=example.com
+export FMA_S3_ENDPOINT=https://s3.example.com
+export FMA_S3_BUCKET=fma
+export FMA_S3_ACCESS_KEY_ID=your-access-key
+export FMA_S3_SECRET_ACCESS_KEY=your-secret-key
+bash deploy/gen.sh --non-interactive
+```
+
+In this mode, unset fields use defaults and missing required fields fail instead of
+waiting for input. Region defaults to `us-east-1`. Set `FMA_OVERWRITE=yes` to replace
+existing generated files; the default preserves them. Environment lookup also works
+in interactive mode. Generator-only variables are rendered into service arguments;
+they do not add registration or configuration-management APIs to the mail process.
+
+
+Run `make install` as the selected user on the target Linux host. It requires the
+generated configuration, builds the binary, installs the generated systemd unit
+and environment files, then enables and restarts `fma.service`. Missing configuration
+fails before building or installing anything. Installation paths come from the
+generated `install.mk`; regenerate configuration to change them.
+
+Install `nginx-http.conf` and `nginx-https.conf` from `deploy/generated/` in the Nginx
+HTTP context. The generated `nginx-stream.conf` belongs at the top level, outside
+`http {}`. Public mail ports are standard; upstream loopback ports match the generated
+service. The HTTPS certificate must cover the configured domain, `www.<domain>`,
+and `mail.<domain>`. Upload the initial TLS certificate and account password objects
+to S3 before starting the mail service.
+
+Install `deploy/generated/renew-hook.sh` as a root-run Certbot deploy hook. It uploads
+renewed certificates using the selected user's S3 configuration and restarts that
+user's mail service. The target needs Bash, AWS CLI, Nginx, `runuser`, and systemd;
+the generator itself only needs Bash and standard Unix utilities. Nginx configuration
+and root-owned Certbot hooks are installed separately from `make install`.
+
+<a id="run-docker"></a>
+
+### 3.3. Docker startup
+
+The [Dockerfile](Dockerfile) uses a Go build stage and an Alpine 3.23 runtime with
+CA certificates. The runtime runs as UID/GID 65532 and needs no data volumes;
+accounts, TLS keys, messages and queues remain in your existing S3 bucket.
+See [Docker's multi-stage build documentation](https://docs.docker.com/build/building/multi-stage/).
+
+```sh
+cp .env.example .env
+# Edit .env: set your domain, S3 endpoint/bucket and credentials.
+# Upload cert.pem, key.pem and account objects to that bucket first.
+docker compose up -d --build
+docker compose logs -f fma
+docker compose down
+```
+
+The Compose configuration publishes standard SMTP/submission/POP3/IMAP TCP ports.
+HTTP health is published only on host loopback port 8080. Listeners inside the
+container bind `0.0.0.0`; `localhost` in an S3 endpoint refers to that container,
+so use a reachable external S3 address. `.env` is ignored by Git. No S3 container,
+local database or Docker volume is created. The container root filesystem is read-only.
+Containers run fma directly rather than invoking systemd or `install.sh`.
+
+Build an image yourself, optionally injecting version metadata:
+
+```sh
+docker build --build-arg COMMIT="$(git rev-parse HEAD)" -t fma:local .
+```
+
+`VERSION` and `RELEASE_TIME` are optional build arguments; without them the image uses
+`dev-{datetime}` and the UTC build time. The build context only includes the Go source,
+module files and Dockerfile; environment files and generated credentials are excluded.
+To use a published image with the same Compose settings:
+
+```sh
+FMA_IMAGE=ghcr.io/jabberwocky238/fma:latest docker compose up -d --no-build --pull always
+```
+
+JMAP uses the HTTP backend on host loopback port 8080. Connect an HTTPS reverse proxy and set the matching `FMA_JMAP_URL`. Allow uploads of at least 6 GiB and disable proxy request buffering to local disk.
+
+<a id="run-kubernetes"></a>
+
+### 3.4. Kubernetes startup
+
+[deploy/kubernetes/](deploy/kubernetes/) provides a Kustomize deployment: two replicas,
+a configuration ConfigMap, a TCP LoadBalancer Service and a PodDisruptionBudget.
+The pods run without root privileges, local data volumes or Kubernetes API credentials.
+They share the same S3 bucket. The TCP Service exposes the seven mail ports; a separate HTTP Service
+connects the JMAP backend to the Ingress. Your cluster must support LoadBalancer services, or you can
+adapt its type to your existing TCP entry point.
+
+Edit `deploy/kubernetes/configmap.yaml` for your domain and S3 endpoint/bucket.
+TLS comes directly from the Kubernetes `fma-tls` Secret (`kubernetes.io/tls`), mounted
+read-only at `/run/fma/tls`. Use an existing cert-manager Secret by changing
+`secretName` in `deployment.yaml`, or create one before applying the deployment:
+
+```sh
+kubectl create namespace fma --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n fma create secret tls fma-tls --cert=fullchain.pem --key=privkey.pem
+```
+
+No certificate objects are required in S3 for this deployment. Certificates are loaded
+at startup; after Secret renewal, restart the pods (or use your cluster's Secret
+reload controller). The process does not write or manage mounted certificate files.
+
+Set the image and tag in `kustomization.yaml` to a published
+GHCR version or your own pushed image. Create the credentials Secret in the same
+namespace as the deployment (`fma`):
+
+```sh
+kubectl -n fma create secret generic fma-s3 \
+  --from-literal=FMA_S3_ACCESS_KEY_ID="$FMA_S3_ACCESS_KEY_ID" \
+  --from-literal=FMA_S3_SECRET_ACCESS_KEY="$FMA_S3_SECRET_ACCESS_KEY" \
+  --from-literal=FMA_S3_SESSION_TOKEN="${FMA_S3_SESSION_TOKEN:-}" \
+  --dry-run=client -o yaml | kubectl -n fma apply -f -
+kubectl apply -k deploy/kubernetes
+kubectl -n fma rollout status deployment/fma
+kubectl -n fma get service fma
+```
+
+For a private registry package, configure an image pull Secret on the deployment.
+Pin an image version for reproducible rollouts; `latest` is pulled when a pod starts,
+but publishing it does not restart existing pods. Use `kubectl -n fma rollout restart deployment/fma`
+after changing environment settings or to refresh `latest`. Set resource requests/limits
+based on your workloads. Graceful shutdown allows 120 seconds for in-flight work.
+Startup, readiness and liveness probes use HTTP `/`, which checks the running process;
+it does not continuously verify S3 availability. See the
+[Kubernetes probe documentation](https://kubernetes.io/docs/concepts/workloads/pods/probes/).
+
+JMAP uses the `fma-http` ClusterIP Service and `ingress.yaml`, with HTTPS certificates from the same `fma-tls` Secret in namespace `fma`. Change the Ingress host and ConfigMap `FMA_JMAP_URL` to your domain. An existing Ingress controller is required; configure its upload limits and disable request buffering.
+
+<a id="jmap"></a>
+
+## 4. Using JMAP
+
+JMAP clients discover the session at `https://mail.example.com/.well-known/jmap`
+and authenticate using HTTP Basic with their existing account or alias and password.
+Use the returned `apiUrl`, `uploadUrl`, `downloadUrl` and `primaryAccounts`; account
+IDs are opaque, not the login name. Set `FMA_JMAP_URL` when the public origin differs.
+The HTTP listener is behind your HTTPS proxy; `/` remains the unauthenticated health check.
+
+```sh
+export JMAP_USER=alice
+export JMAP_PASSWORD='your-password'
+curl --fail --user "$JMAP_USER:$JMAP_PASSWORD" \
+  https://mail.example.com/.well-known/jmap
+```
+
+A JMAP client must support the Mail capability, not only JMAP contacts/calendars.
+Configure its server/session URL and credentials above. Server-side API calls use
+these capabilities:
+
+```json
+{
+  "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+  "methodCalls": [
+    ["Mailbox/get", {"accountId": "ACCOUNT_ID"}, "folders"],
+    ["Email/query", {"accountId": "ACCOUNT_ID", "limit": 20,
+      "sort": [{"property": "receivedAt", "isAscending": false}]}, "messages"],
+    ["Email/get", {"accountId": "ACCOUNT_ID",
+      "#ids": {"resultOf": "messages", "name": "Email/query", "path": "/ids"},
+      "fetchAllBodyValues": true}, "bodies"]
+  ]
+}
+```
+
+Save this as `request.json`, replace `ACCOUNT_ID` with the discovered account ID,
+and POST it to `apiUrl`:
+
+```sh
+curl --fail --user "$JMAP_USER:$JMAP_PASSWORD" \
+  --header 'Content-Type: application/json' --data-binary @request.json \
+  https://mail.example.com/api
+```
+
+| Operation | Methods / flow |
+| --- | --- |
+| Read and search | `Mailbox/get`, `Email/query`, `Email/get`, `Thread/get`, `SearchSnippet/get` |
+| Folder edits | `Mailbox/set`: create, rename, parent, subscription and destroy |
+| Message edits | `Email/set`: create drafts, update `keywords`/`mailboxIds`, destroy |
+| Import MIME | POST RFC 5322 bytes to `uploadUrl`, then `Email/import` with its `blobId` and destination `mailboxIds` |
+| Attachments | POST bytes to `uploadUrl`; reference the returned `blobId` in `Email/set` attachments. Download `Email/get` attachment `blobId` through `downloadUrl` |
+| Send | `Identity/get` → `Email/set` draft → `EmailSubmission/set` using `emailId` and `identityId` |
+| Delivery status | `EmailSubmission/get`; inspect `undoStatus` and per-recipient `deliveryStatus` |
+| Incremental sync | Persist each type's `state`, call `/changes` with `sinceState`; refresh created/updated IDs and remove destroyed IDs |
+| Search-result sync | `Email/queryChanges` with the prior `queryState`; restart the query if the server returns `cannotCalculateChanges` |
+| Optimistic writes | Supply `ifInState`; on `stateMismatch`, refresh and reconcile before retrying |
+
+For sending, add `urn:ietf:params:jmap:submission` to `using`. Example request body
+(replace all capitalized IDs with values from the server):
+
+```json
+{
+  "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:submission"],
+  "methodCalls": [["EmailSubmission/set", {
+    "accountId": "ACCOUNT_ID",
+    "create": {"send": {"emailId": "DRAFT_EMAIL_ID", "identityId": "IDENTITY_ID"}},
+    "onSuccessUpdateEmail": {"#send": {
+      "mailboxIds/DRAFTS_MAILBOX_ID": null,
+      "mailboxIds/SENT_MAILBOX_ID": true,
+      "keywords/$draft": null
+    }}
+  }, "submit"]]
+}
+```
+
+Upload a file using the session's upload URL after substituting `{accountId}`:
+
+```sh
+curl --fail --user "$JMAP_USER:$JMAP_PASSWORD" \
+  --header 'Content-Type: application/octet-stream' --data-binary @document.pdf \
+  'https://mail.example.com/upload/ACCOUNT_ID/'
+```
+
+Include `{"blobId":"UPLOADED_BLOB_ID","type":"application/pdf","name":"document.pdf"}`
+in the draft's `attachments` array. Multipart MIME, binary/empty attachments and
+Unicode filenames are supported. Incoming attachments are resolved from messages
+in the authenticated account; knowing another account's blob hash grants no access.
+A complete message/upload is limited to 6 GiB; composed attachments total at most
+4 GiB to leave room for MIME transfer encoding and headers.
+
+To/Cc/Bcc produce envelope recipients; Bcc is removed from the transmitted MIME.
+External recipients need `direct` or `relay`; local delivery works with outbound
+disabled. Queued submissions survive restarts and are swept by the existing
+15-second scheduler. JMAP submission records retain delivery receipts, while their
+active claim and retry index are cleared on completion. The claim window is 20
+seconds; each JMAP transmission attempt is limited to 6 seconds to leave time for
+fenced finalization and the library's clock-skew margin. Temporary failures retry.
+
+SMTP, IMAP, POP3 and JMAP share mailboxes: SMTP delivery appears in JMAP; JMAP folder,
+flag and message edits appear in IMAP/POP3. Synchronization uses durable `/changes`
+and `/queryChanges` cursors and works across restarts and nodes. EventSource and
+Web Push subscriptions are not enabled in this version; clients must poll changes.
+Do not interpret the RFC table as a claim to implement every optional extension.
+
+<a id="testing"></a>
+
+## 5. CI, testing and Fals3y
+
+### Local Fals3y
 
 Install the native [Fals3y](https://github.com/LukeOfEarth/fals3y) binary, then run:
 
@@ -111,7 +571,84 @@ The library handles protocol framing, TLS and SASL PLAIN; fma supplies S3 authen
 and mailbox sessions. `DELE` marks messages, `RSET` clears those marks, and `QUIT`
 commits deletion. Disconnecting without `QUIT` keeps the messages.
 
-## Accounts
+### Tests and builds
+
+```sh
+make test
+```
+
+Runs formatting checks, `go vet`, Go race tests, and S3/SMTP/POP3/IMAP integration tests
+against native Fals3y. Coverage includes concurrent claims, expiry takeover, rejection
+of stale completion, yielding at 1024 tasks, interrupted cleanup, concurrent UID
+allocation, listing over 1000 objects, outbound retries, folders, and process restart.
+The mail test process runs in an empty, read-only working directory. Tests do not use
+Docker. Set `FALS3Y_BIN` to override the default `~/.local/bin/fals3y` executable.
+
+Build metadata is injected at link time into three separate variables: `version`,
+`commit`, and `releaseTime`. `make build` and `make test` default to a UTC version
+such as `dev-20260910T120000Z`, the full Git commit, and an RFC3339 UTC build time.
+Override these with `VERSION`, `COMMIT`, and `RELEASE_TIME` when needed. Use Make
+instead of bare `go build` to populate this metadata. `fma --version` prints the
+version on its first line, followed by commit and release time.
+
+JMAP integration test entry point:
+
+```sh
+python3 scripts/verify_jmap.py
+```
+
+This script reuses the isolated native Fals3y fixture and is included in `make test` and CI. It covers authentication/account isolation, alias/proxy restrictions, folder hierarchy, state conflicts, import/create/destroy, search/threads, attachment upload/download/reuse, cross-protocol reads and writes, To/Cc/Bcc, queueing and process restart. The storage adapter also runs naust-jmap's contract tests for atomic batches, assertions, ordered scans, concurrency and reopen.
+
+### CI and releases
+
+GitHub Actions runs formatting, vet, race, native Fals3y integration tests, and a
+build on branch pushes and pull requests, using Go 1.25 and the current stable Go.
+Release configuration is checked with GoReleaser as part of CI.
+
+Push a semantic version tag to publish a GitHub Release after the same checks pass:
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+GoReleaser builds Linux, macOS, and Windows binaries for amd64 and arm64 without
+CGO. GoReleaser injects the tag version, full commit and UTC release-build time;
+snapshot builds use `dev-{datetime}`. This time identifies the build, which precedes
+the GitHub Release publication. Releases include tar.gz archives (ZIP on Windows), both READMEs, MIT license,
+deployment examples, and SHA-256 checksums. Version tags with prerelease suffixes
+produce prereleases. Publishing uses the workflow's built-in `GITHUB_TOKEN` with
+`contents: write`; no personal token or Docker daemon is required.
+
+Container publication is separate and **manual only**: open **Actions → Publish GHCR
+image → Run workflow**, or run:
+
+```sh
+gh workflow run ghcr.yml
+```
+
+The workflow resolves the latest stable GitHub Release, checks out that tag's commit,
+and publishes **Linux amd64/arm64 only** to `ghcr.io/jabberwocky238/fma:<release-tag>`
+and `:latest`. It uses the release version, source commit and release publication time
+for build metadata. `latest` moves to that release's image. The release must include
+the Dockerfile; this workflow does not build arbitrary main-branch changes or publish
+macOS/Windows images. It authenticates with `GITHUB_TOKEN` and `packages: write`.
+Binary releases remain available for all three operating systems and both architectures.
+
+For a local packaging check with GoReleaser v2:
+
+```sh
+goreleaser check
+goreleaser release --snapshot --clean
+```
+
+These workflows expect this project directory to be the GitHub repository root.
+
+<a id="bucket"></a>
+
+## 6. Bucket layout
+
+### Account kinds
 
 Each ID is a bucket-root prefix. **`<id>/.kind` is required** and selects exactly
 one type; configuration files for other types are ignored, so stale files cannot
@@ -172,331 +709,41 @@ must be provisioned externally with `.kind=account`; existing aliases need
 `.kind=alias`.** There is no automatic migration or registration API. To change a
 type, prepare its new configuration first and replace `.kind` last.
 
-## Connect to S3
-
-Build with Go 1.25 or newer. The bucket must already exist and support consistent
-reads and listings, ETags, and atomic conditional PUTs (`If-None-Match` and `If-Match`).
-
-```sh
-export FMA_S3_ENDPOINT=http://127.0.0.1:9000
-export FMA_S3_BUCKET=fma
-export FMA_S3_REGION=us-east-1
-export FMA_S3_ACCESS_KEY_ID=local
-export FMA_S3_SECRET_ACCESS_KEY=local
-./fma
-```
-
-Fals3y accepts arbitrary credentials, but the SDK requires a key pair. Use real
-credentials for other S3 services; `FMA_S3_SESSION_TOKEN` supports temporary credentials.
-The binary does not load local AWS configuration files. Mail configuration environment settings use the `FMA_` prefix, which is added centrally by the
-configuration reader. Flags `-s3-endpoint`,
-`-s3-bucket`, and `-s3-region` override connection settings. Startup fails if the bucket
-is unavailable. Listeners bind to loopback by default; see `./fma -h` for ports.
-
-Upload a TLS certificate chain and private key as `cert.pem` and `key.pem` before
-starting. The `-cert` and `-key` flags specify object keys, not filesystem paths.
-`FMA_RELAY_PASSWORD_FILE` and `FMA_RELAY_CA_FILE` also name objects in the same bucket.
-Certificates and relay configuration are loaded once at startup. `-tls-dir /run/fma/tls`
-reads `tls.crt` and `tls.key` from a read-only mounted Secret instead of S3.
-
-Logging uses the global structured logger. Set `LOG_LEVEL=debug|info|warn|error`
-(default `info`). DEBUG/INFO/WARN use stdout and ERROR/FATAL use stderr; this variable has no `FMA_` prefix and is read before configuration.
-Startup validates the complete configuration before connecting to S3 or opening
-listeners, failing on missing required values and reporting warnings such as disabled
-outbound delivery. `--version` needs no S3 configuration; `--queue` only needs S3.
-
-## Queue ownership and recovery
-
-Multiple nodes may share a bucket. `.lock` controls outbound scanning and claiming;
-it does not block protocol traffic or previously claimed jobs. The lease records
-its owner, start time, renewal time, and expiry. It renews every 15 seconds and expires
-after 30 seconds, allowing one interval of renewal slack. Release conditionally marks
-the lease expired, avoiding deletion of a successor's lock. Keep node clocks synchronized.
-
-The holder scans `.outbox/` immediately and every 15 seconds. Before execution, it
-claims each eligible task with a conditional PUT. A node holds at most 1024 active
-tasks. Claiming a batch of 1024 or reaching capacity immediately releases the scanner
-lease; the node waits until the next scan interval before competing again. Already
-claimed tasks continue running after release.
-
-Each preclaim records its owner, start time, and a fixed 20-second expiry. It is not
-renewed. Expiry cancels execution and leaves the task in S3 for another claim. Recovery
-occurs on a subsequent scan; a crashed scanner also requires lease expiry. An old
-worker cannot overwrite a successor using a stale ETag.
-
-Temporary SMTP errors persist per-recipient retry state with exponential backoff,
-starting at `-queue-retry`. Confirmed recipients are skipped on retries. Permanent
-failures complete after a local delivery-failure notice is stored.
-
-The preclaim is embedded in the task object, so deleting the task removes both.
-Completion first conditionally writes a terminal state that cannot be claimed again,
-then deletes the object. If deletion fails or the process crashes between these steps,
-a later scan retries deletion without sending again. `-queue` lists outstanding tasks;
-completed tasks are not retained as queue history.
-
-S3 and remote SMTP do not share a transaction. If a remote accepts a message but the
-worker times out or cannot persist confirmation, redelivery may duplicate it. Delivery
-is at least once, not exactly once. Mailbox UID allocation and catalog updates use
-conditional S3 writes to avoid concurrent nodes overwriting each other.
-
-## Bucket layout
-
 | Object key | Contents |
 | --- | --- |
-| `<id>/.kind` | Required type: `account`, `alias` or `proxy` |
-| `<user>/.password` | Account password |
+| `<id>/.kind` | account / alias / proxy |
+| `<account>/.password` | Account password |
 | `<alias>/.alias` | Target local ID |
-| `<proxy>/.proxy` | Forwarding destination email address |
-| `<proxy>/.proxy-errors/<id>.json` | Failure diagnostics without message bodies |
-| `<user>/<uid>.json`, `<user>/next` | Inbox messages and UID counter |
-| `<user>/folders` | Folder catalog, UIDVALIDITY, subscriptions, storage IDs |
-| `<user>/.folders/<id>/` | Other folders' messages and counters |
-| `.outbox/<id>.json` | Task body, recipient state, archive state, and preclaim |
-| `.lock` | Scanner lease |
-| `cert.pem`, `key.pem` | TLS certificate and private key |
+| `<proxy>/.proxy` | Forwarding address |
+| `<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body |
+| `<account>/.jmap/state.json` | Canonical mailbox metadata, indexes, state changes, UID bookkeeping, submission records and account lease |
+| `<account>/.jmap/blobs/<blobId>` | Immutable raw MIME, uploaded files and decoded MIME parts |
+| `.jmap-queue/<accountId>` | Durable discovery hint for submission accounts; not a delivery task or auth grant |
+| `.outbox/<id>.json` | SMTP outbound task and embedded preclaim |
+| `.lock` | Shared 15-second scan/renewal lease |
+| `cert.pem, key.pem` | TLS certificate and key unless mounted from a Secret |
 
-Renaming a folder updates its catalog without copying message bodies. Recreating a
-deleted folder assigns a new storage ID. Failed folder cleanup may leave unreachable
-objects. Migrate legacy layouts externally while the old service is stopped; the
-binary has no import path.
+Legacy `<account>/<uid>.json`, `next`, `folders` and `.folders/` data is converted on the account's first access, retaining the original objects. A conditional create publishes the complete metadata image; failures cannot publish a partial mailbox. Existing UIDs and folder storage identities are preserved. Stop every old-version node before upgrading; do not mix legacy writers with the new version. Old objects no longer receive updates and may be cleaned externally after verifying backups and the new mailbox. The binary exposes no registration or management commands. Unreferenced uploads and MIME objects remain in S3; no local temporary files or new background garbage collector are used.
 
-## Outbound mail and deployment
+<a id="credits"></a>
 
-Outbound delivery is disabled by default. Set `FMA_OUTBOUND_MODE=direct` to use MX
-delivery, or `relay` to use an SMTP relay. A relay is another SMTP server that
-accepts outbound mail from fma and delivers it to the recipient's mail provider;
-configure its address and credentials. These modes affect external delivery only,
-not receiving mail or reading local mailboxes.
-
-Generate deployment configuration interactively:
-
-```sh
-bash deploy/gen.sh
-make install
-```
-
-The generator asks for the domain, Linux service user and UID, installation paths,
-S3 connection and credentials, certificate object keys, outbound settings, retry
-delay, local protocol ports, and Certbot paths. Secret input is hidden on a terminal.
-Each field is checked before continuing. Malformed domains, IPv4/IPv6 addresses,
-endpoint URLs, relay addresses, paths and ports show an error and repeat that prompt.
-Non-secret surrounding whitespace is trimmed and mail domains are lowercased.
-Press Enter to accept defaults such as region `us-east-1`; secrets are preserved
-verbatim. Validation checks syntax, while the server checks S3 access at startup.
-Templates live in `deploy/template/` and use `@@NAME@@` placeholders. Generated
-files live in `deploy/generated/`, which is ignored by Git and excluded from release
-archives. Files are private by default; the generator asks before replacing existing
-configuration and preserves it if input is cancelled.
-
-The generator checks environment variables **before each prompt**. Set values are
-validated and used without asking; invalid environment values fail immediately and
-secrets are not echoed. For unattended deployments (including Kubernetes setup):
-
-```sh
-export FMA_DOMAIN=example.com
-export FMA_S3_ENDPOINT=https://s3.example.com
-export FMA_S3_BUCKET=fma
-export FMA_S3_ACCESS_KEY_ID=your-access-key
-export FMA_S3_SECRET_ACCESS_KEY=your-secret-key
-bash deploy/gen.sh --non-interactive
-```
-
-In this mode, unset fields use defaults and missing required fields fail instead of
-waiting for input. Region defaults to `us-east-1`. Set `FMA_OVERWRITE=yes` to replace
-existing generated files; the default preserves them. Environment lookup also works
-in interactive mode. Generator-only variables are rendered into service arguments;
-they do not add registration or configuration-management APIs to the mail process.
-
-| Generator fields | Environment variables |
-| --- | --- |
-| Domain, service identity | `FMA_DOMAIN`, `FMA_DEPLOY_USER`, `FMA_DEPLOY_UID`, `FMA_DEPLOY_HOME` |
-| Installation paths | `FMA_BINDIR`, `FMA_CONFIG_DIR`, `FMA_SYSTEMD_USER_DIR` (also for system units) |
-| S3 connection | `FMA_S3_ENDPOINT`, `FMA_S3_BUCKET`, `FMA_S3_REGION`, `FMA_S3_ACCESS_KEY_ID`, `FMA_S3_SECRET_ACCESS_KEY`, `FMA_S3_SESSION_TOKEN` |
-| Certificate object keys | `FMA_CERT_KEY`, `FMA_KEY_KEY` |
-| Outbound | `FMA_OUTBOUND_MODE`, `FMA_RELAY_ADDR`, `FMA_RELAY_TLS`, `FMA_RELAY_USER`, `FMA_RELAY_PASSWORD`, `FMA_RELAY_PASSWORD_FILE`, `FMA_RELAY_CA_FILE`, `FMA_QUEUE_RETRY` |
-| Ports | `FMA_SMTP_PORT`, `FMA_SUBMISSION_PORT`, `FMA_SMTPS_PORT`, `FMA_POP3_PORT`, `FMA_POP3S_PORT`, `FMA_IMAP_PORT`, `FMA_IMAPS_PORT`, `FMA_HTTP_PORT` |
-| Certbot paths | `FMA_LINEAGE`, `FMA_WEBROOT` |
-| Logging, overwrite | `LOG_LEVEL` (no prefix), `FMA_OVERWRITE` |
-
-Run `make install` as the selected user on the target Linux host. It requires the
-generated configuration, builds the binary, installs the generated systemd unit
-and environment files, then enables and restarts `fma.service`. Missing configuration
-fails before building or installing anything. Installation paths come from the
-generated `install.mk`; regenerate configuration to change them.
-
-Install `nginx-http.conf` and `nginx-https.conf` from `deploy/generated/` in the Nginx
-HTTP context. The generated `nginx-stream.conf` belongs at the top level, outside
-`http {}`. Public mail ports are standard; upstream loopback ports match the generated
-service. The HTTPS certificate must cover the configured domain, `www.<domain>`,
-and `mail.<domain>`. Upload the initial TLS certificate and account password objects
-to S3 before starting the mail service.
-
-Install `deploy/generated/renew-hook.sh` as a root-run Certbot deploy hook. It uploads
-renewed certificates using the selected user's S3 configuration and restarts that
-user's mail service. The target needs Bash, AWS CLI, Nginx, `runuser`, and systemd;
-the generator itself only needs Bash and standard Unix utilities. Nginx configuration
-and root-owned Certbot hooks are installed separately from `make install`.
-
-## Docker and Docker Compose
-
-The [Dockerfile](Dockerfile) uses a Go build stage and an Alpine 3.23 runtime with
-CA certificates. The runtime runs as UID/GID 65532 and needs no data volumes;
-accounts, TLS keys, messages and queues remain in your existing S3 bucket.
-See [Docker's multi-stage build documentation](https://docs.docker.com/build/building/multi-stage/).
-
-```sh
-cp .env.example .env
-# Edit .env: set your domain, S3 endpoint/bucket and credentials.
-# Upload cert.pem, key.pem and account objects to that bucket first.
-docker compose up -d --build
-docker compose logs -f fma
-docker compose down
-```
-
-The Compose configuration publishes standard SMTP/submission/POP3/IMAP TCP ports.
-HTTP health is published only on host loopback port 8080. Listeners inside the
-container bind `0.0.0.0`; `localhost` in an S3 endpoint refers to that container,
-so use a reachable external S3 address. `.env` is ignored by Git. No S3 container,
-local database or Docker volume is created. The container root filesystem is read-only.
-Containers run fma directly rather than invoking systemd or `install.sh`.
-
-Build an image yourself, optionally injecting version metadata:
-
-```sh
-docker build --build-arg COMMIT="$(git rev-parse HEAD)" -t fma:local .
-```
-
-`VERSION` and `RELEASE_TIME` are optional build arguments; without them the image uses
-`dev-{datetime}` and the UTC build time. The build context only includes the Go source,
-module files and Dockerfile; environment files and generated credentials are excluded.
-To use a published image with the same Compose settings:
-
-```sh
-FMA_IMAGE=ghcr.io/jabberwocky238/fma:latest docker compose up -d --no-build --pull always
-```
-
-## Kubernetes
-
-[deploy/kubernetes/](deploy/kubernetes/) provides a Kustomize deployment: two replicas,
-a configuration ConfigMap, a TCP LoadBalancer Service and a PodDisruptionBudget.
-The pods run without root privileges, local data volumes or Kubernetes API credentials.
-They share the same S3 bucket. The Service exposes the seven mail ports and keeps
-HTTP health internal. Your cluster must support LoadBalancer services, or you can
-adapt its type to your existing TCP entry point.
-
-Edit `deploy/kubernetes/configmap.yaml` for your domain and S3 endpoint/bucket.
-TLS comes directly from the Kubernetes `fma-tls` Secret (`kubernetes.io/tls`), mounted
-read-only at `/run/fma/tls`. Use an existing cert-manager Secret by changing
-`secretName` in `deployment.yaml`, or create one before applying the deployment:
-
-```sh
-kubectl create namespace fma --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n fma create secret tls fma-tls --cert=fullchain.pem --key=privkey.pem
-```
-
-No certificate objects are required in S3 for this deployment. Certificates are loaded
-at startup; after Secret renewal, restart the pods (or use your cluster's Secret
-reload controller). The process does not write or manage mounted certificate files.
-
-Set the image and tag in `kustomization.yaml` to a published
-GHCR version or your own pushed image. Create the credentials Secret in the same
-namespace as the deployment (`fma`):
-
-```sh
-kubectl -n fma create secret generic fma-s3 \
-  --from-literal=FMA_S3_ACCESS_KEY_ID="$FMA_S3_ACCESS_KEY_ID" \
-  --from-literal=FMA_S3_SECRET_ACCESS_KEY="$FMA_S3_SECRET_ACCESS_KEY" \
-  --from-literal=FMA_S3_SESSION_TOKEN="${FMA_S3_SESSION_TOKEN:-}" \
-  --dry-run=client -o yaml | kubectl -n fma apply -f -
-kubectl apply -k deploy/kubernetes
-kubectl -n fma rollout status deployment/fma
-kubectl -n fma get service fma
-```
-
-For a private registry package, configure an image pull Secret on the deployment.
-Pin an image version for reproducible rollouts; `latest` is pulled when a pod starts,
-but publishing it does not restart existing pods. Use `kubectl -n fma rollout restart deployment/fma`
-after changing environment settings or to refresh `latest`. Set resource requests/limits
-based on your workloads. Graceful shutdown allows 120 seconds for in-flight work.
-Startup, readiness and liveness probes use HTTP `/`, which checks the running process;
-it does not continuously verify S3 availability. See the
-[Kubernetes probe documentation](https://kubernetes.io/docs/concepts/workloads/pods/probes/).
-
-## Test
-
-```sh
-make test
-```
-
-Runs formatting checks, `go vet`, Go race tests, and S3/SMTP/POP3/IMAP integration tests
-against native Fals3y. Coverage includes concurrent claims, expiry takeover, rejection
-of stale completion, yielding at 1024 tasks, interrupted cleanup, concurrent UID
-allocation, listing over 1000 objects, outbound retries, folders, and process restart.
-The mail test process runs in an empty, read-only working directory. Tests do not use
-Docker. Set `FALS3Y_BIN` to override the default `~/.local/bin/fals3y` executable.
-
-Build metadata is injected at link time into three separate variables: `version`,
-`commit`, and `releaseTime`. `make build` and `make test` default to a UTC version
-such as `dev-20260910T120000Z`, the full Git commit, and an RFC3339 UTC build time.
-Override these with `VERSION`, `COMMIT`, and `RELEASE_TIME` when needed. Use Make
-instead of bare `go build` to populate this metadata. `fma --version` prints the
-version on its first line, followed by commit and release time.
-
-## CI and releases
-
-GitHub Actions runs formatting, vet, race, native Fals3y integration tests, and a
-build on branch pushes and pull requests, using Go 1.25 and the current stable Go.
-Release configuration is checked with GoReleaser as part of CI.
-
-Push a semantic version tag to publish a GitHub Release after the same checks pass:
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-GoReleaser builds Linux, macOS, and Windows binaries for amd64 and arm64 without
-CGO. GoReleaser injects the tag version, full commit and UTC release-build time;
-snapshot builds use `dev-{datetime}`. This time identifies the build, which precedes
-the GitHub Release publication. Releases include tar.gz archives (ZIP on Windows), both READMEs, MIT license,
-deployment examples, and SHA-256 checksums. Version tags with prerelease suffixes
-produce prereleases. Publishing uses the workflow's built-in `GITHUB_TOKEN` with
-`contents: write`; no personal token or Docker daemon is required.
-
-Container publication is separate and **manual only**: open **Actions → Publish GHCR
-image → Run workflow**, or run:
-
-```sh
-gh workflow run ghcr.yml
-```
-
-The workflow resolves the latest stable GitHub Release, checks out that tag's commit,
-and publishes **Linux amd64/arm64 only** to `ghcr.io/jabberwocky238/fma:<release-tag>`
-and `:latest`. It uses the release version, source commit and release publication time
-for build metadata. `latest` moves to that release's image. The release must include
-the Dockerfile; this workflow does not build arbitrary main-branch changes or publish
-macOS/Windows images. It authenticates with `GITHUB_TOKEN` and `packages: write`.
-Binary releases remain available for all three operating systems and both architectures.
-
-For a local packaging check with GoReleaser v2:
-
-```sh
-goreleaser check
-goreleaser release --snapshot --clean
-```
-
-These workflows expect this project directory to be the GitHub repository root.
-
-## License
+## 7. License and acknowledgements
 
 [MIT](LICENSE). Copyright © 2026 Jabberwocky238.
 
-## Acknowledgements
+Thanks to the following projects. Each retains its own license; fma's MIT license does not replace dependency licenses.
 
-Thanks to the projects that make fma possible:
-
-- [emersion/go-smtp](https://github.com/emersion/go-smtp) — SMTP server and client.
-- [emersion/go-imap](https://github.com/emersion/go-imap) — IMAP protocol and server.
-- [migadu/go-pop3](https://github.com/migadu/go-pop3) — POP3 protocol and server.
-- [Fals3y](https://github.com/LukeOfEarth/fals3y) — the native S3-compatible service
-  used for local development and integration tests.
+| Project | Purpose | License |
+| --- | --- | --- |
+| [emersion/go-smtp](https://github.com/emersion/go-smtp) | SMTP | [MIT](https://github.com/emersion/go-smtp/blob/v0.25.0/LICENSE) |
+| [emersion/go-imap](https://github.com/emersion/go-imap) | IMAP | [MIT](https://github.com/emersion/go-imap/blob/v1.2.1/LICENSE) |
+| [migadu/go-pop3](https://github.com/migadu/go-pop3) | POP3 | [MIT](https://github.com/migadu/go-pop3/blob/v0.1.4/LICENSE) |
+| [naust-mail/naust-jmap](https://github.com/naust-mail/naust-jmap) | JMAP Core and Mail | [Apache-2.0](https://github.com/naust-mail/naust-jmap/blob/main/LICENSE) |
+| [emersion/go-message](https://github.com/emersion/go-message) | MIME | [MIT](https://github.com/emersion/go-message/blob/v0.18.2/LICENSE) |
+| [emersion/go-sasl](https://github.com/emersion/go-sasl) | SASL | [MIT](https://github.com/emersion/go-sasl/blob/master/LICENSE) |
+| [aws/aws-sdk-go-v2](https://github.com/aws/aws-sdk-go-v2) | S3 SDK | [Apache-2.0](https://github.com/aws/aws-sdk-go-v2/blob/v1.36.3/LICENSE) |
+| [aws/smithy-go](https://github.com/aws/smithy-go) | AWS SDK support | [Apache-2.0](https://github.com/aws/smithy-go/blob/v1.22.2/LICENSE) |
+| [klauspost/compress](https://github.com/klauspost/compress) | Streaming gzip compression and decompression | [BSD-3-Clause](https://github.com/klauspost/compress/blob/v1.20.0/LICENSE) |
+| [WireGuard](https://github.com/WireGuard/wireguard-go/blob/ecfc5a8d54462e18e13c72173e2623d16d8e25a0/device/pools.go) | WaitPool design, adapted with cancellation | [MIT](https://github.com/WireGuard/wireguard-go/blob/ecfc5a8d54462e18e13c72173e2623d16d8e25a0/LICENSE) |
+| [LukeOfEarth/fals3y](https://github.com/LukeOfEarth/fals3y) | Native S3 for development and integration tests | [MIT](https://github.com/LukeOfEarth/fals3y/blob/v0.3.0/LICENSE) |
+| [golang.org/x/text](https://pkg.go.dev/golang.org/x/text) | Character encodings | [BSD-3-Clause](https://cs.opensource.google/go/x/text/+/refs/tags/v0.34.0:LICENSE) |

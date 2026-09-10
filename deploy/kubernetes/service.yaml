@@ -15,3 +15,14 @@ spec:
     - {name: pop3s, port: 995, targetPort: pop3s}
     - {name: imap, port: 143, targetPort: imap}
     - {name: imaps, port: 993, targetPort: imaps}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: fma
+  name: fma-http
+spec:
+  selector:
+    app: fma
+  ports:
+    - {name: http, port: 8080, targetPort: http}

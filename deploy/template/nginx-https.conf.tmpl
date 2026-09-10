@@ -5,7 +5,12 @@ server {
     ssl_certificate @@LINEAGE@@/fullchain.pem;
     ssl_certificate_key @@LINEAGE@@/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 6g;
     location / {
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
         proxy_pass http://127.0.0.1:@@HTTP_PORT@@;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto https;
