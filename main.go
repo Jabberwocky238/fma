@@ -794,6 +794,41 @@ func localUser(address string) string {
 	return parts[0]
 }
 
+type identityKind string
+
+const (
+	kindAccount identityKind = "account"
+	kindAlias   identityKind = "alias"
+	kindProxy   identityKind = "proxy"
+)
+
+func readKind(id string) (identityKind, error) {
+	if !usernameRE.MatchString(id) {
+		return "", fs.ErrNotExist
+	}
+	data, err := objects.Get(path.Join(id, ".kind"))
+	if err != nil {
+		return "", err
+	}
+	kind := identityKind(strings.TrimRight(string(data), "\r\n"))
+	switch kind {
+	case kindAccount, kindAlias, kindProxy:
+		return kind, nil
+	}
+	return "", fs.ErrNotExist
+}
+func aliasTarget(id string) (string, error) {
+	data, err := objects.Get(path.Join(id, ".alias"))
+	if err != nil {
+		return "", err
+	}
+	target := strings.TrimRight(string(data), "\r\n")
+	if !usernameRE.MatchString(target) {
+		return "", fs.ErrNotExist
+	}
+	return target, nil
+}
+
 // Aliases keep their own prefix; credentials and mailbox data belong to RootID.
 type accountIdentity struct {
 	LoginID string
@@ -812,16 +847,19 @@ func resolveIdentity(address string) (accountIdentity, error) {
 			return identity, fs.ErrNotExist
 		}
 		seen[identity.RootID] = true
-		data, err := objects.Get(path.Join(identity.RootID, ".alias"))
-		if errors.Is(err, fs.ErrNotExist) {
-			return identity, nil
-		}
+		kind, err := readKind(identity.RootID)
 		if err != nil {
 			return identity, err
 		}
-		target := strings.TrimRight(string(data), "\r\n")
-		if !usernameRE.MatchString(target) {
+		if kind == kindAccount {
+			return identity, nil
+		}
+		if kind != kindAlias {
 			return identity, fs.ErrNotExist
+		}
+		target, err := aliasTarget(identity.RootID)
+		if err != nil {
+			return identity, err
 		}
 		identity.RootID = target
 	}
@@ -1252,6 +1290,7 @@ type smtpSession struct {
 	user        string
 	from        string
 	remote      []string
+	proxies     []proxyRoute
 	recipients  []string
 }
 
@@ -1303,6 +1342,76 @@ func (s *smtpSession) Mail(from string, _ *smtp.MailOptions) error {
 	s.from = from
 	return nil
 }
+
+// A proxy-only prefix can receive mail without enabling password authentication.
+// Routing is resolved once at RCPT and persisted with the accepted task.
+type proxyRoute struct{ Address, Owner string }
+
+func resolveDelivery(user string) (local, remote, owner string, err error) {
+	seen := map[string]bool{}
+	for range 16 {
+		if seen[user] {
+			return "", "", "", &smtp.SMTPError{Code: 550, Message: "mail routing loop"}
+		}
+		seen[user] = true
+		kind, e := readKind(user)
+		if e != nil {
+			return "", "", "", e
+		}
+		switch kind {
+		case kindAccount:
+			if _, e := userPassword(user); e != nil {
+				return "", "", "", e
+			}
+			return user, "", owner, nil
+		case kindAlias:
+			user, e = aliasTarget(user)
+			if e != nil {
+				return "", "", "", e
+			}
+		case kindProxy:
+			data, e := objects.Get(path.Join(user, ".proxy"))
+			if e != nil {
+				return "", "", "", e
+			}
+			target := strings.TrimRight(string(data), "\r\n")
+			addr, parseErr := mail.ParseAddress(target)
+			if parseErr != nil || addr.Address != target || !strings.Contains(target, "@") || strings.ContainsAny(target, "\r\n") {
+				return "", "", "", &smtp.SMTPError{Code: 550, Message: "invalid mail proxy target"}
+			}
+			if owner == "" {
+				owner = user
+			}
+			next := localUser(target)
+			if next == "" {
+				domain := strings.ToLower(target[strings.LastIndex(target, "@")+1:])
+				if domain == config.Domain || domain == "mail."+config.Domain {
+					return "", "", "", fs.ErrNotExist
+				}
+				return "", target, owner, nil
+			}
+			user = next
+		}
+	}
+	return "", "", "", &smtp.SMTPError{Code: 550, Message: "mail routing chain too long"}
+}
+
+func proxyBody(body []byte) ([]byte, error) {
+	message, err := mail.ReadMessage(bytes.NewReader(body))
+	if err != nil {
+		return nil, &smtp.SMTPError{Code: 554, Message: "invalid forwarded message headers"}
+	}
+	hops := 0
+	for _, value := range message.Header["X-Fma-Proxy-Hops"] {
+		n, e := strconv.Atoi(value)
+		if e != nil || n < 0 || n >= 16 {
+			return nil, &smtp.SMTPError{Code: 554, Message: "mail proxy hop limit exceeded"}
+		}
+		hops = max(hops, n)
+	}
+	return append(fmt.Appendf(nil, "X-FMA-Proxy-Hops: %d\r\n", hops+1), body...), nil
+}
+
 func (s *smtpSession) Rcpt(to string, _ *smtp.RcptOptions) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -1327,16 +1436,30 @@ func (s *smtpSession) Rcpt(to string, _ *smtp.RcptOptions) error {
 		}
 		return nil
 	}
-	account, _, err := accountPassword(u)
+	local, remote, owner, err := resolveDelivery(u)
 	if err != nil {
+		var response *smtp.SMTPError
+		if errors.As(err, &response) {
+			return response
+		}
 		if errors.Is(err, fs.ErrNotExist) {
 			return &smtp.SMTPError{Code: 550, Message: "unknown local recipient"}
 		}
 		return &smtp.SMTPError{Code: 451, Message: "account storage unavailable"}
 	}
-	u = account.RootID
-	if !slices.Contains(s.recipients, u) {
-		s.recipients = append(s.recipients, u)
+	if remote != "" {
+		if !outboundEnabled() {
+			return &smtp.SMTPError{Code: 451, Message: "outbound transport not configured for proxy"}
+		}
+		if !slices.Contains(s.remote, remote) {
+			s.remote = append(s.remote, remote)
+		}
+		route := proxyRoute{Address: remote, Owner: owner}
+		if !slices.Contains(s.proxies, route) {
+			s.proxies = append(s.proxies, route)
+		}
+	} else if !slices.Contains(s.recipients, local) {
+		s.recipients = append(s.recipients, local)
 	}
 	return nil
 }
@@ -1345,13 +1468,13 @@ func (s *smtpSession) Data(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if err = queueMail(s.user, s.from, s.recipients, s.remote, b); err != nil {
+	if err = queueMail(s.user, s.from, s.recipients, s.remote, b, s.proxies...); err != nil {
 		return fmt.Errorf("mail storage: %w", err)
 	}
 	logger.Info(fmt.Sprintf("SMTP DATA accepted peer=%q user=%q local=%d remote=%d", s.peer, s.user, len(s.recipients), len(s.remote)))
 	return nil
 }
-func (s *smtpSession) Reset()      { s.recipients = nil; s.remote = nil; s.from = "" }
+func (s *smtpSession) Reset()      { s.recipients = nil; s.remote = nil; s.proxies = nil; s.from = "" }
 func (*smtpSession) Logout() error { return nil }
 
 // Auth Login
@@ -1908,11 +2031,12 @@ func (h *mailboxSelect) Handle(c server.Conn) error {
 const outbox = ".outbox"
 
 type outboundRecipient struct {
-	Address  string
-	State    string
-	Attempts int
-	Next     time.Time
-	Error    string
+	ProxyOwners []string `json:"proxy_owners,omitempty"`
+	Address     string
+	State       string
+	Attempts    int
+	Next        time.Time
+	Error       string
 }
 type outboundJob struct {
 	ID         string
@@ -1929,7 +2053,7 @@ type outboundJob struct {
 
 func outboundEnabled() bool { return config.OutboundMode == "relay" || config.OutboundMode == "direct" }
 
-func queueMail(user, from string, local, remote []string, body []byte) error {
+func queueMail(user, from string, local, remote []string, body []byte, proxies ...proxyRoute) error {
 	if len(remote) == 0 {
 		if err := deliver(local, body); err != nil {
 			return err
@@ -1943,9 +2067,23 @@ func queueMail(user, from string, local, remote []string, body []byte) error {
 	if _, err := rand.Read(id[:]); err != nil {
 		return err
 	}
-	job := &outboundJob{ID: fmt.Sprintf("%x", id), User: user, From: from, Body: body, Created: time.Now()}
+	queuedBody := body
+	if len(proxies) > 0 {
+		var err error
+		queuedBody, err = proxyBody(body)
+		if err != nil {
+			return err
+		}
+	}
+	job := &outboundJob{ID: fmt.Sprintf("%x", id), User: user, From: from, Body: queuedBody, Created: time.Now()}
 	for _, address := range remote {
-		job.Recipients = append(job.Recipients, outboundRecipient{Address: address, State: "pending"})
+		recipient := outboundRecipient{Address: address, State: "pending"}
+		for _, route := range proxies {
+			if route.Address == address && !slices.Contains(recipient.ProxyOwners, route.Owner) {
+				recipient.ProxyOwners = append(recipient.ProxyOwners, route.Owner)
+			}
+		}
+		job.Recipients = append(job.Recipients, recipient)
 	}
 	// Publish a complete queue object only after local delivery succeeds.
 	if err := deliver(local, body); err != nil {
@@ -2011,20 +2149,40 @@ func (claim *claimedTask) process(ctx context.Context) error {
 		}
 		logger.Info(fmt.Sprintf("outbound id=%s recipient=%s state=%s attempt=%d error=%q", job.ID, r.Address, r.State, r.Attempts, r.Error))
 	}
-	var failed []string
+	notices := map[string][]string{}
+	proxyFailures := map[string][]string{}
 	pending := false
 	for _, r := range job.Recipients {
 		if r.State == "pending" {
 			pending = true
 		}
 		if r.State == "failed" {
-			failed = append(failed, r.Address+": "+r.Error)
+			for _, owner := range r.ProxyOwners {
+				proxyFailures[owner] = append(proxyFailures[owner], r.Address+": "+r.Error)
+			}
+			if job.User != "" {
+				notices[job.User] = append(notices[job.User], r.Address+": "+r.Error)
+			}
 		}
 	}
-	if !pending && len(failed) > 0 && !job.Notified {
-		notice := fmt.Sprintf("From: mailer-daemon@%s\r\nTo: %s\r\nDate: %s\r\nMessage-ID: <%s-failure@mail.%s>\r\nSubject: Delivery failed [%s]\r\nContent-Type: text/plain; charset=utf-8\r\nAuto-Submitted: auto-replied\r\n\r\nOutbound delivery failed. Queue ID: %s\r\n%s\r\n", config.Domain, job.From, time.Now().Format(time.RFC1123Z), job.ID, config.Domain, job.ID, job.ID, strings.Join(failed, "\r\n"))
-		if err := deliver([]string{job.User}, []byte(notice)); err != nil {
-			return err
+	if !pending && !job.Notified {
+		for owner, failures := range proxyFailures {
+			// A proxy has no mailbox. Retain diagnostics in S3 without keeping the message.
+			report := struct {
+				TaskID   string
+				Created  time.Time
+				Failures []string
+			}{job.ID, job.Created, failures}
+			if err := writeJSON(path.Join(owner, ".proxy-errors", job.ID+".json"), report); err != nil {
+				return err
+			}
+		}
+		for user, failed := range notices {
+			notice := fmt.Sprintf("From: mailer-daemon@%s\r\nTo: %s@%s\r\nDate: %s\r\nMessage-ID: <%s-failure@mail.%s>\r\nSubject: Delivery failed [%s]\r\nContent-Type: text/plain; charset=utf-8\r\nAuto-Submitted: auto-replied\r\n\r\nOutbound delivery failed. Queue ID: %s\r\n%s\r\n", config.Domain, user, config.Domain, time.Now().Format(time.RFC1123Z), job.ID, config.Domain, job.ID, job.ID, strings.Join(failed, "\r\n"))
+			// Failure notices stay local and never re-enter proxy routing.
+			if err := deliver([]string{user}, []byte(notice)); err != nil {
+				return err
+			}
 		}
 		job.Notified = true
 		if err := claim.save(ctx); err != nil {

@@ -113,15 +113,27 @@ commits deletion. Disconnecting without `QUIT` keeps the messages.
 
 ## Accounts
 
-Each username is a bucket-root prefix. The contents of `<user>/.password` define
-the password. Provision accounts directly through S3:
+Each ID is a bucket-root prefix. **`<id>/.kind` is required** and selects exactly
+one type; configuration files for other types are ignored, so stale files cannot
+silently change routing or authentication.
+
+| `.kind` | Configuration | Behavior |
+| --- | --- | --- |
+| `account` | `.password`: nonempty password | A real mailbox with protocol login |
+| `alias` | `.alias`: another local ID | Resolves to that ID; login only if the chain ends at an account |
+| `proxy` | `.proxy`: one full email address | Forward-only, no login and no local copy of the message |
+
+Prepare the type-specific object first, then write `.kind` to activate it:
+
 
 ```sh
 printf '%s' 'your-password' | curl -f -X PUT --data-binary @- \
   http://127.0.0.1:9000/fma/alice/.password
+printf '%s' account | curl -f -X PUT --data-binary @- \
+  http://127.0.0.1:9000/fma/alice/.kind
 ```
 
-Creating this object enables the account; overwriting it changes the password;
+Once `.kind=account` exists, overwriting `.password` changes the password;
 deleting it rejects subsequent logins and local SMTP recipient checks. No server
 restart is needed. Existing authenticated sessions are not automatically revoked.
 
@@ -131,12 +143,34 @@ newlines; trailing CR/LF characters are stripped. Password objects contain plain
 credentials, protected by the bucket's access controls. Authentication and local
 recipient checks read S3 on every request, without an account list or password cache.
 
-Alias accounts are provisioned externally: put the root username in `<alias>/.alias`.
+Alias accounts are provisioned externally: set `<alias>/.kind` to `alias` and put
+the target local ID in `<alias>/.alias`.
 The alias keeps its own prefix and uses the root account password and mailbox.
 Alias chains are resolved on each login and recipient lookup; cycles and missing
 accounts are rejected. Hidden metadata objects such as `.profile.json` are excluded
 from mail listings. Protocol logins retain the login ID separately from the root ID;
 SMTP, POP3 and IMAP do not expose an avatar/profile management API.
+
+For forwarding, write the destination address to `<id>/.proxy` and set `.kind` to
+`proxy`. The destination may be local or external. Local targets resolve immediately;
+external forwarding uses the durable S3 outbound queue and requires `direct` or `relay`.
+Unauthenticated inbound SMTP may deliver to a configured local proxy, but cannot
+choose arbitrary external destinations. MIME bodies and attachments remain intact;
+forwarding adds only an `X-FMA-Proxy-Hops` header for external loop protection.
+Alias/proxy chains are limited to 16 local hops, and external proxy hops to 16.
+
+Routing is read from S3 on each RCPT and stored with accepted tasks. Changing the
+proxy affects later SMTP transactions, not already queued mail. Multiple recipients
+forwarding to the same destination produce one delivery. Forwarding preserves the
+original envelope sender; no SRS rewriting is implemented, so the destination's
+sender policy can still reject forwarded mail. Permanent failures are recorded as
+metadata under `<proxy>/.proxy-errors/<task-id>.json`, without retaining the message
+body. The completed task and its preclaim are then removed together.
+
+Missing or invalid `.kind` values reject login and delivery. **Existing accounts
+must be provisioned externally with `.kind=account`; existing aliases need
+`.kind=alias`.** There is no automatic migration or registration API. To change a
+type, prepare its new configuration first and replace `.kind` last.
 
 ## Connect to S3
 
@@ -209,8 +243,11 @@ conditional S3 writes to avoid concurrent nodes overwriting each other.
 
 | Object key | Contents |
 | --- | --- |
+| `<id>/.kind` | Required type: `account`, `alias` or `proxy` |
 | `<user>/.password` | Account password |
-| `<alias>/.alias` | Root username for a shared account |
+| `<alias>/.alias` | Target local ID |
+| `<proxy>/.proxy` | Forwarding destination email address |
+| `<proxy>/.proxy-errors/<id>.json` | Failure diagnostics without message bodies |
 | `<user>/<uid>.json`, `<user>/next` | Inbox messages and UID counter |
 | `<user>/folders` | Folder catalog, UIDVALIDITY, subscriptions, storage IDs |
 | `<user>/.folders/<id>/` | Other folders' messages and counters |

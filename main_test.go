@@ -196,6 +196,7 @@ func TestOutboundPermanentFailureNotifiesSender(t *testing.T) {
 }
 func TestExternalRecipientRequiresAuthentication(t *testing.T) {
 	outboundTestDir(t)
+	checkError(t, objects.Put("jw238/.kind", []byte("account")))
 	checkError(t, objects.Put("jw238/.password", []byte("123123")))
 	session := &smtpSession{}
 	if session.Rcpt("recipient@example.net", nil) == nil {
@@ -610,6 +611,7 @@ func TestS3StorageReloadAndPagination(t *testing.T) {
 	if authenticate("alice", "secret") {
 		t.Fatal("missing account accepted")
 	}
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
 	checkError(t, objects.Put("alice/.password", []byte("secret")))
 	if !authenticate("alice", "secret") {
 		t.Fatal("external account was not discovered")
@@ -818,6 +820,7 @@ func TestExternalAccountsWithoutReload(t *testing.T) {
 	if authenticate("alice", "secret") {
 		t.Fatal("missing account accepted")
 	}
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
 	checkError(t, objects.Put("alice/.password", []byte("secret\n")))
 	if !authenticate("alice@t12e.cc", "secret") || authenticate("alice", "wrong") {
 		t.Fatal("new account authentication failed")
@@ -827,6 +830,7 @@ func TestExternalAccountsWithoutReload(t *testing.T) {
 	if session.Rcpt("alicex@t12e.cc", nil) == nil {
 		t.Fatal("prefix isolation failed")
 	}
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
 	checkError(t, objects.Put("alice/.password", []byte("changed")))
 	if authenticate("alice", "secret") || !authenticate("alice", "changed") {
 		t.Fatal("password change required reload")
@@ -835,6 +839,7 @@ func TestExternalAccountsWithoutReload(t *testing.T) {
 	if authenticate("alice", "changed") || session.Rcpt("alice@t12e.cc", nil) == nil {
 		t.Fatal("deleted account still accepted")
 	}
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
 	checkError(t, objects.Put("alice/.password", nil))
 	if authenticate("alice", "") || session.Rcpt("alice@t12e.cc", nil) == nil {
 		t.Fatal("empty password accepted")
@@ -1035,7 +1040,9 @@ func TestConfigEnvironmentPrefixAndOfflineVersion(t *testing.T) {
 
 func TestAliasIdentityAndSharedMailbox(t *testing.T) {
 	outboundTestDir(t)
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
 	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	checkError(t, objects.Put("sales/.kind", []byte("alias")))
 	checkError(t, objects.Put("sales/.alias", []byte("alice\n")))
 	checkError(t, objects.Put("sales/.password", []byte("ignored")))
 	checkError(t, objects.Put("alice/.profile.json", []byte(`{"display_name":"Alice","avatar":"avatar.png"}`)))
@@ -1086,7 +1093,9 @@ func TestAliasIdentityAndSharedMailbox(t *testing.T) {
 	if len(mailbox) != 1 {
 		t.Fatal("disconnect committed alias deletes")
 	}
+	checkError(t, objects.Put("other/.kind", []byte("account")))
 	checkError(t, objects.Put("other/.password", []byte("different")))
+	checkError(t, objects.Put("sales/.kind", []byte("alias")))
 	checkError(t, objects.Put("sales/.alias", []byte("other")))
 	if authenticate("sales", "secret") || !authenticate("sales", "different") {
 		t.Fatal("alias target change not immediate")
@@ -1098,8 +1107,10 @@ func TestAliasIdentityAndSharedMailbox(t *testing.T) {
 
 func TestInvalidAliasesFailClosed(t *testing.T) {
 	outboundTestDir(t)
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
 	checkError(t, objects.Put("alice/.password", []byte("secret")))
 	for _, target := range []string{"", "missing", "../alice", "alice@t12e.cc", "sales"} {
+		checkError(t, objects.Put("sales/.kind", []byte("alias")))
 		checkError(t, objects.Put("sales/.alias", []byte(target)))
 		if authenticate("sales", "secret") {
 			t.Fatalf("invalid alias accepted: %q", target)
@@ -1108,7 +1119,9 @@ func TestInvalidAliasesFailClosed(t *testing.T) {
 			t.Fatal("invalid alias recipient accepted")
 		}
 	}
+	checkError(t, objects.Put("sales/.kind", []byte("alias")))
 	checkError(t, objects.Put("sales/.alias", []byte("support")))
+	checkError(t, objects.Put("support/.kind", []byte("alias")))
 	checkError(t, objects.Put("support/.alias", []byte("sales")))
 	if authenticate("sales", "secret") {
 		t.Fatal("alias cycle accepted")
@@ -1201,4 +1214,158 @@ func TestMountedTLSSecret(t *testing.T) {
 	c.CertFile = ""
 	c.KeyFile = ""
 	checkError(t, checkConfig(c))
+}
+
+func TestIdentityKindSelectsConfiguration(t *testing.T) {
+	outboundTestDir(t)
+	for key, value := range map[string]string{
+		"slot/.password": "slot-password", "slot/.alias": "root", "slot/.proxy": "remote@example.net",
+		"root/.kind": "account", "root/.password": "root-password",
+	} {
+		checkError(t, objects.Put(key, []byte(value)))
+	}
+	for _, kind := range []string{"", "unknown", "account alias", "ACCOUNT"} {
+		checkError(t, objects.Put("slot/.kind", []byte(kind)))
+		if authenticate("slot", "slot-password") || (&smtpSession{}).Rcpt("slot@t12e.cc", nil) == nil {
+			t.Fatal("invalid kind accepted", kind)
+		}
+	}
+	checkError(t, objects.Delete("slot/.kind"))
+	if authenticate("slot", "slot-password") {
+		t.Fatal("missing kind inferred from password")
+	}
+	checkError(t, objects.Put("slot/.kind", []byte("account\n")))
+	if !authenticate("slot", "slot-password") || authenticate("slot", "root-password") {
+		t.Fatal("account used alias or proxy config")
+	}
+	account := &smtpSession{}
+	checkError(t, account.Rcpt("slot@t12e.cc", nil))
+	if len(account.remote) != 0 || len(account.recipients) != 1 || account.recipients[0] != "slot" {
+		t.Fatal("account routed via stale proxy")
+	}
+	checkError(t, objects.Put("slot/.kind", []byte("alias")))
+	if !authenticate("slot", "root-password") || authenticate("slot", "slot-password") {
+		t.Fatal("alias used stale password")
+	}
+	checkError(t, objects.Put("slot/.kind", []byte("proxy")))
+	if authenticate("slot", "slot-password") || authenticate("slot", "root-password") {
+		t.Fatal("proxy allowed authentication")
+	}
+	proxy := &smtpSession{}
+	checkError(t, proxy.Rcpt("slot@t12e.cc", nil))
+	if len(proxy.remote) != 1 || proxy.remote[0] != "remote@example.net" || len(proxy.recipients) != 0 {
+		t.Fatal("proxy used stale account or alias")
+	}
+}
+
+func TestProxyLocalRoutingAndCycles(t *testing.T) {
+	outboundTestDir(t)
+	config.OutboundMode = "disabled"
+	for key, value := range map[string]string{
+		"forward/.kind": "proxy", "forward/.proxy": "alias@t12e.cc",
+		"alias/.kind": "alias", "alias/.alias": "root",
+		"root/.kind": "account", "root/.password": "secret",
+	} {
+		checkError(t, objects.Put(key, []byte(value)))
+	}
+	body := []byte("From: sender@example.net\r\nSubject: local proxy\r\n\r\noriginal\r\n")
+	session := &smtpSession{}
+	checkError(t, session.Mail("sender@example.net", nil))
+	checkError(t, session.Rcpt("forward@t12e.cc", nil))
+	checkError(t, session.Rcpt("root@t12e.cc", nil))
+	checkError(t, session.Data(bytes.NewReader(body)))
+	mailbox, err := messages("root")
+	checkError(t, err)
+	if len(mailbox) != 1 || !bytes.Equal(mailbox[0].Body, body) {
+		t.Fatal("local proxy lost or duplicated mail")
+	}
+	mailbox, err = messages("forward")
+	checkError(t, err)
+	if len(mailbox) != 0 {
+		t.Fatal("proxy kept a local copy")
+	}
+	for _, target := range []string{"forward@t12e.cc", "bad", "one@example.net,two@example.net", "name <one@example.net>", "../root@t12e.cc", "missing@t12e.cc", "remote@example.net"} {
+		checkError(t, objects.Put("forward/.proxy", []byte(target)))
+		if (&smtpSession{}).Rcpt("forward@t12e.cc", nil) == nil {
+			t.Fatal("invalid/disabled proxy accepted", target)
+		}
+	}
+	checkError(t, objects.Put("forward/.proxy", []byte("alias@t12e.cc")))
+	checkError(t, objects.Put("alias/.alias", []byte("forward")))
+	if (&smtpSession{}).Rcpt("forward@t12e.cc", nil) == nil {
+		t.Fatal("mixed alias/proxy loop accepted")
+	}
+}
+
+func TestProxyRemoteDurabilityAndFailure(t *testing.T) {
+	for _, failure := range []bool{false, true} {
+		t.Run(fmt.Sprint(failure), func(t *testing.T) {
+			outboundTestDir(t)
+			relay := newFakeRelay(t, true)
+			if failure {
+				relay.code.Store(550)
+			}
+			for _, id := range []string{"first", "second"} {
+				checkError(t, objects.Put(id+"/.kind", []byte("proxy")))
+				checkError(t, objects.Put(id+"/.proxy", []byte("destination@example.net")))
+			}
+			body := []byte("From: sender@example.net\r\nTo: first@t12e.cc\r\nSubject: forwarded\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAwQF\r\n")
+			s := &smtpSession{}
+			checkError(t, s.Mail("sender@example.net", nil))
+			checkError(t, s.Rcpt("first@t12e.cc", nil))
+			checkError(t, s.Rcpt("second@t12e.cc", nil))
+			// Retargeting after RCPT must not alter the accepted routing snapshot.
+			checkError(t, objects.Put("first/.proxy", []byte("changed@example.net")))
+			checkError(t, s.Data(bytes.NewReader(body)))
+			key, job := queuedJob(t)
+			if job.User != "" || job.From != "sender@example.net" || len(job.Recipients) != 1 || job.Recipients[0].Address != "destination@example.net" || len(job.Recipients[0].ProxyOwners) != 2 {
+				t.Fatal("proxy routing was not persisted")
+			}
+			if !bytes.Equal(job.Body, append([]byte("X-FMA-Proxy-Hops: 1\r\n"), body...)) {
+				t.Fatal("forwarding changed MIME content")
+			}
+			for _, id := range []string{"first", "second"} {
+				mailbox, err := messages(id)
+				checkError(t, err)
+				if len(mailbox) != 0 {
+					t.Fatal("proxy stored original mail")
+				}
+			}
+			claimAndProcess(t, key) // Reloads the S3 task as a fresh worker.
+			if _, err := objects.Get(key); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal("completed proxy task/preclaim not deleted", err)
+			}
+			if !failure && relay.received.Load() != 1 {
+				t.Fatal("duplicate proxy delivery")
+			}
+			if failure {
+				for _, id := range []string{"first", "second"} {
+					report, err := objects.Get(id + "/.proxy-errors/" + job.ID + ".json")
+					checkError(t, err)
+					if !bytes.Contains(report, []byte("destination@example.net")) || bytes.Contains(report, []byte("AAECAwQF")) {
+						t.Fatal("invalid proxy failure report")
+					}
+				}
+				if _, err := objects.Get("next"); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatal("failure wrote into empty account")
+				}
+			}
+			s.Reset()
+			if len(s.proxies) != 0 {
+				t.Fatal("proxy route leaked into next SMTP transaction")
+			}
+		})
+	}
+}
+
+func TestProxyHopLimit(t *testing.T) {
+	body := []byte("Subject: loop\r\n\r\nbody\r\n")
+	for range 16 {
+		var err error
+		body, err = proxyBody(body)
+		checkError(t, err)
+	}
+	if _, err := proxyBody(body); err == nil {
+		t.Fatal("external proxy loop not bounded")
+	}
 }

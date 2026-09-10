@@ -314,6 +314,7 @@ def local():
             work.mkdir(mode=0o500)
             for user,password in [('jw238','123123'),('jw238x','different-password')] + [(u, 'mime-password') for u in ['mime-to', 'mime-cc', 'mime-bcc', 'mime-header-only']]:
                 s3_request(f'/{bucket}/{user}/.password', 'PUT', password.encode())
+                s3_request(f'/{bucket}/{user}/.kind', 'PUT', b'account')
             sockets = [socket.socket() for _ in range(8)]
             for sock in sockets:
                 sock.bind(('127.0.0.1', 0))
