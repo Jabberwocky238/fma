@@ -52,6 +52,10 @@ import (
 	smtp "github.com/emersion/go-smtp"
 	"github.com/migadu/go-pop3/pop3"
 	"github.com/migadu/go-pop3/pop3server"
+	jmap "github.com/naust-mail/naust-jmap/core/jmap"
+	jauth "github.com/naust-mail/naust-jmap/core/providers/auth"
+	jbackend "github.com/naust-mail/naust-jmap/core/providers/backend"
+	jblob "github.com/naust-mail/naust-jmap/core/providers/blob"
 )
 
 // Main
@@ -2482,3 +2486,261 @@ func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient s
 	}
 	return nil
 }
+
+// JMAP's ordered key/value records for one account commit in one conditional
+// S3 write. Binary MIME blobs live separately, so transactions copy metadata only.
+// There is no local database and no process-owned lease or background maintainer.
+type jmapBackend struct {
+	key    string
+	store  objectStore
+	mu     sync.RWMutex
+	closed bool
+}
+
+func (b *jmapBackend) snapshot(ctx context.Context) (map[string][]byte, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	data, etag, err := b.store.(versionedStore).GetVersion(b.key)
+	if errors.Is(err, fs.ErrNotExist) {
+		return map[string][]byte{}, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	var state map[string][]byte
+	if err = json.Unmarshal(data, &state); err != nil {
+		return nil, "", err
+	}
+	if state == nil {
+		return nil, "", fmt.Errorf("invalid JMAP metadata: %s", b.key)
+	}
+	return state, etag, nil
+}
+func (b *jmapBackend) Get(ctx context.Context, key []byte) ([]byte, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return nil, fs.ErrClosed
+	}
+	state, _, err := b.snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	value, ok := state[hex.EncodeToString(key)]
+	if !ok {
+		return nil, jbackend.ErrNotFound
+	}
+	return value, nil
+}
+func (b *jmapBackend) Scan(ctx context.Context, start, end []byte, reverse bool, visit func([]byte, []byte) bool) error {
+	b.mu.RLock()
+	if b.closed {
+		b.mu.RUnlock()
+		return fs.ErrClosed
+	}
+	state, _, err := b.snapshot(ctx)
+	b.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(state))
+	for key := range state {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if reverse {
+		slices.Reverse(keys)
+	}
+	for _, encoded := range keys {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		key, err := hex.DecodeString(encoded)
+		if err != nil {
+			return err
+		}
+		if bytes.Compare(key, start) >= 0 && (end == nil || bytes.Compare(key, end) < 0) {
+			if !visit(key, state[encoded]) {
+				break
+			}
+		}
+	}
+	return nil
+}
+func (b *jmapBackend) WriteBatch(ctx context.Context, batch *jbackend.Batch) error {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return fs.ErrClosed
+	}
+	for attempt := 0; attempt < 128; attempt++ {
+		state, etag, err := b.snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		// Assertions are tested against the pre-batch state, even when a Set
+		// earlier in this batch targets the same key.
+		for _, op := range batch.Ops {
+			if op.Kind != jbackend.OpAssert {
+				continue
+			}
+			value, found := state[hex.EncodeToString(op.Key)]
+			if (op.Value == nil && found) || (op.Value != nil && (!found || !bytes.Equal(value, op.Value))) {
+				return jbackend.ErrAssertFailed
+			}
+		}
+		for _, op := range batch.Ops {
+			key := hex.EncodeToString(op.Key)
+			switch op.Kind {
+			case jbackend.OpSet:
+				state[key] = bytes.Clone(op.Value)
+			case jbackend.OpDelete:
+				delete(state, key)
+			case jbackend.OpAdd:
+				var value int64
+				if old, ok := state[key]; ok {
+					value, err = jbackend.DecodeInt64(old)
+					if err != nil {
+						return err
+					}
+				}
+				state[key] = jbackend.EncodeInt64(value + op.Delta)
+			case jbackend.OpAssert:
+			default:
+				return fmt.Errorf("unknown JMAP batch operation: %d", op.Kind)
+			}
+		}
+		data, err := json.Marshal(state)
+		if err != nil {
+			return err
+		}
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if etag == "" {
+			err = b.store.Create(b.key, data)
+		} else {
+			err = b.store.(versionedStore).Swap(b.key, data, etag)
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+	}
+	return fmt.Errorf("JMAP metadata contention: %s", b.key)
+}
+func (b *jmapBackend) Close() error { b.mu.Lock(); defer b.mu.Unlock(); b.closed = true; return nil }
+
+type jmapBlobs struct{ store objectStore }
+
+func jmapAccountID(root string) jmap.Id { return jmap.Id("A" + hex.EncodeToString([]byte(root))) }
+func jmapRoot(acct jmap.Id) (string, error) {
+	if !strings.HasPrefix(string(acct), "A") {
+		return "", jauth.ErrUnauthenticated
+	}
+	data, err := hex.DecodeString(string(acct)[1:])
+	root := string(data)
+	if err != nil || !usernameRE.MatchString(root) {
+		return "", jauth.ErrUnauthenticated
+	}
+	return root, nil
+}
+func (s jmapBlobs) key(acct, id jmap.Id) (string, error) {
+	root, err := jmapRoot(acct)
+	if err != nil {
+		return "", err
+	}
+	if !regexp.MustCompile(`^G[A-Za-z0-9_-]{43}$`).MatchString(string(id)) {
+		return "", jblob.ErrNotFound
+	}
+	return root + "/.jmap/blobs/" + string(id), nil
+}
+func (s jmapBlobs) Put(ctx context.Context, acct, id jmap.Id, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key, err := s.key(acct, id)
+	if err != nil {
+		return err
+	}
+	if id != jblob.IdFor(data) {
+		return fmt.Errorf("JMAP blob content hash mismatch")
+	}
+	err = s.store.Create(key, data)
+	if errors.Is(err, fs.ErrExist) {
+		return nil
+	}
+	return err
+}
+func (s jmapBlobs) Open(ctx context.Context, acct, id jmap.Id) (io.ReadCloser, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	key, err := s.key(acct, id)
+	if err != nil {
+		return nil, 0, err
+	}
+	data, err := s.store.Get(key)
+	if errors.Is(err, fs.ErrNotExist) {
+		err = jblob.ErrNotFound
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+}
+func (s jmapBlobs) Delete(ctx context.Context, acct, id jmap.Id) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key, err := s.key(acct, id)
+	if err != nil {
+		return err
+	}
+	err = s.store.Delete(key)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+func (s jmapBlobs) Create(ctx context.Context, acct jmap.Id) (jblob.BlobWriter, error) {
+	if _, err := jmapRoot(acct); err != nil {
+		return nil, err
+	}
+	return &jmapBlobWriter{ctx: ctx, store: s, account: acct}, ctx.Err()
+}
+
+type jmapBlobWriter struct {
+	bytes.Buffer
+	ctx      context.Context
+	store    jmapBlobs
+	account  jmap.Id
+	finished bool
+}
+
+func (w *jmapBlobWriter) Write(data []byte) (int, error) {
+	if w.finished {
+		return 0, fs.ErrClosed
+	}
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if w.Len()+len(data) > 25<<20 {
+		return 0, fmt.Errorf("JMAP upload exceeds 25 MiB")
+	}
+	return w.Buffer.Write(data)
+}
+func (w *jmapBlobWriter) ID() jmap.Id { return jblob.IdFor(w.Bytes()) }
+func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
+	if w.finished {
+		return "", fs.ErrClosed
+	}
+	id := w.ID()
+	if err := w.store.Put(w.ctx, w.account, id, w.Bytes()); err != nil {
+		return "", err
+	}
+	w.finished = true
+	w.Reset()
+	return id, nil
+}
+func (w *jmapBlobWriter) Abort() error { w.finished = true; w.Reset(); return nil }

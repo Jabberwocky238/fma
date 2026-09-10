@@ -26,6 +26,8 @@ import (
 
 	"github.com/emersion/go-sasl"
 	smtp "github.com/emersion/go-smtp"
+	jbackend "github.com/naust-mail/naust-jmap/core/providers/backend"
+	"github.com/naust-mail/naust-jmap/core/providers/backend/backendtest"
 )
 
 // Outbound Test
@@ -1368,4 +1370,18 @@ func TestProxyHopLimit(t *testing.T) {
 	if _, err := proxyBody(body); err == nil {
 		t.Fatal("external proxy loop not bounded")
 	}
+}
+
+func TestJMAPS3BackendContract(t *testing.T) {
+	outboundTestDir(t)
+	backendtest.Run(t, backendtest.Config{
+		Open: func(t *testing.T) jbackend.Backend {
+			return &jmapBackend{key: t.Name() + "/.jmap/state.json", store: objects}
+		},
+		Reopen: func(t *testing.T, old jbackend.Backend) jbackend.Backend {
+			b := old.(*jmapBackend)
+			checkError(t, b.Close())
+			return &jmapBackend{key: b.key, store: b.store}
+		},
+	})
 }
