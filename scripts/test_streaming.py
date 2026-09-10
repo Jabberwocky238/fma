@@ -13,6 +13,7 @@ import os
 import re
 from pathlib import Path
 import signal
+import shutil
 import socket
 import ssl
 import subprocess
@@ -20,6 +21,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
 BLOCK = bytes(range(256)) * 4096
@@ -62,13 +64,18 @@ class Measurement:
     def finish(self):
         self.stop.set(); self.thread.join()
         rss, cpu = process_usage(self.pid)
-        return {'elapsed_seconds': round(time.monotonic() - self.started, 3),
-                'cpu_seconds': round(cpu - self.cpu_start, 3),
-                'peak_rss_bytes': max(rss, self.peak), 'initial_rss_bytes': self.rss_start,
+        elapsed = time.monotonic() - self.started
+        cpu_used = cpu - self.cpu_start
+        peak = max(rss, self.peak)
+        return {'elapsed_seconds': round(elapsed, 3),
+                'cpu_seconds': round(cpu_used, 3),
+                'average_cpu_percent_one_core': round(100 * cpu_used / elapsed, 2),
+                'peak_rss_bytes': peak, 'initial_rss_bytes': self.rss_start,
+                'peak_rss_growth_bytes': max(0, peak - self.rss_start),
                 'rss_sample_interval_seconds': .05}
 
 
-def mail_benchmark(proc, ports, conn, auth, account, size, block, results):
+def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_transfer):
     """Real MIME attachment IO, with no full-message client buffers."""
     import imaplib
     import smtplib
@@ -120,12 +127,19 @@ def mail_benchmark(proc, ports, conn, auth, account, size, block, results):
             client.ehlo()
             assert client.mail('sender@example.net')[0] == 250
             assert client.rcpt('alice@t12e.cc')[0] == 250
-            assert client.docmd('DATA')[0] == 354
-            for chunk in chunks(): client.sock.sendall(chunk)
-            client.sock.sendall(b'.\r\n')
+            if smtp_transfer == 'bdat':
+                assert client.has_extn('chunking'), 'server did not advertise CHUNKING'
+                if raw_size > 0xffffffff:
+                    raise ValueError('single-chunk BDAT benchmark exceeds the 32-bit chunk size')
+                client.putcmd('BDAT', f'{raw_size} LAST')
+                for chunk in chunks(): client.sock.sendall(chunk)
+            else:
+                assert client.docmd('DATA')[0] == 354
+                for chunk in chunks(): client.sock.sendall(chunk)
+                client.sock.sendall(b'.\r\n')
             reply = client.getreply()
             assert reply[0] == 250, reply
-    phase('smtp_mime_upload', smtp_upload)
+    phase('smtp_bdat_mime_upload' if smtp_transfer == 'bdat' else 'smtp_mime_upload', smtp_upload)
     context = ssl._create_unverified_context()
     with imaplib.IMAP4_SSL('127.0.0.1', ports['imaps'], ssl_context=context, timeout=600) as client:
         client.login('alice', 'password')
@@ -189,15 +203,27 @@ def main():
     parser.add_argument('--report', type=Path)
     parser.add_argument('--mail', action='store_true', help='also send and receive a real MIME attachment through SMTP, IMAP, POP3 and JMAP')
     parser.add_argument('--data', choices=['compressible', 'incompressible'], default='incompressible')
+    parser.add_argument('--smtp-transfer', choices=['data', 'bdat'], default='data', help='SMTP DATA or advertised CHUNKING/BDAT; reports them separately')
     args = parser.parse_args()
     # Repeat a random 1 MiB block: its period exceeds gzip's 32 KiB window.
     # Generate it outside the timed phase, keeping client memory bounded.
     block = BLOCK if args.data == 'compressible' else os.urandom(1 << 20)
     assert args.size_mib > 0
     size = args.size_mib << 20
+    fals3y_requested = os.environ.get('FALS3Y_BIN', str(Path.home() / '.local/bin/fals3y'))
+    fals3y = str(Path(shutil.which(fals3y_requested) or fals3y_requested).resolve(strict=True))
+    with open(fals3y, 'rb') as executable:
+        fals3y_sha256 = hashlib.file_digest(executable, 'sha256').hexdigest()
+    fals3y_version = subprocess.run([fals3y, 'version'], capture_output=True, text=True, timeout=10)
     results = {'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
                'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
-               'working_tree': 'measured from working tree; see git status', 'phases': {}, 'data': args.data}
+               'pop3_module': json.loads(subprocess.check_output(
+                   ['go', 'list', '-m', '-json', 'github.com/Jabberwocky238/go-pop3'], cwd=ROOT, text=True)),
+               'fals3y': {'requested_path': fals3y_requested, 'resolved_path': fals3y,
+                          'sha256': fals3y_sha256, 'version': (fals3y_version.stdout + fals3y_version.stderr).strip(),
+                          'version_exit_code': fals3y_version.returncode},
+               'go_flags': os.environ.get('GOFLAGS', ''),
+               'working_tree': 'measured from working tree; see git status', 'phases': {}, 'data': args.data, 'smtp_transfer': args.smtp_transfer}
     with tempfile.TemporaryDirectory(prefix='fma-streaming-') as directory:
         tmp = Path(directory)
         binary = tmp / 'fma'
@@ -207,7 +233,6 @@ def main():
         def s3request(key, method='GET', data=None):
             with urllib.request.urlopen(urllib.request.Request(endpoint + key, method=method, data=data), timeout=30) as response:
                 return response.read()
-        fals3y = os.environ.get('FALS3Y_BIN', str(Path.home() / '.local/bin/fals3y'))
         with (tmp / 's3.log').open('wb') as output:
             storage = subprocess.Popen([fals3y, 'start', '-p', str(s3port), '-d', str(tmp / 's3')], stdout=output, stderr=output)
         proc = None
@@ -260,7 +285,7 @@ def main():
             measure = Measurement(proc.pid)
             digest = hashlib.sha256()
             conn.putrequest('POST', f'/upload/{account}/')
-            for name, value in {**auth, 'Content-Type': 'application/octet-stream', 'Content-Length': str(size)}.items():
+            for name, value in {**auth, 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="large.bin"', 'Subject': 'streaming benchmark', 'Content-Length': str(size)}.items():
                 conn.putheader(name, value)
             conn.endheaders()
             sent = 0
@@ -277,19 +302,24 @@ def main():
             assert uploaded['blobId'] == expected_id and uploaded['size'] == size, uploaded
             results['sha256'] = digest.hexdigest()
             object_key = f'/stream-test/alice/.jmap/blobs/{uploaded["blobId"]}'
-            with urllib.request.urlopen(urllib.request.Request(endpoint + object_key, method='HEAD')) as stored:
+            reference = json.loads(s3request(object_key))
+            assert reference['key'].startswith('alice/mail/'), reference
+            results['object_key'] = reference['key']
+            metadata = reference.get('metadata', {})
+            physical_url = endpoint + '/stream-test/' + urllib.parse.quote(reference['key'], safe='/')
+            with urllib.request.urlopen(urllib.request.Request(physical_url, method='HEAD')) as stored:
                 results['stored_bytes'] = int(stored.headers['Content-Length'])
-                results['storage_encoding'] = stored.headers.get('x-amz-meta-fma-encoding', 'identity')
+                results['storage_encoding'] = metadata.get('fma-encoding', 'identity')
                 assert (results['storage_encoding'] == 'gzip') == (size > (10 << 20)), dict(stored.headers)
                 if size > (10 << 20):
-                    assert int(stored.headers['x-amz-meta-fma-size']) == size
+                    assert int(metadata['fma-size']) == size
                     if args.data == 'compressible':
                         assert results['stored_bytes'] < size, results
                     else:
                         assert results['stored_bytes'] >= size * .99, results
 
-            results['s3_commit_timings'] = [dict(zip(['parts', 'complete_seconds', 'copy_seconds'], map(float, values)))
-                for values in re.findall(r'parts=(\d+) complete_seconds=([\d.e+-]+) copy_seconds=([\d.e+-]+)', (tmp / 'fma.log').read_text())]
+            results['s3_commit_timings'] = [dict(zip(['parts', 'complete_seconds', 'index_seconds', 'copy_seconds'], map(float, values)))
+                for values in re.findall(r'parts=(\d+) complete_seconds=([\d.e+-]+) index_seconds=([\d.e+-]+) copy_seconds=([\d.e+-]+)', (tmp / 'fma.log').read_text())]
             print(json.dumps({'upload': results['phases']['upload']}), flush=True)
             print('Streaming S3 through JMAP download; client hashes chunks without retaining the file', flush=True)
             measure = Measurement(proc.pid)
@@ -302,17 +332,28 @@ def main():
             results['phases']['download'] = measure.finish()
             assert received == size and digest.hexdigest() == results['sha256'], (received, digest.hexdigest())
             if args.mail:
-                mail_benchmark(proc, mail_ports, conn, auth, account, size, block, results)
+                mail_benchmark(proc, mail_ports, conn, auth, account, size, block, results, args.smtp_transfer)
             conn.close()
             assert list(work.iterdir()) == [], 'fma wrote local temporary data'
             assert max(phase['peak_rss_bytes'] for phase in results['phases'].values()) <= args.max_rss_mib << 20, results
             # An interrupted upload must not leave a completed blob or multipart staging data.
             conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
             conn.putrequest('POST', f'/upload/{account}/')
-            for name, value in {**auth, 'Content-Type': 'application/octet-stream', 'Content-Length': str(size)}.items():
+            for name, value in {**auth, 'Content-Type': 'application/octet-stream', 'Content-Disposition': 'attachment; filename="large.bin"', 'Subject': 'streaming benchmark', 'Content-Length': str(size)}.items():
                 conn.putheader(name, value)
             conn.endheaders(); conn.send(BLOCK * 9); conn.close()
             time.sleep(1)
+            for name, phase in results['phases'].items():
+                if name.endswith('_metadata'):
+                    continue
+                transferred = results['mail']['mime_bytes'] if 'mime' in name else size
+                phase['bytes'] = transferred
+                phase['mib_per_second'] = round(transferred / (1 << 20) / phase['elapsed_seconds'], 2)
+                phase['attachment_mib_per_second'] = round(size / (1 << 20) / phase['elapsed_seconds'], 2)
+            results['mail_stream_timings'] = [line for line in (tmp / 'fma.log').read_text().splitlines()
+                                              if any(marker in line for marker in ['S3 stream commit', 'mail stream stored', 'mail stream delivery'])]
+            with open(fals3y, 'rb') as executable:
+                assert hashlib.file_digest(executable, 'sha256').hexdigest() == fals3y_sha256, 'Fals3y executable changed during benchmark'
             results['success'] = True
             print(json.dumps(results, indent=2), flush=True)
             if args.report:

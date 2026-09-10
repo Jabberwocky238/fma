@@ -5,7 +5,7 @@ server {
     ssl_certificate @@LINEAGE@@/fullchain.pem;
     ssl_certificate_key @@LINEAGE@@/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-    client_max_body_size 6g;
+    client_max_body_size 4g;
     location / {
         proxy_request_buffering off;
         proxy_buffering off;

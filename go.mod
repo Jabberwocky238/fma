@@ -3,6 +3,7 @@ module fma
 go 1.25.0
 
 require (
+	github.com/Jabberwocky238/go-pop3 v0.1.6
 	github.com/aws/aws-sdk-go-v2 v1.36.3
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.64
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.78.2
@@ -13,7 +14,6 @@ require (
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.25.0
 	github.com/klauspost/compress v1.20.0
-	github.com/migadu/go-pop3 v0.1.4
 	github.com/naust-mail/naust-jmap/core v0.4.2
 	github.com/naust-mail/naust-jmap/datatypes/mail v0.3.3
 )
@@ -29,3 +29,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.18.15 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
+
+replace github.com/emersion/go-smtp => github.com/Jabberwocky238/go-smtp v0.25.1-0.20260910174640-b0673510e580

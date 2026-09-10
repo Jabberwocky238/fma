@@ -12,14 +12,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/emersion/go-imap"
 	"io"
 	"io/fs"
 	"log/slog"
 	"net"
 	"net/http/httptest"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -27,12 +26,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/emersion/go-imap"
+
+	"slices"
+
 	"github.com/emersion/go-sasl"
 	smtp "github.com/emersion/go-smtp"
 	jmap "github.com/naust-mail/naust-jmap/core/jmap"
 	jbackend "github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/backendtest"
-	"slices"
 )
 
 // Outbound Test
@@ -958,7 +961,7 @@ func TestConcurrentS3MailboxAllocation(t *testing.T) {
 				failures <- err
 				return
 			}
-			failures <- appendMessage("alice", []byte(fmt.Sprintf("message %d", i)), nil, time.Now(), false)
+			failures <- appendMessage("alice", fmt.Appendf(nil, "message %d", i), nil, time.Now(), false)
 		}(i)
 	}
 	wg.Wait()
@@ -1492,6 +1495,20 @@ func TestS3BlobCompression(t *testing.T) {
 			checkError(t, err)
 			stored, err := bucket.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket.bucket, Key: &key})
 			checkError(t, err)
+			if stored.Metadata["fma-reference"] != "1" {
+				t.Fatal("expected a small named-object index")
+			}
+			referenceData, err := io.ReadAll(io.LimitReader(stored.Body, 8193))
+			stored.Body.Close()
+			checkError(t, err)
+			ref, err := decodeObjectReference(key, referenceData)
+			checkError(t, err)
+			if !strings.HasPrefix(ref.Key, root+"/mail/untitled_") || !strings.HasSuffix(ref.Key, "/message.eml") {
+				t.Fatalf("unexpected physical key %q", ref.Key)
+			}
+			stored, err = bucket.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket.bucket, Key: &ref.Key})
+			checkError(t, err)
+			stored.Metadata = ref.Metadata
 			compressed := stored.Metadata["fma-encoding"] == "gzip"
 			if compressed != (size > gzipThreshold) {
 				t.Fatalf("compression=%v size=%d", compressed, size)
@@ -1517,7 +1534,7 @@ func TestS3BlobCompression(t *testing.T) {
 			if length != size || n != size || !bytes.Equal(hash.Sum(nil), got.Sum(nil)) {
 				t.Fatalf("round trip size=%d/%d want=%d", length, n, size)
 			}
-			// Cross-account/server-side copy must preserve compression metadata.
+			// Copies must preserve compression metadata.
 			copyKey := root + "/copy"
 			checkError(t, bucket.CopyStream(ctx, key, copyKey))
 			r2, length, err := bucket.OpenStream(ctx, copyKey)
@@ -1716,5 +1733,145 @@ func TestWaitPoolConcurrentCapacity(t *testing.T) {
 	}
 	if peak.Load() > 3 {
 		t.Fatal("maximum exceeded")
+	}
+}
+
+func TestNamedBlobKeyEscapesSegments(t *testing.T) {
+	name := blobName{MIME: true, Filename: "../report/#?%.pdf"}
+	key := namedBlobKey("alice", name, []byte("Subject: =?UTF-8?B?5oql5Lu3L+WQiOWQjCAjMQ==?=\r\n\r\nbody"))
+	parts := strings.Split(key, "/")
+	if len(parts) != 4 || parts[0] != "alice" || parts[1] != "mail" {
+		t.Fatalf("unsafe key %q", key)
+	}
+	if !strings.HasPrefix(parts[2], "%E6%8A%A5%E4%BB%B7%2F%E5%90%88%E5%90%8C%20%231_") {
+		t.Fatalf("subject not decoded and escaped: %q", parts[2])
+	}
+	if parts[3] != "..%2Freport%2F%23%3F%25.pdf" {
+		t.Fatalf("filename not escaped: %q", parts[3])
+	}
+	for _, value := range []string{".", "..", "a/b", "a%2Fb", "a?b#c", "\x00\r\n"} {
+		segment := objectNameSegment(value, "untitled")
+		if segment == "." || segment == ".." || strings.ContainsAny(segment, "/?#\x00\r\n") {
+			t.Fatalf("unsafe segment %q", segment)
+		}
+	}
+	if len(namedBlobKey("alice", blobName{Subject: strings.Repeat("界", 1000), Filename: strings.Repeat("文", 1000)}, nil)) > 1024 {
+		t.Fatal("S3 key limit exceeded")
+	}
+}
+
+func TestObjectReferenceAccountBoundary(t *testing.T) {
+	for _, target := range []string{"bob/mail/topic/file", "alice/mail/../../bob/file", "alice/.jmap/blobs/Gother", "/alice/mail/topic/file"} {
+		data := []byte(fmt.Sprintf(`{"key":%q}`, target))
+		if _, err := decodeObjectReference("alice/.jmap/blobs/Gid", data); err == nil {
+			t.Fatalf("accepted %q", target)
+		}
+	}
+	if _, err := decodeObjectReference("alice/.jmap/blobs/Gid", []byte(`{"key":"alice/mail/topic/file","metadata":{"fma-reference":"1"}}`)); err == nil {
+		t.Fatal("accepted nested reference")
+	}
+}
+
+func TestSeparateUploadAndMIMELimits(t *testing.T) {
+	if jmapCore().MaxSizeUpload != 4<<30 || jmapMailCapability().MaxSizeAttachmentsPerEmail != 4<<30 || maxMailSize != 6<<30 {
+		t.Fatal("upload, attachment and MIME limits differ")
+	}
+	w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("alice"), writer: discardObjectUpload{}, digest: sha256.New(), size: maxMailSize}
+	if _, err := w.Write([]byte{1}); err == nil {
+		t.Fatal("oversized MIME accepted")
+	}
+}
+
+func TestS3NamedObjectCollisionAndLegacyRead(t *testing.T) {
+	endpoint := os.Getenv("TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("requires native S3 fixture")
+	}
+	bucket, err := connectBucket(S3Config{Endpoint: endpoint, Bucket: os.Getenv("TEST_S3_BUCKET"), Region: "us-east-1", AccessKey: "test", SecretKey: "test"})
+	checkError(t, err)
+	root := fmt.Sprintf("names%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		for _, account := range []string{root, root + "b"} {
+			keys, _ := bucket.List(account + "/")
+			for _, key := range keys {
+				bucket.Delete(key)
+			}
+		}
+	})
+	ctx := context.Background()
+	key := namedBlobKey(root, blobName{Subject: "a/b#%", Filename: "../report?.pdf"}, nil)
+	first, err := bucket.NewUpload(ctx, key)
+	checkError(t, err)
+	_, err = first.Write([]byte("original"))
+	checkError(t, err)
+	index := root + "/.jmap/blobs/G" + strings.Repeat("a", 43)
+	checkError(t, first.Commit(index, nil))
+	checkError(t, first.Abort())
+	if _, err = bucket.NewUpload(ctx, key); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("collision: %v", err)
+	}
+	multipartKey := namedBlobKey(root, blobName{Subject: "multipart", Filename: "large.bin"}, nil)
+	multipartWriter, err := bucket.NewUpload(ctx, multipartKey)
+	checkError(t, err)
+	block := make([]byte, 128<<10)
+	for range 136 {
+		_, err = multipartWriter.Write(block)
+		checkError(t, err)
+	}
+	if _, err = bucket.NewUpload(ctx, multipartKey); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("multipart collision: %v", err)
+	}
+	checkError(t, multipartWriter.Commit(root+"/.jmap/blobs/multipart", nil))
+	checkError(t, multipartWriter.Abort())
+	abortedKey := namedBlobKey(root, blobName{Subject: "aborted"}, nil)
+	aborted, err := bucket.NewUpload(ctx, abortedKey)
+	checkError(t, err)
+	checkError(t, aborted.Abort())
+	retried, err := bucket.NewUpload(ctx, abortedKey)
+	checkError(t, err)
+	checkError(t, retried.Abort())
+	r, n, err := bucket.OpenStream(ctx, index)
+	checkError(t, err)
+	data, err := io.ReadAll(r)
+	r.Close()
+	checkError(t, err)
+	if n != 8 || string(data) != "original" {
+		t.Fatal("collision replaced original data")
+	}
+	destination := root + "b/.jmap/blobs/" + path.Base(index)
+	checkError(t, bucket.CopyStream(ctx, index, destination))
+	checkError(t, bucket.CopyStream(ctx, index, destination))
+	r, n, err = bucket.OpenStream(ctx, destination)
+	checkError(t, err)
+	data, err = io.ReadAll(r)
+	r.Close()
+	checkError(t, err)
+	if n != 8 || string(data) != "original" {
+		t.Fatal("cross-account copy lost content")
+	}
+	empty, err := bucket.NewUpload(ctx, namedBlobKey(root, blobName{Filename: "empty.bin"}, nil))
+	checkError(t, err)
+	emptyIndex := root + "/.jmap/blobs/G" + strings.Repeat("b", 43)
+	checkError(t, empty.Commit(emptyIndex, nil))
+	checkError(t, empty.Abort())
+	emptyDestination := root + "b/.jmap/blobs/" + path.Base(emptyIndex)
+	checkError(t, bucket.CopyStream(ctx, emptyIndex, emptyDestination))
+	r, n, err = bucket.OpenStream(ctx, emptyDestination)
+	checkError(t, err)
+	data, err = io.ReadAll(r)
+	r.Close()
+	checkError(t, err)
+	if n != 0 || len(data) != 0 {
+		t.Fatal("empty copy contains data")
+	}
+	legacy := root + "/.jmap/blobs/legacy"
+	checkError(t, bucket.Put(legacy, []byte("old blob")))
+	r, n, err = bucket.OpenStream(ctx, legacy)
+	checkError(t, err)
+	data, err = io.ReadAll(r)
+	r.Close()
+	checkError(t, err)
+	if n != 8 || string(data) != "old blob" {
+		t.Fatal("legacy blob no longer readable")
 	}
 }

@@ -49,6 +49,8 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/Jabberwocky238/go-pop3/pop3"
+	"github.com/Jabberwocky238/go-pop3/pop3server"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
 	"github.com/emersion/go-imap/backend/backendutil"
@@ -62,8 +64,6 @@ import (
 	"github.com/emersion/go-sasl"
 	smtp "github.com/emersion/go-smtp"
 	"github.com/klauspost/compress/gzip"
-	"github.com/migadu/go-pop3/pop3"
-	"github.com/migadu/go-pop3/pop3server"
 	jdescriptor "github.com/naust-mail/naust-jmap/core/descriptor"
 	jmap "github.com/naust-mail/naust-jmap/core/jmap"
 	jdb "github.com/naust-mail/naust-jmap/core/objectdb"
@@ -520,7 +520,7 @@ func objectError(key string, err error) error {
 	var api smithy.APIError
 	if errors.As(err, &api) {
 		switch api.ErrorCode() {
-		case "NoSuchKey", "NoSuchUpload":
+		case "NoSuchKey", "NoSuchUpload", "NotFound":
 			return fmt.Errorf("object %q: %w", key, fs.ErrNotExist)
 		case "PreconditionFailed", "ConditionalRequestConflict":
 			return fmt.Errorf("object %q: %w", key, fs.ErrExist)
@@ -2873,16 +2873,92 @@ func (s jmapBlobs) Delete(ctx context.Context, acct, id jmap.Id) error {
 	}
 	return err
 }
+
+// Blob IDs belong to the JMAP library; physical objects use human-readable names.
+type blobNameContext struct{}
+type blobName struct {
+	Subject, Filename string
+	MIME              bool
+}
+
+// Escape each segment independently: slashes, percent signs and dot segments
+// must remain literal names, never change the account or directory boundary.
+func objectNameSegment(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = fallback
+	}
+	var segment strings.Builder
+	for _, r := range value {
+		escaped := url.PathEscape(string(r))
+		if segment.Len()+len(escaped) > 360 {
+			break
+		}
+		segment.WriteString(escaped)
+	}
+	value = segment.String()
+	if value == "." {
+		return "%2E"
+	}
+	if value == ".." {
+		return "%2E%2E"
+	}
+	return value
+}
+
+func namedBlobKey(root string, name blobName, prefix []byte) string {
+	if name.MIME {
+		// Only inspect bounded headers, never read or reconstruct the MIME body.
+		end, separator := bytes.Index(prefix, []byte("\r\n\r\n")), 4
+		if end < 0 {
+			end, separator = bytes.Index(prefix, []byte("\n\n")), 2
+		}
+		if end >= 0 && end < 64<<10 {
+			if msg, err := mail.ReadMessage(bytes.NewReader(prefix[:end+separator])); err == nil {
+				name.Subject = msg.Header.Get("Subject")
+				if decoded, err := new(mime.WordDecoder).DecodeHeader(name.Subject); err == nil {
+					name.Subject = decoded
+				}
+			}
+		}
+		if name.Filename == "" {
+			name.Filename = "message.eml"
+		}
+	}
+	// A nanosecond UTC timestamp is independent of the untrusted Date header.
+	// Conditional S3 writes reject a collision instead of overwriting a message.
+	id := objectNameSegment(name.Subject, "untitled") + "_" + time.Now().UTC().Format("20060102T150405.000000000Z")
+	return root + "/mail/" + id + "/" + objectNameSegment(name.Filename, "attachment.bin")
+}
+
 func (s jmapBlobs) Create(ctx context.Context, acct jmap.Id) (jblob.BlobWriter, error) {
-	root, err := jmapRoot(acct)
-	if err != nil {
+	if _, err := jmapRoot(acct); err != nil {
 		return nil, err
 	}
-	writer, err := newObjectUpload(ctx, s.store, root+"/.jmap/uploads/")
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &jmapBlobWriter{ctx: ctx, store: s, account: acct, writer: writer, digest: sha256.New()}, nil
+	return &jmapBlobWriter{ctx: ctx, store: s, account: acct, digest: sha256.New()}, nil
+}
+
+func (w *jmapBlobWriter) startUpload(extra []byte) error {
+	if w.writer != nil {
+		return nil
+	}
+	root, err := jmapRoot(w.account)
+	if err != nil {
+		return err
+	}
+	name, ok := w.ctx.Value(blobNameContext{}).(blobName)
+	if !ok {
+		name.MIME = true
+	}
+	prefix := extra
+	if w.probe != nil {
+		prefix = w.probe.Bytes()
+	}
+	w.writer, err = newObjectUpload(w.ctx, w.store.store, namedBlobKey(root, name, prefix))
+	return err
 }
 
 type jmapBlobWriter struct {
@@ -2906,8 +2982,8 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 	if err := w.ctx.Err(); err != nil {
 		return 0, err
 	}
-	if w.size+int64(len(data)) > jmapMaxUpload {
-		return 0, fmt.Errorf("JMAP upload exceeds 6 GiB")
+	if w.size+int64(len(data)) > maxMailSize {
+		return 0, fmt.Errorf("MIME object exceeds 6 GiB")
 	}
 	if w.writeErr != nil {
 		return 0, w.writeErr
@@ -2924,6 +3000,9 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 		n, err = w.probe.Write(data)
 	} else {
 		if w.gzip == nil {
+			if err = w.startUpload(data); err != nil {
+				return 0, err
+			}
 			w.gzip, err = gzipWriters.Get(w.ctx)
 			if err != nil {
 				return 0, err
@@ -2961,6 +3040,9 @@ func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
 	if w.writeErr != nil {
 		return "", w.writeErr
 	}
+	if err = w.startUpload(nil); err != nil {
+		return "", err
+	}
 	if w.gzip != nil {
 		err = w.gzip.Close()
 		gzipWriters.Put(w.gzip)
@@ -2993,7 +3075,10 @@ func (w *jmapBlobWriter) Abort() error {
 		gzipWriters.Put(w.gzip)
 		w.gzip = nil
 	}
-	return w.writer.Abort()
+	if w.writer != nil {
+		return w.writer.Abort()
+	}
+	return nil
 }
 
 type jmapAccount struct {
@@ -3586,6 +3671,12 @@ func serveJMAP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/upload/") {
+		typ, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		_, disposition, _ := mime.ParseMediaType(r.Header.Get("Content-Disposition"))
+		name := blobName{Subject: r.Header.Get("Subject"), Filename: disposition["filename"], MIME: typ == "message/rfc822" || typ == "message/global"}
+		r = r.WithContext(context.WithValue(r.Context(), blobNameContext{}, name))
+	}
 	a, err := openJMAPAccount(r.Context(), identity.RootID)
 	if err != nil {
 		logger.Error("JMAP account", "error", err)
@@ -4078,7 +4169,7 @@ const (
 	maxAttachmentSize = 4 << 30
 	// Base64 with CRLF every 76 characters expands 4 GiB to about 5.48 GiB.
 	maxMailSize         = 6 << 30
-	jmapMaxUpload int64 = maxMailSize // Email/import uploads complete MIME too.
+	jmapMaxUpload int64 = 4 << 30 // HTTP uploads; internally composed MIME may be larger.
 )
 
 type streamingStore interface {
@@ -4136,18 +4227,78 @@ func (w *bufferedObjectUpload) Commit(key string, metadata map[string]string) er
 	return err
 }
 func (w *bufferedObjectUpload) Abort() error { w.Reset(); return nil }
+
+// A small JMAP index points at an immutable, named physical object. Publishing
+// the index is the commit: the large object is never renamed or copied.
+type namedObjectReference struct {
+	Key      string            `json:"key"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+func decodeObjectReference(key string, data []byte) (namedObjectReference, error) {
+	var ref namedObjectReference
+	if len(data) > 8192 {
+		return ref, fmt.Errorf("object reference too large")
+	}
+	if err := json.Unmarshal(data, &ref); err != nil {
+		return ref, err
+	}
+	root, _, _ := strings.Cut(key, "/")
+	if !usernameRE.MatchString(root) || !strings.HasPrefix(ref.Key, root+"/mail/") || path.Clean(ref.Key) != ref.Key || len(ref.Key) > 1024 {
+		return ref, fmt.Errorf("object reference escapes account")
+	}
+	if ref.Metadata["fma-reference"] != "" {
+		return ref, fmt.Errorf("nested object reference")
+	}
+	return ref, nil
+}
+func (b *s3Bucket) putObjectReference(ctx context.Context, key string, ref namedObjectReference, create bool) error {
+	data, err := json.Marshal(ref)
+	if err != nil {
+		return err
+	}
+	if _, err = decodeObjectReference(key, data); err != nil {
+		return err
+	}
+	input := &s3.PutObjectInput{Bucket: &b.bucket, Key: &key, Body: bytes.NewReader(data), Metadata: map[string]string{"fma-reference": "1"}}
+	if create {
+		input.IfNoneMatch = aws.String("*")
+	}
+	_, err = b.client.PutObject(ctx, input)
+	err = objectError(key, err)
+	if errors.Is(err, fs.ErrExist) {
+		return nil
+	}
+	return err
+}
 func (b *s3Bucket) OpenStream(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &b.bucket, Key: &key})
 	if err != nil {
 		return nil, 0, objectError(key, err)
 	}
+	if result.Metadata["fma-reference"] == "1" {
+		data, err := io.ReadAll(io.LimitReader(result.Body, 8193))
+		result.Body.Close()
+		if err != nil {
+			return nil, 0, err
+		}
+		ref, err := decodeObjectReference(key, data)
+		if err != nil {
+			return nil, 0, err
+		}
+		result, err = b.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &b.bucket, Key: &ref.Key})
+		if err != nil {
+			return nil, 0, objectError(ref.Key, err)
+		}
+		result.Metadata = ref.Metadata
+	}
 	if result.Metadata["fma-encoding"] == "gzip" {
 		size, err := strconv.ParseInt(result.Metadata["fma-size"], 10, 64)
-		if err != nil || size < 0 || size > jmapMaxUpload {
+		if err != nil || size < 0 || size > maxMailSize {
 			result.Body.Close()
 			return nil, 0, fmt.Errorf("invalid uncompressed blob size")
 		}
-		reader, err := gzip.NewReader(result.Body)
+		reader, err := gzip.NewReader(bufio.NewReaderSize(result.Body, 128<<10))
 		if err != nil {
 			result.Body.Close()
 			return nil, 0, err
@@ -4165,7 +4316,61 @@ type gzipObjectReader struct {
 func (r *gzipObjectReader) Read(p []byte) (int, error) { return r.Reader.Read(p) }
 func (r *gzipObjectReader) Close() error               { return errors.Join(r.Reader.Close(), r.source.Close()) }
 func (b *s3Bucket) CopyStream(ctx context.Context, src, dst string) error {
-	return b.copyStream(ctx, src, dst, nil)
+	head, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &b.bucket, Key: &src})
+	if err != nil {
+		return objectError(src, err)
+	}
+	if head.Metadata["fma-reference"] != "1" {
+		return b.copyStream(ctx, src, dst, nil)
+	}
+	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &b.bucket, Key: &src})
+	if err != nil {
+		return objectError(src, err)
+	}
+	data, err := io.ReadAll(io.LimitReader(result.Body, 8193))
+	result.Body.Close()
+	if err != nil {
+		return err
+	}
+	ref, err := decodeObjectReference(src, data)
+	if err != nil {
+		return err
+	}
+	srcRoot, _, _ := strings.Cut(src, "/")
+	dstRoot, _, _ := strings.Cut(dst, "/")
+	if !usernameRE.MatchString(dstRoot) {
+		return fmt.Errorf("invalid destination account")
+	}
+	if srcRoot != dstRoot {
+		// Re-delivery to the same content-addressed account index is idempotent.
+		if path.Base(src) == path.Base(dst) && jmapBlobIDRE.MatchString(path.Base(dst)) {
+			_, existing := b.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &b.bucket, Key: &dst})
+			if existing == nil {
+				return nil
+			}
+			if !errors.Is(objectError(dst, existing), fs.ErrNotExist) {
+				return objectError(dst, existing)
+			}
+		}
+		target := dstRoot + strings.TrimPrefix(ref.Key, srcRoot)
+		// Stream the stored bytes (including gzip) without decode/re-encode.
+		// This also works with S3-compatible services without UploadPartCopy.
+		source, err := b.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &b.bucket, Key: &ref.Key})
+		if err != nil {
+			return objectError(ref.Key, err)
+		}
+		defer source.Body.Close()
+		upload, err := b.NewUpload(ctx, target)
+		if err != nil {
+			return err
+		}
+		defer upload.Abort()
+		if _, err = copyStream(ctx, upload, source.Body); err != nil {
+			return err
+		}
+		return upload.Commit(dst, ref.Metadata)
+	}
+	return b.putObjectReference(ctx, dst, ref, false)
 }
 func (b *s3Bucket) copyStream(ctx context.Context, src, dst string, metadata map[string]string) error {
 	head, err := b.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &b.bucket, Key: &src})
@@ -4181,7 +4386,7 @@ func (b *s3Bucket) copyStream(ctx context.Context, src, dst string, metadata map
 		_, err = b.client.CopyObject(ctx, &s3.CopyObjectInput{Bucket: &b.bucket, Key: &dst, CopySource: &source, CopySourceIfMatch: head.ETag, Metadata: metadata, MetadataDirective: s3types.MetadataDirectiveReplace})
 		return objectError(dst, err)
 	}
-	// CopyObject cannot copy a complete MIME object above 5 GiB.
+	// Legacy objects above 5 GiB need multipart copy.
 	upload, err := b.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: &b.bucket, Key: &dst, Metadata: metadata})
 	if err != nil {
 		return objectError(dst, err)
@@ -4209,34 +4414,47 @@ func (b *s3Bucket) copyStream(ctx context.Context, src, dst string, metadata map
 		}
 		parts = append(parts, s3types.CompletedPart{PartNumber: &number, ETag: part.CopyPartResult.ETag})
 	}
-	_, err = b.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: &b.bucket, Key: &dst, UploadId: upload.UploadId, MultipartUpload: &s3types.CompletedMultipartUpload{Parts: parts}})
+	completion := &s3.CompleteMultipartUploadInput{Bucket: &b.bucket, Key: &dst, UploadId: upload.UploadId, MultipartUpload: &s3types.CompletedMultipartUpload{Parts: parts}}
+	_, err = b.client.CompleteMultipartUpload(ctx, completion)
 	complete = err == nil
 	return objectError(dst, err)
 }
-func (b *s3Bucket) NewUpload(ctx context.Context, prefix string) (objectUpload, error) {
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		return nil, err
-	}
+func (b *s3Bucket) NewUpload(ctx context.Context, key string) (objectUpload, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	// Reserve the final name atomically before accepting body bytes. Some S3
+	// compatible servers ignore conditions on CompleteMultipartUpload; a second
+	// fma writer must fail at the conditional PUT, not overwrite the first.
+	reserved, err := b.client.PutObject(ctx, &s3.PutObjectInput{Bucket: &b.bucket, Key: &key, Body: bytes.NewReader(nonce[:]), IfNoneMatch: aws.String("*"), Metadata: map[string]string{"fma-pending": "1"}})
+	if err != nil {
+		return nil, objectError(key, err)
+	}
+	if reserved.ETag == nil {
+		return nil, fmt.Errorf("S3 reservation returned no ETag")
+	}
 	ctx, cancel := context.WithCancel(ctx)
-	return &s3StreamUpload{bucket: b, ctx: ctx, cancel: cancel, key: prefix + hex.EncodeToString(id[:])}, nil
+	return &s3StreamUpload{bucket: b, ctx: ctx, cancel: cancel, key: key, reservation: reserved.ETag}, nil
 }
 
 type s3StreamUpload struct {
-	cancel   context.CancelFunc
-	workers  sync.WaitGroup
-	partMu   sync.Mutex
-	partErr  error
-	bucket   *s3Bucket
-	ctx      context.Context
-	key      string
-	uploadID *string
-	parts    []s3types.CompletedPart
-	buffer   *bytes.Buffer
-	finished bool
+	reservation      *string
+	physicalComplete bool
+	cancel           context.CancelFunc
+	workers          sync.WaitGroup
+	partMu           sync.Mutex
+	partErr          error
+	bucket           *s3Bucket
+	ctx              context.Context
+	key              string
+	uploadID         *string
+	parts            []s3types.CompletedPart
+	buffer           *bytes.Buffer
+	finished         bool
 }
 
 func (w *s3StreamUpload) Write(data []byte) (int, error) {
@@ -4309,42 +4527,40 @@ func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
 		return err
 	}
 	b := w.bucket
-	if w.uploadID == nil {
-		var data []byte
-		if w.buffer != nil {
-			data = w.buffer.Bytes()
-		}
-		_, err := b.client.PutObject(w.ctx, &s3.PutObjectInput{Bucket: &b.bucket, Key: &key, Body: bytes.NewReader(data), IfNoneMatch: aws.String("*"), Metadata: metadata})
-		if err = objectError(key, err); err != nil && !errors.Is(err, fs.ErrExist) {
-			return err
-		}
-	} else {
-		if w.buffer != nil && w.buffer.Len() > 0 {
-			if err := w.flush(); err != nil {
-				return err
+	completeStart := time.Now()
+	if !w.physicalComplete {
+		if w.uploadID == nil {
+			var data []byte
+			if w.buffer != nil {
+				data = w.buffer.Bytes()
+			}
+			_, err := b.client.PutObject(w.ctx, &s3.PutObjectInput{Bucket: &b.bucket, Key: &w.key, Body: bytes.NewReader(data), IfMatch: w.reservation, Metadata: metadata})
+			if err != nil {
+				return objectError(w.key, err)
+			}
+		} else {
+			if w.buffer != nil && w.buffer.Len() > 0 {
+				if err := w.flush(); err != nil {
+					return err
+				}
+			}
+			w.workers.Wait()
+			if w.partErr != nil {
+				return w.partErr
+			}
+			_, err := b.client.CompleteMultipartUpload(w.ctx, &s3.CompleteMultipartUploadInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, IfMatch: w.reservation, MultipartUpload: &s3types.CompletedMultipartUpload{Parts: w.parts}})
+			if err != nil {
+				return objectError(w.key, err)
 			}
 		}
-		w.workers.Wait()
-		if w.partErr != nil {
-			return w.partErr
-		}
-		completeStart := time.Now()
-		_, err := b.client.CompleteMultipartUpload(w.ctx, &s3.CompleteMultipartUploadInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, MultipartUpload: &s3types.CompletedMultipartUpload{Parts: w.parts}})
-		if err != nil {
-			return objectError(w.key, err)
-		}
-		completeElapsed := time.Since(completeStart)
-		copyStart := time.Now()
-		if err = b.copyStream(w.ctx, w.key, key, metadata); err != nil {
-			return err
-		}
-		logger.Debug("S3 stream commit", "parts", len(w.parts), "complete_seconds", completeElapsed.Seconds(), "copy_seconds", time.Since(copyStart).Seconds())
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 30*time.Second)
-		defer cancel()
-		if _, err = b.client.DeleteObject(cleanup, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &w.key}); err != nil {
-			logger.Warn("remove completed S3 upload staging object", "key", w.key, "error", err)
-		}
+		w.physicalComplete = true
 	}
+	completeElapsed := time.Since(completeStart)
+	indexStart := time.Now()
+	if err := b.putObjectReference(w.ctx, key, namedObjectReference{Key: w.key, Metadata: metadata}, true); err != nil {
+		return err
+	}
+	logger.Debug("S3 stream commit", "parts", len(w.parts), "complete_seconds", completeElapsed.Seconds(), "index_seconds", time.Since(indexStart).Seconds(), "copy_seconds", 0)
 	w.finished = true
 	w.cancel()
 	w.workers.Wait()
@@ -4354,6 +4570,7 @@ func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
 	}
 	return nil
 }
+
 func (w *s3StreamUpload) Abort() error {
 	if w.finished {
 		return nil
@@ -4365,19 +4582,28 @@ func (w *s3StreamUpload) Abort() error {
 		s3BufferPool.Put(w.buffer)
 		w.buffer = nil
 	}
-	if w.uploadID == nil {
+	// Once completed, an index PUT may have succeeded despite a lost response.
+	if w.physicalComplete {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 30*time.Second)
 	defer cancel()
 	b := w.bucket
-	_, err := b.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID})
-	// Complete may have succeeded before a failed Copy; remove that staging key too.
-	_, delErr := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &w.key})
-	if err = objectError(w.key, err); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	var err error
+	if w.uploadID != nil {
+		_, err = b.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID})
+		err = objectError(w.key, err)
+		if errors.Is(err, fs.ErrNotExist) {
+			err = nil
+		}
+	}
+	// No index was published; remove our pending reservation. A failed multipart
+	// abort retains the name to prevent a second writer racing late completion.
+	if err != nil {
 		return err
 	}
-	return objectError(w.key, delErr)
+	_, err = b.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &w.key})
+	return objectError(w.key, err)
 }
 
 type guardedReader struct {
@@ -4464,6 +4690,7 @@ func storeMailStream(ctx context.Context, root string, r io.Reader) (*jmapBlobRe
 		return nil, err
 	}
 	defer writer.Abort()
+	readStart := time.Now()
 	size, err := copyStream(ctx, writer, io.LimitReader(r, maxMailSize+1))
 	if err != nil {
 		return nil, err
@@ -4471,10 +4698,13 @@ func storeMailStream(ctx context.Context, root string, r io.Reader) (*jmapBlobRe
 	if size > maxMailSize {
 		return nil, &smtp.SMTPError{Code: 552, Message: "message too large"}
 	}
+	readElapsed := time.Since(readStart)
+	commitStart := time.Now()
 	id, err := writer.Commit()
 	if err != nil {
 		return nil, err
 	}
+	logger.Debug("mail stream stored", "bytes", size, "read_seconds", readElapsed.Seconds(), "commit_seconds", time.Since(commitStart).Seconds())
 	return &jmapBlobRef{AccountID: account, BlobID: id, Size: size}, nil
 }
 
@@ -4540,6 +4770,10 @@ func (a *jmapAccount) importStoredMail(ctx context.Context, box jmap.Id, ref *jm
 	return id, err
 }
 func deliverMailStream(ctx context.Context, users []string, ref *jmapBlobRef, sent bool) error {
+	started := time.Now()
+	defer func() {
+		logger.Debug("mail stream delivery", "recipients", len(users), "sent", sent, "elapsed_seconds", time.Since(started).Seconds())
+	}()
 	for _, user := range users {
 		if user == "" {
 			continue

@@ -286,7 +286,7 @@ docker build --build-arg COMMIT="$(git rev-parse HEAD)" -t fma:local .
 FMA_IMAGE=ghcr.io/jabberwocky238/fma:latest docker compose up -d --no-build --pull always
 ```
 
-JMAP 经宿主机回环地址 8080 提供 HTTP 后端，请接入 HTTPS 反向代理，并设置匹配的 `FMA_JMAP_URL`。上传限制至少 6 GiB；不要让代理缓冲附件到本地磁盘。
+JMAP 经宿主机回环地址 8080 提供 HTTP 后端，请接入 HTTPS 反向代理，并设置匹配的 `FMA_JMAP_URL`。上传限制至少 4 GiB；不要让代理缓冲附件到本地磁盘。
 
 <a id="run-kubernetes"></a>
 
@@ -362,11 +362,12 @@ curl --fail --user "$JMAP_USER:$JMAP_PASSWORD" \
 
 ```sh
 curl --fail --user "$JMAP_USER:$JMAP_PASSWORD" \
-  --header 'Content-Type: application/octet-stream' --data-binary @document.pdf \
+  --header 'Content-Type: application/octet-stream' \
+  --header 'Content-Disposition: attachment; filename="document.pdf"' --data-binary @document.pdf \
   'https://mail.example.com/upload/ACCOUNT_ID/'
 ```
 
-将 `{"blobId":"UPLOADED_BLOB_ID","type":"application/pdf","name":"document.pdf"}` 放入草稿的 attachments 数组。支持 multipart MIME、二进制附件、空文件与 Unicode 文件名。收到的附件只从认证账户所属的邮件解析，知道其他账户的 blob 哈希不会获得访问权。完整邮件/单次上传限制为 6 GiB，创建邮件时附件总计最多 4 GiB，为 MIME 传输编码和头部留空间。
+将 `{"blobId":"UPLOADED_BLOB_ID","type":"application/pdf","name":"document.pdf"}` 放入草稿的 attachments 数组。支持 multipart MIME、二进制附件、空文件与 Unicode 文件名。收到的附件只从认证账户所属的邮件解析，知道其他账户的 blob 哈希不会获得访问权。JMAP 单次 HTTP 上传限制为 4 GiB，邮件附件总计最多 4 GiB；完整 MIME 保留 6 GiB 上限，为 Base64 编码和头部留空间。JMAP 上传直接流式接收原始字节，组装 MIME 时才进行 Base64 编码。
 
 To/Cc/Bcc 都参与信封收件人计算；传出的 MIME 删除 Bcc 头。外部投递需要 direct 或 relay，本地投递在关闭外发时仍可使用。提交记录保存在 S3，重启后由原有 15 秒调度器继续处理；完成时清除活动 claim 和重试索引，保留供 JMAP 查询的投递结果。Claim 固定 20 秒；JMAP 每次传输尝试限制为 6 秒，为带条件的完成写入和库要求的时钟偏差留出余量，临时失败会重试。
 
@@ -389,7 +390,7 @@ python3 scripts/local.py
 
 `--bucket <name>` 选择已有桶，`--data` 修改 Fals3y 数据目录。该本地环境使用无鉴权 S3 端点和自签名 TLS 证书。
 
-POP3/STLS 和 POP3S 使用 migadu/go-pop3，由库管理协议、TLS、SASL PLAIN 和连接，fma 提供 S3 认证及邮箱会话。`DELE` 标记删除，`RSET` 撤销标记，`QUIT` 提交删除；未执行 `QUIT` 就断开连接会保留邮件。
+POP3/STLS 和 POP3S 使用 Jabberwocky238/go-pop3（migadu/go-pop3 的性能修复 fork），由库管理协议、TLS、SASL PLAIN 和连接，fma 提供 S3 认证及邮箱会话。`DELE` 标记删除，`RSET` 撤销标记，`QUIT` 提交删除；未执行 `QUIT` 就断开连接会保留邮件。
 
 ### 测试与构建
 
@@ -484,13 +485,35 @@ printf '%s' account | curl -f -X PUT --data-binary @- \
 | `<proxy>/.proxy` | Forwarding address / 转发邮箱地址 |
 | `<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body / 无正文的失败诊断 |
 | `<account>/.jmap/state.json` | Canonical mailbox metadata, indexes, state changes, UID bookkeeping, submission records and account lease / 统一邮箱元数据、索引、变更、UID、提交记录和账户租约 |
-| `<account>/.jmap/blobs/<blobId>` | Immutable raw MIME, uploaded files and decoded MIME parts / 不可变 MIME 原文、上传文件及解码附件 |
+| `<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | 流式写入的不可变 MIME 或上传附件；超过 10 MiB 使用 gzip |
+| `<account>/.jmap/blobs/<blobId>` | 命名对象及其编码、大小的小型索引；旧对象仍直接包含 MIME/blob 字节 |
+| `<account>/.jmap/blobs/<blobId>.part` | 原始 MIME 内附件的流式读取位置索引 |
 | `.jmap-queue/<accountId>` | Durable discovery hint for submission accounts; not a delivery task or auth grant / 提交账户发现标记，不是投递任务或认证授权 |
 | `.outbox/<id>.json` | SMTP outbound task and embedded preclaim / SMTP 外发任务及内嵌 preclaim |
 | `.lock` | Shared 15-second scan/renewal lease / 共享的 15 秒扫描与续期租约 |
 | `cert.pem, key.pem` | TLS certificate and key unless mounted from a Secret / TLS 证书与私钥，Secret 挂载时不需要 |
 
 旧版本的 `<account>/<uid>.json`、`next`、`folders` 和 `.folders/` 在该账户第一次访问时转换为共享元数据，保留原始对象。新元数据完整生成后才通过条件创建发布，失败不会发布半个邮箱；UID 和已有文件夹存储标识保留。升级前停止所有旧版本节点，不能混跑旧存储写入器和新版本。旧对象不会再接收更新，可在验证备份及新邮箱后通过外部工具清理。二进制不提供注册或管理命令。未引用的上传与 MIME 对象留在 S3，不使用本地临时文件或新增后台清理器。
+
+邮件物理目录 ID 使用 `subject + UTC timestamp`，时间戳精确到纳秒。
+主题先解码 RFC 2047，再与文件名分别做百分号转义；`/`、`%`、`?`、`#`、Unicode、单独的 `.` 和 `..` 不会改变路径层级，并限制各段长度。S3 条件创建保证时间戳或名称碰撞时报错，不覆盖已有内容。
+MIME 正文使用 `message.eml`；HTTP 上传可通过 `Content-Disposition` 提供附件名，未提供时使用 `attachment.bin`，无主题时使用 `untitled`。收到的附件仍从原始 MIME 流式读取，不在收信时重复存储整份附件。
+JMAP 的 blobId 保留为库要求的内容标识，只关联小型索引，不再决定正文或附件的物理对象名。分片直接上传到命名路径，完成后只 PUT 小索引，提交时不再复制整对象。
+旧对象可继续读取。部署该存储格式前需停止旧节点，旧版本无法读取新索引。索引发布中断或重复上传相同内容后，可能留下未引用的物理对象；当前没有自动 blob 清理器。
+
+SMTP 通过 `go.mod replace` 使用固定版本的性能修复 fork（[PR #312](https://github.com/emersion/go-smtp/pull/312)）。DATA reader 的单文件补丁改编自 [uponusolutions/go-smtp](https://github.com/uponusolutions/go-smtp/blob/86ff2622fb52f86371265b74a976333ff53c10a0/internal/textsmtp/dotreader.go) 的跨行扫描，保留原有服务端 API、默认 4 KiB 输入缓冲和行长度检查。POP3 直接导入独立模块 `github.com/Jabberwocky238/go-pop3`；`main` 包含性能修复和 fork 说明，`pr` 仅向上游提交性能补丁（[PR #3](https://github.com/migadu/go-pop3/pull/3)）。
+
+POP3 v0.1.6 增加 ARM64 向量扫描，并保留通用实现。独立 2 GiB 编码测试的吞吐量再提升 2.04 倍，但完整下载尚未验证出稳定加速。CPU、RSS、不同输入类型的对照和复现命令见 [PERFORMANCE.md](PERFORMANCE.md)。
+
+实测吞吐量和当前瓶颈见 [PERFORMANCE.md](PERFORMANCE.md)。
+
+吞吐量测试默认使用 2 GiB 附件，同时报告传输字节和原始附件字节的 MiB/s。
+`--smtp-transfer bdat` 单独测量已有的 SMTP CHUNKING 流式路径；默认仍测 DATA，保留其点转义处理耗时：
+
+```sh
+python3 scripts/test_streaming.py --mail --size-mib 2048 --report /tmp/fma-data.json
+python3 scripts/test_streaming.py --mail --size-mib 2048 --smtp-transfer bdat --report /tmp/fma-bdat.json
+```
 
 <a id="credits"></a>
 
@@ -504,7 +527,7 @@ printf '%s' account | curl -f -X PUT --data-binary @- \
 | --- | --- | --- |
 | [emersion/go-smtp](https://github.com/emersion/go-smtp) | SMTP | [MIT](https://github.com/emersion/go-smtp/blob/v0.25.0/LICENSE) |
 | [emersion/go-imap](https://github.com/emersion/go-imap) | IMAP | [MIT](https://github.com/emersion/go-imap/blob/v1.2.1/LICENSE) |
-| [migadu/go-pop3](https://github.com/migadu/go-pop3) | POP3 | [MIT](https://github.com/migadu/go-pop3/blob/v0.1.4/LICENSE) |
+| [Jabberwocky238/go-pop3](https://github.com/Jabberwocky238/go-pop3)（migadu/go-pop3 fork） | POP3 | [MIT](https://github.com/migadu/go-pop3/blob/v0.1.4/LICENSE) |
 | [naust-mail/naust-jmap](https://github.com/naust-mail/naust-jmap) | JMAP Core and Mail / JMAP 核心与邮件 | [Apache-2.0](https://github.com/naust-mail/naust-jmap/blob/main/LICENSE) |
 | [emersion/go-message](https://github.com/emersion/go-message) | MIME | [MIT](https://github.com/emersion/go-message/blob/v0.18.2/LICENSE) |
 | [emersion/go-sasl](https://github.com/emersion/go-sasl) | SASL | [MIT](https://github.com/emersion/go-sasl/blob/master/LICENSE) |

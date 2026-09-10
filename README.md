@@ -387,7 +387,7 @@ To use a published image with the same Compose settings:
 FMA_IMAGE=ghcr.io/jabberwocky238/fma:latest docker compose up -d --no-build --pull always
 ```
 
-JMAP uses the HTTP backend on host loopback port 8080. Connect an HTTPS reverse proxy and set the matching `FMA_JMAP_URL`. Allow uploads of at least 6 GiB and disable proxy request buffering to local disk.
+JMAP uses the HTTP backend on host loopback port 8080. Connect an HTTPS reverse proxy and set the matching `FMA_JMAP_URL`. Allow uploads of at least 4 GiB and disable proxy request buffering to local disk.
 
 <a id="run-kubernetes"></a>
 
@@ -519,7 +519,8 @@ Upload a file using the session's upload URL after substituting `{accountId}`:
 
 ```sh
 curl --fail --user "$JMAP_USER:$JMAP_PASSWORD" \
-  --header 'Content-Type: application/octet-stream' --data-binary @document.pdf \
+  --header 'Content-Type: application/octet-stream' \
+  --header 'Content-Disposition: attachment; filename="document.pdf"' --data-binary @document.pdf \
   'https://mail.example.com/upload/ACCOUNT_ID/'
 ```
 
@@ -527,8 +528,9 @@ Include `{"blobId":"UPLOADED_BLOB_ID","type":"application/pdf","name":"document.
 in the draft's `attachments` array. Multipart MIME, binary/empty attachments and
 Unicode filenames are supported. Incoming attachments are resolved from messages
 in the authenticated account; knowing another account's blob hash grants no access.
-A complete message/upload is limited to 6 GiB; composed attachments total at most
-4 GiB to leave room for MIME transfer encoding and headers.
+A single JMAP HTTP upload is limited to 4 GiB, and composed attachments total at most
+4 GiB. Complete MIME messages may reach 6 GiB to allow for Base64 encoding and headers.
+JMAP uploads stream raw bytes; Base64 encoding happens when composing MIME.
 
 To/Cc/Bcc produce envelope recipients; Bcc is removed from the transmitted MIME.
 External recipients need `direct` or `relay`; local delivery works with outbound
@@ -566,7 +568,7 @@ Use `--bucket <name>` to select an existing bucket. `--data` configures Fals3y's
 storage directory, not the mail process. This local setup uses an unauthenticated
 S3 endpoint and a self-signed TLS certificate.
 
-POP3/STLS and POP3S use [migadu/go-pop3](https://github.com/migadu/go-pop3).
+POP3/STLS and POP3S use [Jabberwocky238/go-pop3](https://github.com/Jabberwocky238/go-pop3), a performance fork of migadu/go-pop3.
 The library handles protocol framing, TLS and SASL PLAIN; fma supplies S3 authentication
 and mailbox sessions. `DELE` marks messages, `RSET` clears those marks, and `QUIT`
 commits deletion. Disconnecting without `QUIT` keeps the messages.
@@ -717,13 +719,45 @@ type, prepare its new configuration first and replace `.kind` last.
 | `<proxy>/.proxy` | Forwarding address |
 | `<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body |
 | `<account>/.jmap/state.json` | Canonical mailbox metadata, indexes, state changes, UID bookkeeping, submission records and account lease |
-| `<account>/.jmap/blobs/<blobId>` | Immutable raw MIME, uploaded files and decoded MIME parts |
+| `<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | Immutable streamed MIME or uploaded attachment bytes; gzip above 10 MiB |
+| `<account>/.jmap/blobs/<blobId>` | Small reference to a named object and its encoding/size; legacy objects still contain raw MIME/blob bytes |
+| `<account>/.jmap/blobs/<blobId>.part` | Small locator for an incoming attachment inside its original MIME message |
 | `.jmap-queue/<accountId>` | Durable discovery hint for submission accounts; not a delivery task or auth grant |
 | `.outbox/<id>.json` | SMTP outbound task and embedded preclaim |
 | `.lock` | Shared 15-second scan/renewal lease |
 | `cert.pem, key.pem` | TLS certificate and key unless mounted from a Secret |
 
 Legacy `<account>/<uid>.json`, `next`, `folders` and `.folders/` data is converted on the account's first access, retaining the original objects. A conditional create publishes the complete metadata image; failures cannot publish a partial mailbox. Existing UIDs and folder storage identities are preserved. Stop every old-version node before upgrading; do not mix legacy writers with the new version. Old objects no longer receive updates and may be cleaned externally after verifying backups and the new mailbox. The binary exposes no registration or management commands. Unreferenced uploads and MIME objects remain in S3; no local temporary files or new background garbage collector are used.
+
+Physical mail directory IDs are `subject + UTC timestamp` with nanosecond precision.
+RFC 2047 subjects are decoded, and each subject/filename path segment is percent-escaped
+(including `/`, `%`, `?`, `#`, Unicode and dot-only segments), with a bounded length.
+Object creation is conditional: a timestamp/name collision fails instead of overwriting data.
+Raw MIME uses `message.eml`. HTTP uploads accept a filename in `Content-Disposition`;
+without one they use `attachment.bin`, and without a subject they use `untitled`.
+Incoming attachments remain streaming views of the original MIME, so receiving a mail
+never duplicates all attachment bytes. A JMAP blob ID remains the library's content
+identifier; it no longer dictates the physical object's name. Multipart upload writes
+directly to that name, followed by a small index PUT, with no whole-object copy at commit.
+Existing objects remain readable. Stop older nodes before deploying this storage format;
+they cannot read the new reference objects. Completed but unreferenced physical objects
+may remain after interrupted index publication or repeated identical uploads; no automatic
+blob garbage collector is provided.
+
+SMTP uses a pinned performance fork through `go.mod replace` ([PR #312](https://github.com/emersion/go-smtp/pull/312)). Its single-file DATA reader patch adapts the cross-line scan from [uponusolutions/go-smtp](https://github.com/uponusolutions/go-smtp/blob/86ff2622fb52f86371265b74a976333ff53c10a0/internal/textsmtp/dotreader.go), retaining the existing server API, default 4 KiB input buffer, and line-length checks. POP3 directly imports the independent `github.com/Jabberwocky238/go-pop3` module; its `main` includes the performance fix and fork documentation, while `pr` submits only the patch to upstream ([PR #3](https://github.com/migadu/go-pop3/pull/3)).
+
+POP3 v0.1.6 adds bounded ARM64 vector scanning with a portable fallback. The isolated 2 GiB writer benchmark gains another 2.04x throughput; complete-download gains remain unproven. CPU, RSS, input-shape comparisons and reproduction commands are recorded in [PERFORMANCE.md](PERFORMANCE.md).
+
+See [PERFORMANCE.md](PERFORMANCE.md) for measured throughput and the remaining limits.
+
+The throughput benchmark defaults to a 2 GiB attachment and reports both wire-byte and
+attachment-byte MiB/s. `--smtp-transfer bdat` separately measures the existing SMTP
+CHUNKING path; the default remains DATA so its dot-processing cost stays visible:
+
+```sh
+python3 scripts/test_streaming.py --mail --size-mib 2048 --report /tmp/fma-data.json
+python3 scripts/test_streaming.py --mail --size-mib 2048 --smtp-transfer bdat --report /tmp/fma-bdat.json
+```
 
 <a id="credits"></a>
 
@@ -737,7 +771,7 @@ Thanks to the following projects. Each retains its own license; fma's MIT licens
 | --- | --- | --- |
 | [emersion/go-smtp](https://github.com/emersion/go-smtp) | SMTP | [MIT](https://github.com/emersion/go-smtp/blob/v0.25.0/LICENSE) |
 | [emersion/go-imap](https://github.com/emersion/go-imap) | IMAP | [MIT](https://github.com/emersion/go-imap/blob/v1.2.1/LICENSE) |
-| [migadu/go-pop3](https://github.com/migadu/go-pop3) | POP3 | [MIT](https://github.com/migadu/go-pop3/blob/v0.1.4/LICENSE) |
+| [Jabberwocky238/go-pop3](https://github.com/Jabberwocky238/go-pop3) (fork of migadu/go-pop3) | POP3 | [MIT](https://github.com/migadu/go-pop3/blob/v0.1.4/LICENSE) |
 | [naust-mail/naust-jmap](https://github.com/naust-mail/naust-jmap) | JMAP Core and Mail | [Apache-2.0](https://github.com/naust-mail/naust-jmap/blob/main/LICENSE) |
 | [emersion/go-message](https://github.com/emersion/go-message) | MIME | [MIT](https://github.com/emersion/go-message/blob/v0.18.2/LICENSE) |
 | [emersion/go-sasl](https://github.com/emersion/go-sasl) | SASL | [MIT](https://github.com/emersion/go-sasl/blob/master/LICENSE) |
