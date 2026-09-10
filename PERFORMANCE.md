@@ -771,3 +771,169 @@ speedup. Application `make test` and module verification passed after selecting
 the published version, including native S3 protocol integration and the 32 MiB
 streaming check. The larger measurements above used the identical POP3 runtime
 patch in a local checkout; they are not relabeled as new published-module runs.
+
+
+## SMTP and JMAP bottleneck isolation after the storage update
+
+Application baseline: commit **077b404**. All measurements in this section use a
+2,147,483,648-byte low-compressibility attachment / 2,938,662,361-byte MIME message,
+Apple M4/macOS arm64, Go 1.25.3 and the same Fals3y shared-file binary
+0.3.1-dev.b8e48bf (SHA-256 1298e405c1631fbded92892eadc7252d8e2e319dfdf42f48c188ae3fd82ffb4b).
+This is a new investigation; the historical seven-second SMTP / three-second
+commit results are not the current baseline.
+
+| Component | Repository / version | Role in the measured path | PR relationship |
+| --- | --- | --- | --- |
+| Application | [Jabberwocky238/fma](https://github.com/Jabberwocky238/fma), 077b404 | serveJMAP, materializePart, findPart, openPart, streaming storage | Temporary diagnostic overlays only; no new runtime patch/PR |
+| SMTP | [Jabberwocky238/go-smtp](https://github.com/Jabberwocky238/go-smtp), b0673510e580 / v0.25.1-0.20260910174640-b0673510e580 | DATA reader plus original per-byte line-length checks | Existing [PR #312](https://github.com/emersion/go-smtp/pull/312) is reference only; not edited |
+| JMAP core | [naust-mail/naust-jmap](https://github.com/naust-mail/naust-jmap), core v0.4.2 | Blob authorization and HTTP download using streamed copy | No PR filed |
+| JMAP mail | [naust-mail/naust-jmap](https://github.com/naust-mail/naust-jmap), datatypes/mail v0.3.3 | Email/get attachment identity calculation, MIME and Base64 parsing | No PR filed |
+| POP3 | [Jabberwocky238/go-pop3](https://github.com/Jabberwocky238/go-pop3), v0.1.6 | Unchanged control path | Existing [PR #3](https://github.com/migadu/go-pop3/pull/3); no additional POP3 fix in this investigation |
+
+### Unprofiled single-change comparisons
+
+Temporary Go overlays and a temporary SMTP checkout isolate one change at a time.
+The production checkout and pinned dependencies remain unchanged. All four full
+runs passed protocol/content hashes and the 256 MiB email-server RSS ceiling.
+Samples were sequential; one sample per variant cannot establish significance.
+
+| Variant | SMTP DATA (s) | JMAP attachment metadata (s) | JMAP attachment download (s) | Changed behavior |
+| --- | ---: | ---: | ---: | --- |
+| baseline | 5.430 | 5.167 | 14.067 | None |
+| coalesce-result | 5.500 | 5.209 | 8.779 | Aggregate decoded attachment reads, bounded at 128 KiB; no extra whole-object buffer |
+| smtp128 | 5.776 | 5.196 | 14.189 | SMTP text input buffer 4 KiB to 128 KiB only; line checks retained |
+| smtp-bulk-limit | 4.512 | 5.200 | 16.508 | Batch line-length checks at LF boundaries; original 4 KiB input buffer retained |
+
+| Variant / affected phase | Server CPU (s) | Average CPU, one core = 100% | Initial RSS (bytes) | Peak RSS (bytes) | Sampled increase (bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline / smtp_mime_upload | 7.530 | 138.68% | 136134656 | 149585920 | 13451264 |
+| smtp128 / smtp_mime_upload | 7.240 | 125.35% | 135905280 | 157777920 | 21872640 |
+| smtp-bulk-limit / smtp_mime_upload | 6.270 | 138.97% | 118407168 | 147980288 | 29573120 |
+| baseline / jmap_attachment_metadata | 5.410 | 104.70% | 184909824 | 185090048 | 180224 |
+| baseline / jmap_attachment_download | 16.990 | 120.78% | 185090048 | 187449344 | 2359296 |
+| coalesce-result / jmap_attachment_download | 9.350 | 106.50% | 176603136 | 176685056 | 81920 |
+
+CPU/RSS cover the entire email server, exclude the separate Fals3y/client processes,
+and include prior phases' retained buffers. RSS sampling is every 0.05 s. The
+aggregation experiment adds no whole-attachment allocation; its bounded reader
+still requires additional error/cancellation/short-read tests before production use.
+
+### SMTP: the bottleneck moved away from multipart commit
+
+| Variant | Receive / gzip / stream (s) | Commit including outstanding uploads (s) | Inbox import (s) |
+| --- | ---: | ---: | ---: |
+| baseline | 4.245561 | 0.025131 | 1.150662 |
+| smtp128 | 4.105414 | 0.518050 | 1.142987 |
+| smtp-bulk-limit | 3.331336 | 0.019617 | 1.152079 |
+
+The baseline's 4.245561 s reception, 0.025131 s commit and 1.150662 s import account
+for almost all 5.430 s SMTP latency. Continuing to optimize the historical 2.893 s
+commit would target a bottleneck already removed by the storage update.
+The 128 KiB buffer alone did not improve total latency in this sample; its commit
+also varied to 0.518050 s, so the test does not isolate a buffer slowdown either.
+The line-check experiment reduced SMTP to 4.512 s (16.9% less wall time) and CPU
+from 7.53 to 6.27 s (16.7% less CPU). It preserves positive line-length enforcement
+and passed the existing DataReader/LineLimit tests; it is not a merged library fix.
+
+### JMAP: repeated full scans and small decoded output chunks
+
+An instrumented diagnostic build measured the following actual gzip-decoded MIME
+consumption. These counters are logical decompressed bytes, not physical S3 bytes
+or socket-read counts. The CPU-profile run is separate from the unprofiled table.
+
+| Diagnostic stage | Stage elapsed (s) | MIME bytes read | OpenStream calls | Recorded completion UTC |
+| --- | ---: | ---: | ---: | --- |
+| Email/get attachments | 5.183364 | 2,938,662,361 | 1 | 2026-09-10T18:45:10.259Z |
+| First-download materializePart subset | 4.481955 | 2,938,662,361 | 1 | 2026-09-10T18:45:14.876Z |
+| Entire first attachment download | 14.105453 | 5,877,324,722 | 3 | 2026-09-10T18:45:24.499Z |
+
+The subset is included in the whole download; do not add it again. Metadata plus
+first download reads **8,815,987,083 MIME bytes**, exactly three full message passes.
+Additional source opens can consume headers or fail the physical-blob lookup;
+three OpenStream calls do not mean three full-body reads during download.
+
+Email/get enables identity capture for attachment blobId/size and hashes decoded
+content each time. The application then lacks a part locator: materializePart
+scans account messages, findPart decodes/hashes candidates, and only then saves
+Source/Path/Size. openPart subsequently opens the MIME again for actual delivery.
+For a late attachment or an account with many messages, the uncached search can
+scan still more data. This is an algorithmic cost, not just gzip speed.
+
+The standard Base64 stream decoder buffers 1,024 encoded bytes and can yield only
+768 decoded bytes per call. JMAP core copies that reader to HTTP; small writes
+increase transport/dispatch overhead. Aggregating reads reduced download from
+14.067 to 8.779 s (37.6% less time) and CPU from 16.99 to 9.35 s (45.0% less CPU),
+while metadata remained 5.167 versus 5.209 s. No scan was removed in this experiment,
+so it independently demonstrates an output-chunking cost. The diagnostic first
+locator scan was 4.482 s; the remainder was approximately 9.623 s before aggregation.
+
+Profiles showed most samples under system-call stacks reached from SMTP buffered
+reads and from JMAP gzip/MIME/Base64 reads and HTTP writes. SMTP lineLimitReader
+had 3.82/7.04 s cumulative samples; the metadata decoder 5.06/5.32 s; first-download
+system calls 11.68/15.00 s. These are nested sampled CPU stacks, not additive wall
+stages or proof that pure decoder arithmetic owns those times. The logical read
+counters and isolated changes provide stronger causal evidence than flat symbols.
+
+### Optimization order and limits
+
+| Priority | Proposed change | Why / required safeguards |
+| --- | --- | --- |
+| 1 | Aggregate decoded HTTP attachment output in bounded chunks | Measured reduction; preserve partial data, EOF, cancellation, source closure and read errors |
+| 2 | Persist MIME part identity and locator together during an existing parse | Reuse account + immutable source blob + parser-version metadata; avoid searching/rehashing the MIME again for the first download |
+| 3 | Cache immutable computed attachment metadata | Repeated Email/get should not hash all attachment bytes again; keep request projection, malformed-MIME semantics and account authorization correct |
+| 4 | Batch SMTP line validation while keeping limits | Measured improvement in a temporary checkout; do not disable line checks or broaden the upstream DATA-only PR silently |
+| 5 | Reuse or overlap mail import parsing with reception | Import still rereads the full MIME; simply moving extra hashing into SMTP can make uploads slower, so measure the combined pipeline |
+
+Locators and hashes must never bypass account/message access checks. A single gzip
+object also prevents ordinary S3 byte-range access to decoded MIME offsets; offset
+indexing alone cannot make late parts randomly accessible without an appropriate
+seekable or independently stored representation. These are follow-up designs,
+not performance gains claimed as implemented.
+
+### UTC recording intervals and artifacts
+
+These intervals are measurement-file creation through last modification, including
+setup/other phases; they are not exact per-operation UTC start/end instants.
+No console logs or source snippets are embedded here.
+
+| Measurement | Recording start UTC | Recording end UTC |
+| --- | --- | --- |
+| profile | 2026-09-10T18:44:27.666Z | 2026-09-10T18:45:25.517Z |
+| baseline | 2026-09-10T18:47:22.911Z | 2026-09-10T18:48:02.168Z |
+| coalesce-result | 2026-09-10T18:48:02.364Z | 2026-09-10T18:48:37.045Z |
+| smtp128 | 2026-09-10T18:49:08.300Z | 2026-09-10T18:49:48.495Z |
+| smtp-bulk-limit | 2026-09-10T18:50:27.918Z | 2026-09-10T18:51:10.002Z |
+
+Local evidence uses /tmp/fma-bottleneck-{profile,baseline,coalesce-result,smtp128,smtp-bulk-limit}.json;
+profiles and temporary overlays are outside the repository. The final profile
+run passed hashes but is not mixed into the unprofiled speedup comparisons.
+This pass isolates low-compressibility data; the previous compressible results
+remain historical and do not acquire a new paired speedup claim.
+
+
+### Repeated-request confirmation with aggregated output
+
+A second aggregation run repeated Email/get and download for the same attachment
+within one server process. Both requests still verify the decoded size and hash.
+Only the first download needs a new locator; metadata is requested twice with
+identical properties. This tests an existing locator, not a full-body memory cache.
+
+| Request | Wall (s) | Server CPU (s) | Average one-core CPU | Initial RSS (bytes) | Peak RSS (bytes) | Sampled increase (bytes) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| jmap_attachment_metadata | 5.185 | 5.450 | 105.12% | 199262208 | 199278592 | 16384 |
+| jmap_attachment_download | 8.681 | 9.180 | 105.75% | 199278592 | 199311360 | 32768 |
+| jmap_repeat_metadata | 5.178 | 5.430 | 104.87% | 199311360 | 199327744 | 16384 |
+| jmap_repeat_download | 4.226 | 4.470 | 105.76% | 199327744 | 199327744 | 0 |
+
+Metadata remained **5.185 / 5.178 s**, confirming the absence of effective computed
+attachment-identity caching. Download fell from **8.681 to 4.226 s**, a 4.455 s
+difference consistent with the independently counted 4.482 s locator scan.
+The repeat download remains expensive even after locator reuse and aggregation;
+it still streams and decodes the attachment. This experiment does not measure
+eliminating gzip or Base64 processing.
+
+Recording interval: **2026-09-10T18:53:00.127Z–2026-09-10T18:53:43.408Z**,
+from the measurement artifact's creation/last-write metadata. Evidence:
+/tmp/fma-bottleneck-repeat.json. All hashes and the 256 MiB RSS ceiling passed.
+The only repository change from this investigation is this documentation;
+experimental runtime and library changes remain in temporary files for follow-up.
