@@ -75,54 +75,46 @@ var config Config
 var version, commit, releaseTime string
 
 func defaultConfig() Config {
-	return Config{
-		Domain: "t12e.cc", CertFile: "cert.pem", KeyFile: "key.pem",
-		SMTPAddr: "127.0.0.1:2525", SubmissionAddr: "127.0.0.1:1587", SMTPSAddr: "127.0.0.1:1465",
-		POP3Addr: "127.0.0.1:1110", POP3SAddr: "127.0.0.1:1995",
-		IMAPAddr: "127.0.0.1:1143", IMAPSAddr: "127.0.0.1:1993", HTTPAddr: "127.0.0.1:8080",
-		QueueRetry: time.Minute,
-		S3:         S3Config{Region: "us-east-1"},
-	}
+	c, _ := loadConfig(nil, func(string) string { return "" })
+	return c
 }
 
 func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
-	getenv := func(key string) string { return lookupEnv("FMA_" + key) }
-	c := defaultConfig()
-	// All environment reads belong here. Flags override environment defaults.
-	c.S3.Endpoint = getenv("S3_ENDPOINT")
-	c.S3.Bucket = getenv("S3_BUCKET")
-	if region := getenv("S3_REGION"); region != "" {
-		c.S3.Region = region
+	getenv := func(key, fallback string) string {
+		if value := lookupEnv("FMA_" + key); value != "" {
+			return value
+		}
+		return fallback
 	}
-	c.S3.AccessKey = getenv("S3_ACCESS_KEY_ID")
-	c.S3.SecretKey = getenv("S3_SECRET_ACCESS_KEY")
-	c.S3.SessionToken = getenv("S3_SESSION_TOKEN")
-	c.OutboundMode = getenv("OUTBOUND_MODE")
-	c.RelayAddr = getenv("RELAY_ADDR")
-	c.RelayUser = getenv("RELAY_USER")
-	c.RelayPassword = getenv("RELAY_PASSWORD")
-	c.RelayPasswordFile = getenv("RELAY_PASSWORD_FILE")
-	c.RelayTLS = getenv("RELAY_TLS")
-	c.RelayCAFile = getenv("RELAY_CA_FILE")
+	c := Config{
+		S3: S3Config{
+			AccessKey: getenv("S3_ACCESS_KEY_ID", ""), SecretKey: getenv("S3_SECRET_ACCESS_KEY", ""),
+			SessionToken: getenv("S3_SESSION_TOKEN", ""),
+		},
+		RelayAddr: getenv("RELAY_ADDR", ""), RelayUser: getenv("RELAY_USER", ""),
+		RelayPassword: getenv("RELAY_PASSWORD", ""), RelayPasswordFile: getenv("RELAY_PASSWORD_FILE", ""),
+		RelayTLS: getenv("RELAY_TLS", ""), RelayCAFile: getenv("RELAY_CA_FILE", ""),
+	}
+	// Flags override environment values, which override the defaults below.
 	f := flag.NewFlagSet("fma", flag.ContinueOnError)
-	f.StringVar(&c.Domain, "domain", c.Domain, "local email domain")
-	f.StringVar(&c.S3.Endpoint, "s3-endpoint", c.S3.Endpoint, "S3 endpoint URL; empty for AWS")
-	f.StringVar(&c.S3.Bucket, "s3-bucket", c.S3.Bucket, "existing S3 bucket for all persistent data")
-	f.StringVar(&c.S3.Region, "s3-region", c.S3.Region, "S3 region")
-	f.StringVar(&c.CertFile, "cert", c.CertFile, "TLS certificate chain object key in the S3 bucket")
-	f.StringVar(&c.KeyFile, "key", c.KeyFile, "TLS private key object key in the S3 bucket")
-	f.StringVar(&c.SMTPAddr, "smtp", c.SMTPAddr, "inbound SMTP")
-	f.StringVar(&c.SubmissionAddr, "submission", c.SubmissionAddr, "submission STARTTLS")
-	f.StringVar(&c.SMTPSAddr, "smtps", c.SMTPSAddr, "submission TLS")
-	f.StringVar(&c.POP3Addr, "pop3", c.POP3Addr, "POP3 STLS backend")
-	f.StringVar(&c.POP3SAddr, "pop3s", c.POP3SAddr, "POP3S backend")
-	f.StringVar(&c.IMAPAddr, "imap", c.IMAPAddr, "IMAP STARTTLS backend")
-	f.StringVar(&c.IMAPSAddr, "imaps", c.IMAPSAddr, "IMAPS backend")
-	f.StringVar(&c.HTTPAddr, "http", c.HTTPAddr, "HTTP health backend")
-	f.StringVar(&c.OutboundMode, "outbound", c.OutboundMode, "disabled, relay or direct")
+	f.StringVar(&c.Domain, "domain", "t12e.cc", "local email domain")
+	f.StringVar(&c.S3.Endpoint, "s3-endpoint", getenv("S3_ENDPOINT", ""), "S3 endpoint URL; empty for AWS")
+	f.StringVar(&c.S3.Bucket, "s3-bucket", getenv("S3_BUCKET", ""), "existing S3 bucket for all persistent data")
+	f.StringVar(&c.S3.Region, "s3-region", getenv("S3_REGION", "us-east-1"), "S3 region")
+	f.StringVar(&c.CertFile, "cert", "cert.pem", "TLS certificate chain object key in the S3 bucket")
+	f.StringVar(&c.KeyFile, "key", "key.pem", "TLS private key object key in the S3 bucket")
+	f.StringVar(&c.SMTPAddr, "smtp", "127.0.0.1:2525", "inbound SMTP")
+	f.StringVar(&c.SubmissionAddr, "submission", "127.0.0.1:1587", "submission STARTTLS")
+	f.StringVar(&c.SMTPSAddr, "smtps", "127.0.0.1:1465", "submission TLS")
+	f.StringVar(&c.POP3Addr, "pop3", "127.0.0.1:1110", "POP3 STLS backend")
+	f.StringVar(&c.POP3SAddr, "pop3s", "127.0.0.1:1995", "POP3S backend")
+	f.StringVar(&c.IMAPAddr, "imap", "127.0.0.1:1143", "IMAP STARTTLS backend")
+	f.StringVar(&c.IMAPSAddr, "imaps", "127.0.0.1:1993", "IMAPS backend")
+	f.StringVar(&c.HTTPAddr, "http", "127.0.0.1:8080", "HTTP health backend")
+	f.StringVar(&c.OutboundMode, "outbound", getenv("OUTBOUND_MODE", ""), "disabled, relay or direct")
 	f.BoolVar(&c.ShowVersion, "version", false, "print version and exit")
 	f.BoolVar(&c.ShowQueue, "queue", false, "show outbound status without mail bodies")
-	f.DurationVar(&c.QueueRetry, "queue-retry", c.QueueRetry, "initial outbound retry delay")
+	f.DurationVar(&c.QueueRetry, "queue-retry", time.Minute, "initial outbound retry delay")
 	if err := f.Parse(args); err != nil {
 		return Config{}, err
 	}
