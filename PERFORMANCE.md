@@ -1719,3 +1719,59 @@ streaming content/compression/RSS checks. Local logs are
 `/tmp/fma-owner-complete-tests.log`, `/tmp/fma-owner-build.log` and
 `/tmp/fma-owner-benchmark.log`. The four-node ownership regressions also passed
 three consecutive race-enabled runs.
+
+
+## Post-state-refactor 2 GiB protocol measurements (2026-09-10)
+
+Tested the committed `ea11b06` application with a clean working tree before this documentation update. The runtime source was not changed for these tests. Apple M4, macOS arm64, Go 1.25.3, four default ingestion workers, native Fals3y `0.3.1-dev.b8e48bf`, loopback networking. Five runs executed sequentially, each with a newly built process and isolated temporary S3 storage. These are local end-to-end protocol measurements, not remote AWS S3 throughput or cold OS page-cache measurements.
+
+Every run transfers **2,147,483,648 attachment bytes (2 GiB)**. SMTP, IMAP and POP3 transfer **2,938,662,361 MIME bytes (about 2.737 GiB)** after Base64/MIME framing. The seed is 20260910; incompressible fixtures repeat a random 1 MiB block whose period exceeds the gzip window. JMAP attachment metadata/download are measured immediately after SMTP, before IMAP/POP3 reads. SMTP includes the connection/envelope and final storage acknowledgement; IMAP APPEND includes the command and final acknowledgement.
+
+### Per-run elapsed time
+
+All times below are seconds. `DATA` and `BDAT` rows are separate SMTP transfer modes.
+
+| Run | Raw JMAP up | Raw JMAP down | SMTP write | IMAP down | IMAP APPEND | POP3 down | JMAP metadata | First attachment down | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| data-1 | 1.863 | 0.850 | 4.075 | 1.978 | 4.157 | 1.855 | 0.003 | 0.912 | 239.34 |
+| data-2 | 1.848 | 0.863 | 3.932 | 1.940 | 4.048 | 1.849 | 0.004 | 0.871 | 238.97 |
+| bdat-1 | 1.971 | 0.866 | 4.051 | 1.926 | 4.075 | 1.831 | 0.003 | 0.892 | 233.38 |
+| bdat-2 | 1.791 | 0.865 | 4.088 | 1.918 | 4.096 | 1.817 | 0.003 | 0.887 | 231.84 |
+| compressible | 1.447 | 0.842 | 3.626 | 2.069 | 3.922 | 2.248 | 0.003 | 0.834 | 121.00 |
+
+### Incompressible averages and write throughput
+
+Shared paths average all four incompressible runs; each SMTP mode averages its two runs. Payload throughput uses the 2 GiB decoded size for every path. MIME wire throughput uses the larger MIME size and must not be confused with payload throughput.
+
+| Write path | Samples | Mean seconds | Payload MiB/s | MIME wire MiB/s |
+| --- | ---: | ---: | ---: | ---: |
+| JMAP raw upload | 4 | 1.8682 | 1096.2 | — |
+| SMTP DATA | 2 | 4.0035 | 511.6 | 700.0 |
+| SMTP BDAT | 2 | 4.0695 | 503.3 | 688.7 |
+| IMAP APPEND | 4 | 4.0940 | 500.2 | 684.5 |
+
+SMTP DATA averages **4.0035 s** and BDAT **4.0695 s**. This pair does not demonstrate a BDAT advantage. DATA is close to the preceding production three-block mean of 4.050 s; the roughly 1% difference is not evidence of a significant single-message speedup from the state refactor. This workload uses an almost empty account, so it does not measure the removed whole-account metadata amplification at high message counts. Both SMTP modes and IMAP APPEND remain above three seconds.
+
+The compressible fixture is one additional sample, not a matched two-run mean: raw upload **1.447 s**, SMTP DATA **3.626 s**, IMAP APPEND **3.922 s**. Compression reduces stored bytes and memory, but does not eliminate MIME parsing, hashing or transfer work. Some compressed download timings are slower; do not treat a single sample as a regression finding.
+
+All five runs exited successfully and passed content/hash, storage-encoding, mail-prefix and no-local-spool assertions, as well as the original **256 MiB** sampled fma RSS criterion. Incompressible whole-run peaks were **231.84–239.34 MiB**; the compressible peak was **121.00 MiB**. The harness also exercised interrupted upload handling. CPU/RSS measure fma only, excluding Fals3y and the Python client; RSS sampling is every 50 ms.
+
+### Reproduction and provenance
+
+```sh
+python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --size-mib 2048 --report /tmp/fma-data.json
+python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --size-mib 2048 --smtp-transfer bdat --report /tmp/fma-bdat.json
+python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --size-mib 2048 --data compressible --report /tmp/fma-compressible.json
+```
+
+Reports and full logs are retained locally in `/tmp/fma-2gib-20260910T222508Z` as `<run>.json` and `<run>.log`; `summary.json` contains calculated means. Each report records phase UTC timestamps, fixture hashes, executable identity, CPU, RSS and throughput. Temporary test buckets/processes were cleaned by the harness.
+
+| Run | First upload start UTC | Last measured phase end UTC |
+| --- | --- | --- |
+| data-1 | 2026-09-10T22:25:09.898889+00:00 | 2026-09-10T22:25:27.137661+00:00 |
+| data-2 | 2026-09-10T22:25:29.721193+00:00 | 2026-09-10T22:25:46.709390+00:00 |
+| bdat-1 | 2026-09-10T22:25:49.256838+00:00 | 2026-09-10T22:26:06.548272+00:00 |
+| bdat-2 | 2026-09-10T22:26:09.058219+00:00 | 2026-09-10T22:26:26.203159+00:00 |
+| compressible | 2026-09-10T22:26:28.715879+00:00 | 2026-09-10T22:26:45.386663+00:00 |
+
+All five runs used executable SHA-256 `a19d4aa7dc2bfb16a7d9fdde695f4eab1c63b52c42ce9f3ad98ed8c2f2bf6bb5`. This update records measurements only; no runtime code or tuning parameters changed.
