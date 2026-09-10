@@ -43,6 +43,11 @@ Use `--bucket <name>` to select an existing bucket. `--data` configures Fals3y's
 storage directory, not the mail process. This local setup uses an unauthenticated
 S3 endpoint and a self-signed TLS certificate.
 
+POP3/STLS and POP3S use [migadu/go-pop3](https://github.com/migadu/go-pop3).
+The library handles protocol framing, TLS and SASL PLAIN; fma supplies S3 authentication
+and mailbox sessions. `DELE` marks messages, `RSET` clears those marks, and `QUIT`
+commits deletion. Disconnecting without `QUIT` keeps the messages.
+
 ## Accounts
 
 Each username is a bucket-root prefix. The contents of `<user>/.password` define
@@ -65,7 +70,7 @@ recipient checks read S3 on every request, without an account list or password c
 
 ## Connect to S3
 
-Build with Go 1.23 or newer. The bucket must already exist and support consistent
+Build with Go 1.25 or newer. The bucket must already exist and support consistent
 reads and listings, ETags, and atomic conditional PUTs (`If-None-Match` and `If-Match`).
 
 ```sh
@@ -202,7 +207,7 @@ version on its first line, followed by commit and release time.
 ## CI and releases
 
 GitHub Actions runs formatting, vet, race, native Fals3y integration tests, and a
-build on branch pushes and pull requests, using Go 1.23 and the current stable Go.
+build on branch pushes and pull requests, using Go 1.25 and the current stable Go.
 Release configuration is checked with GoReleaser as part of CI.
 
 Push a semantic version tag to publish a GitHub Release after the same checks pass:

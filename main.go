@@ -49,6 +49,8 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-sasl"
 	smtp "github.com/emersion/go-smtp"
+	"github.com/migadu/go-pop3/pop3"
+	"github.com/migadu/go-pop3/pop3server"
 )
 
 // Main
@@ -254,12 +256,12 @@ func run() error {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "fma mail server: SMTP, POP3S and IMAPS")
 	})}
-	pop := &popServer{cfg: cfg, conns: make(map[net.Conn]bool)}
-	closers = append(closers, im, web, pop)
+	pop, pops := newPOPServer(cfg), newPOPServer(cfg)
+	closers = append(closers, im, web, pop, pops)
 	wg.Add(2)
 	jobs = append(jobs, func() error { return serveQueue(ctx) })
 	go serveGroup(jobs...)
-	go serveGroup(func() error { return pop.Serve(listeners[3]) }, func() error { return im.Serve(listeners[4]) }, func() error { return web.Serve(listeners[5]) }, func() error { return pop.Serve(listeners[6]) }, func() error { return im.Serve(listeners[7]) })
+	go serveGroup(func() error { return pops.Serve(listeners[3]) }, func() error { return im.Serve(listeners[4]) }, func() error { return web.Serve(listeners[5]) }, func() error { return pop.Serve(listeners[6]) }, func() error { return im.Serve(listeners[7]) })
 	log.Print("SMTP, submission, POP3/STLS, POP3S, IMAP/STARTTLS, IMAPS and HTTP backends ready")
 	select {
 	case <-ctx.Done():
@@ -1226,229 +1228,173 @@ func (s *loginServer) Next(response []byte) ([]byte, bool, error) {
 
 var popLocks sync.Map
 
-// Close waits for every POP transaction before releasing the bucket lock.
-type popServer struct {
-	cfg    *tls.Config
-	mu     sync.Mutex
-	conns  map[net.Conn]bool
-	closed bool
-	wg     sync.WaitGroup
+// Each listener has its own library Server, including connection shutdown.
+func newPOPServer(cfg *tls.Config) *pop3server.Server {
+	return pop3server.New(pop3server.Options{
+		TLSConfig: cfg, Greeting: "fma POP3 ready", StrictSessionErrors: true,
+		IdleTimeout: 10 * time.Minute, WriteTimeout: time.Minute, MaxLineLength: 4096,
+		NewSession: func(*pop3server.Conn) (pop3server.Session, error) {
+			return &popMailbox{deleted: make(map[int]bool)}, nil
+		},
+	})
 }
 
-func (p *popServer) Serve(l net.Listener) error {
-	for {
-		c, err := l.Accept()
-		if err != nil {
-			return err
-		}
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			c.Close()
-			return net.ErrClosed
-		}
-		p.conns[c] = true
-		p.wg.Add(1)
-		p.mu.Unlock()
-		go func() {
-			defer p.wg.Done()
-			popSession(c, p.cfg)
-			p.mu.Lock()
-			delete(p.conns, c)
-			p.mu.Unlock()
-		}()
-	}
+type popMailbox struct {
+	user    string
+	msgs    []*memory.Message
+	deleted map[int]bool
+	held    *sync.Mutex
 }
-func (p *popServer) Close() error {
-	p.mu.Lock()
-	p.closed = true
-	for c := range p.conns {
-		c.Close()
+
+var _ pop3server.SessionSASL = (*popMailbox)(nil)
+
+func (p *popMailbox) Login(ctx context.Context, user, password string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	p.mu.Unlock()
-	p.wg.Wait()
+	if !authenticate(user, password) {
+		return &pop3server.Error{Code: "AUTH", Message: "authentication failed"}
+	}
+	user = localUser(user)
+	v, _ := popLocks.LoadOrStore(user, &sync.Mutex{})
+	lock := v.(*sync.Mutex)
+	if !lock.TryLock() {
+		return &pop3server.Error{Code: "IN-USE", Message: "maildrop locked"}
+	}
+	mu.Lock()
+	snapshot, _, err := mailboxSnapshot(user)
+	mu.Unlock()
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		lock.Unlock()
+		return &pop3server.Error{Code: "SYS/TEMP", Message: "storage unavailable"}
+	}
+	p.user, p.msgs, p.held = user, snapshot.Messages, lock
 	return nil
 }
-func popSession(c net.Conn, cfg *tls.Config) {
-	defer c.Close()
-	c.SetDeadline(time.Now().Add(10 * time.Minute))
-	_, secure := c.(*tls.Conn)
-	scan := func() *bufio.Scanner { r := bufio.NewScanner(c); r.Buffer(make([]byte, 512), 4096); return r }
-	reader := scan()
-	out := textproto.NewWriter(bufio.NewWriter(c))
-	reply := func(s string, a ...interface{}) { out.PrintfLine(s, a...) }
-	multiline := func(lines []string) {
-		w := out.DotWriter()
-		for _, s := range lines {
-			fmt.Fprintln(w, s)
-		}
-		w.Close()
+func (p *popMailbox) Close() error {
+	// Only QUIT commits deletes. Disconnect, timeout, and shutdown roll back.
+	if p.held != nil {
+		p.held.Unlock()
+		p.held = nil
 	}
-	reply("+OK fma POP3 ready")
-	var user string
-	var msgs []*memory.Message
-	var held *sync.Mutex
-	deleted := map[int]bool{}
-	defer func() {
-		if held != nil {
-			held.Unlock()
+	p.msgs = nil
+	clear(p.deleted)
+	return nil
+}
+func (p *popMailbox) AuthenticateMechanisms() []string { return []string{"PLAIN"} }
+func (p *popMailbox) AuthenticatePlain(ctx context.Context, identity, user, password string) error {
+	if identity != "" && localUser(identity) != localUser(user) {
+		return &pop3server.Error{Code: "AUTH", Message: "identity mismatch"}
+	}
+	return p.Login(ctx, user, password)
+}
+func (p *popMailbox) message(ctx context.Context, n int) (*memory.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if n < 1 || n > len(p.msgs) || p.deleted[n] {
+		return nil, fmt.Errorf("no such message")
+	}
+	return p.msgs[n-1], nil
+}
+func (p *popMailbox) List(ctx context.Context, n int) ([]pop3.MessageInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if n != 0 {
+		m, err := p.message(ctx, n)
+		if err != nil {
+			return nil, err
 		}
-	}()
-	for {
-		c.SetDeadline(time.Now().Add(10 * time.Minute))
-		if !reader.Scan() {
-			return
-		}
-		command, arg, _ := strings.Cut(reader.Text(), " ")
-		command = strings.ToUpper(command)
-		if command == "CAPA" {
-			reply("+OK")
-			caps := []string{"USER", "UIDL", "TOP"}
-			if !secure {
-				caps = append(caps, "STLS")
-			}
-			multiline(caps)
-			continue
-		}
-		if command == "QUIT" {
-			var ids []uint32
-			for i := range deleted {
-				ids = append(ids, msgs[i-1].Uid)
-			}
-			if held != nil {
-				if err := deleteMessages(user, ids); err != nil {
-					reply("-ERR update failed")
-					return
-				}
-			}
-			reply("+OK goodbye")
-			return
-		}
-		if held == nil {
-			switch command {
-			case "USER":
-				user = localUser(arg)
-				reply("+OK send PASS")
-			case "STLS":
-				if secure || arg != "" {
-					reply("-ERR invalid STLS")
-					continue
-				}
-				reply("+OK begin TLS")
-				encrypted := tls.Server(c, cfg)
-				if err := encrypted.Handshake(); err != nil {
-					return
-				}
-				c = encrypted
-				secure = true
-				user = ""
-				reader = scan()
-				out = textproto.NewWriter(bufio.NewWriter(c))
-			case "PASS":
-				if !secure {
-					reply("-ERR TLS required")
-					continue
-				}
-				if !authenticate(user, arg) {
-					reply("-ERR authentication failed")
-					continue
-				}
-				v, _ := popLocks.LoadOrStore(user, &sync.Mutex{})
-				lock := v.(*sync.Mutex)
-				if !lock.TryLock() {
-					reply("-ERR maildrop locked")
-					continue
-				}
-				mu.Lock()
-				snapshot, _, err := mailboxSnapshot(user)
-				msgs = snapshot.Messages
-				mu.Unlock()
-				if err != nil {
-					lock.Unlock()
-					reply("-ERR storage unavailable")
-					continue
-				}
-				held = lock
-				reply("+OK authenticated")
-			default:
-				reply("-ERR authenticate first")
-			}
-			continue
-		}
-		fields := strings.Fields(arg)
-		n, parseErr := strconv.Atoi(arg)
-		if command == "TOP" && len(fields) == 2 {
-			n, parseErr = strconv.Atoi(fields[0])
-		}
-		indexed := command == "DELE" || command == "RETR" || command == "TOP" || (command == "LIST" || command == "UIDL") && arg != ""
-		if indexed && (parseErr != nil || n < 1 || n > len(msgs) || deleted[n]) {
-			reply("-ERR no such message")
-			continue
-		}
-		count, size := 0, 0
-		for i, m := range msgs {
-			if !deleted[i+1] {
-				count++
-				size += len(m.Body)
-			}
-		}
-		switch command {
-		case "STAT":
-			reply("+OK %d %d", count, size)
-		case "NOOP":
-			reply("+OK")
-		case "RSET":
-			deleted = map[int]bool{}
-			reply("+OK")
-		case "LIST", "UIDL":
-			line := func(i int) string {
-				if command == "UIDL" {
-					return fmt.Sprintf("%d %d", i, msgs[i-1].Uid)
-				}
-				return fmt.Sprintf("%d %d", i, len(msgs[i-1].Body))
-			}
-			if arg != "" {
-				reply("+OK %s", line(n))
-				continue
-			}
-			reply("+OK %d messages", count)
-			var lines []string
-			for i := range msgs {
-				if !deleted[i+1] {
-					lines = append(lines, line(i+1))
-				}
-			}
-			multiline(lines)
-		case "DELE":
-			deleted[n] = true
-			reply("+OK")
-		case "RETR", "TOP":
-			body := strings.ReplaceAll(string(msgs[n-1].Body), "\r\n", "\n")
-			if command == "TOP" {
-				if len(fields) != 2 {
-					reply("-ERR TOP requires message and line count")
-					continue
-				}
-				limit, err := strconv.Atoi(fields[1])
-				if err != nil || limit < 0 {
-					reply("-ERR invalid line count")
-					continue
-				}
-				header, rest, _ := strings.Cut(body, "\n\n")
-				lines := strings.Split(strings.TrimSuffix(rest, "\n"), "\n")
-				if limit < len(lines) {
-					lines = lines[:limit]
-				}
-				body = header + "\n\n" + strings.Join(lines, "\n")
-			}
-			reply("+OK")
-			w := out.DotWriter()
-			fmt.Fprint(w, body)
-			w.Close()
-		default:
-			reply("-ERR unsupported command")
+		return []pop3.MessageInfo{{Num: n, Size: int64(len(m.Body))}}, nil
+	}
+	var result []pop3.MessageInfo
+	for i, m := range p.msgs {
+		if !p.deleted[i+1] {
+			result = append(result, pop3.MessageInfo{Num: i + 1, Size: int64(len(m.Body))})
 		}
 	}
+	return result, nil
+}
+func (p *popMailbox) Stat(ctx context.Context) (int, int64, error) {
+	messages, err := p.List(ctx, 0)
+	var size int64
+	for _, m := range messages {
+		size += m.Size
+	}
+	return len(messages), size, err
+}
+func (p *popMailbox) Uidl(ctx context.Context, n int) ([]pop3.MessageUidl, error) {
+	messages, err := p.List(ctx, n)
+	var result []pop3.MessageUidl
+	for _, m := range messages {
+		result = append(result, pop3.MessageUidl{Num: m.Num, UniqueID: strconv.FormatUint(uint64(p.msgs[m.Num-1].Uid), 10)})
+	}
+	return result, err
+}
+func (p *popMailbox) Retr(ctx context.Context, n int) (io.ReadCloser, error) {
+	m, err := p.message(ctx, n)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(m.Body)), nil
+}
+func (p *popMailbox) Top(ctx context.Context, n, lines int) (io.ReadCloser, error) {
+	m, err := p.message(ctx, n)
+	if err != nil {
+		return nil, err
+	}
+	if lines < 0 {
+		return nil, fmt.Errorf("invalid line count")
+	}
+	r := bufio.NewReader(bytes.NewReader(m.Body))
+	var result bytes.Buffer
+	inBody := false
+	for !inBody || lines > 0 {
+		line, err := r.ReadBytes('\n')
+		result.Write(line)
+		if inBody {
+			lines--
+		} else if len(bytes.TrimRight(line, "\r\n")) == 0 {
+			inBody = true
+		}
+		if err != nil {
+			break
+		}
+	}
+	return io.NopCloser(bytes.NewReader(result.Bytes())), nil
+}
+func (p *popMailbox) Dele(ctx context.Context, n int) error {
+	if _, err := p.message(ctx, n); err != nil {
+		return err
+	}
+	p.deleted[n] = true
+	return nil
+}
+func (p *popMailbox) Rset(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	clear(p.deleted)
+	return nil
+}
+func (p *popMailbox) Noop(ctx context.Context) error { return ctx.Err() }
+func (p *popMailbox) Quit(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	var ids []uint32
+	for i := range p.deleted {
+		ids = append(ids, p.msgs[i-1].Uid)
+	}
+	if err := deleteMessages(p.user, ids); err != nil {
+		return 0, &pop3server.Error{Code: "SYS/TEMP", Message: "update failed"}
+	}
+	clear(p.deleted)
+	return len(ids), nil
 }
 
 // Imap

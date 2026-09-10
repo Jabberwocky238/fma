@@ -159,8 +159,8 @@ def verify(host, ports, context, user='jw238', password='123123', isolated=False
     print('PASS POP3S download / TOP / UIDL / RSET / disconnect rollback / QUIT deletion')
     plain_pop = poplib.POP3(host, ports[6], timeout=15)
     require('STLS' in plain_pop.capa(), 'POP STLS capability missing')
-    plain_pop.user(user)
     try:
+        plain_pop.user(user)
         plain_pop.pass_(password)
         raise AssertionError('POP accepted credentials before TLS')
     except poplib.error_proto:
@@ -171,6 +171,12 @@ def verify(host, ports, context, user='jw238', password='123123', isolated=False
     plain_pop.pass_(password)
     plain_pop.stat()
     plain_pop.quit()
+    sasl_pop = poplib.POP3_SSL(host, pop, timeout=15, context=context)
+    require('PLAIN' in sasl_pop.capa().get('SASL', []), 'POP SASL PLAIN capability missing')
+    token = base64.b64encode(('\0' + user + '\0' + password).encode()).decode()
+    sasl_pop._shortcmd('AUTH PLAIN ' + token)
+    sasl_pop.stat()
+    sasl_pop.quit()
     plain_imap = imaplib.IMAP4(host, ports[7], timeout=15)
     require('STARTTLS' in plain_imap.capabilities, 'IMAP STARTTLS capability missing')
     try:

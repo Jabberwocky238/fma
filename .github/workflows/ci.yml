@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.23.x', stable]
+        go: ['1.25.x', stable]
     env:
       GOTOOLCHAIN: local
     steps:
