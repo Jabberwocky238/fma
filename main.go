@@ -684,8 +684,59 @@ func localUser(address string) string {
 	return parts[0]
 }
 
-// Account existence and credentials are defined solely by <user>/.password.
-// Read on every authentication/RCPT: external provisioning takes effect at once.
+// Aliases keep their own prefix; credentials and mailbox data belong to RootID.
+type accountIdentity struct {
+	LoginID string
+	RootID  string
+}
+
+func resolveIdentity(address string) (accountIdentity, error) {
+	id := localUser(address)
+	identity := accountIdentity{LoginID: id, RootID: id}
+	if id == "" {
+		return identity, fs.ErrNotExist
+	}
+	seen := make(map[string]bool)
+	for range 16 {
+		if seen[identity.RootID] {
+			return identity, fs.ErrNotExist
+		}
+		seen[identity.RootID] = true
+		data, err := objects.Get(path.Join(identity.RootID, ".alias"))
+		if errors.Is(err, fs.ErrNotExist) {
+			return identity, nil
+		}
+		if err != nil {
+			return identity, err
+		}
+		target := strings.TrimRight(string(data), "\r\n")
+		if !usernameRE.MatchString(target) {
+			return identity, fs.ErrNotExist
+		}
+		identity.RootID = target
+	}
+	return identity, fs.ErrNotExist
+}
+func accountPassword(address string) (accountIdentity, []byte, error) {
+	identity, err := resolveIdentity(address)
+	if err != nil {
+		return identity, nil, err
+	}
+	password, err := userPassword(identity.RootID)
+	return identity, password, err
+}
+func authenticateAccount(address, password string) (accountIdentity, error) {
+	identity, stored, err := accountPassword(address)
+	if err != nil {
+		return identity, err
+	}
+	if password == "" || subtle.ConstantTimeCompare(stored, []byte(password)) != 1 {
+		return identity, fs.ErrPermission
+	}
+	return identity, nil
+}
+
+// Read credentials on every login/RCPT; external S3 changes take effect at once.
 func userPassword(user string) ([]byte, error) {
 	if !usernameRE.MatchString(user) {
 		return nil, fs.ErrNotExist
@@ -701,11 +752,8 @@ func userPassword(user string) ([]byte, error) {
 	return data, nil
 }
 func authenticate(u, p string) bool {
-	if p == "" {
-		return false
-	}
-	stored, err := userPassword(localUser(u))
-	return err == nil && subtle.ConstantTimeCompare(stored, []byte(p)) == 1
+	_, err := authenticateAccount(u, p)
+	return err == nil
 }
 func readJSON[T any](path string) (value T, err error) {
 	b, err := objects.Get(path)
@@ -782,7 +830,7 @@ func eachJSON[T any](dir string, visit func(string, T, error) error) error {
 		return err
 	}
 	for _, key := range keys {
-		if path.Dir(key) != dir || !strings.HasSuffix(key, ".json") {
+		if path.Dir(key) != dir || strings.HasPrefix(path.Base(key), ".") || !strings.HasSuffix(key, ".json") {
 			continue
 		}
 		value, err := readJSON[T](key)
@@ -1088,6 +1136,7 @@ func saveSent(user string, body []byte) error {
 
 type smtpBackend struct{ requireAuth bool }
 type smtpSession struct {
+	loginID     string
 	requireAuth bool
 	peer        string
 	user        string
@@ -1114,12 +1163,19 @@ func (s *smtpSession) Auth(mechanism string) (sasl.Server, error) {
 	return sasl.NewPlainServer(s.authenticate), nil
 }
 func (s *smtpSession) authenticate(identity, u, p string) error {
-	if !authenticate(u, p) || identity != "" && localUser(identity) != localUser(u) {
+	account, err := authenticateAccount(u, p)
+	if err == nil && identity != "" {
+		authorized, e := resolveIdentity(identity)
+		if e != nil || authorized.RootID != account.RootID {
+			err = fs.ErrPermission
+		}
+	}
+	if err != nil {
 		log.Printf("SMTP auth failed peer=%q user=%q", s.peer, localUser(u))
 		return smtp.ErrAuthFailed
 	}
-	s.user = localUser(u)
-	log.Printf("SMTP auth accepted peer=%q user=%q", s.peer, s.user)
+	s.loginID, s.user = account.LoginID, account.RootID
+	log.Printf("SMTP auth accepted peer=%q login=%q root=%q", s.peer, s.loginID, s.user)
 	return nil
 }
 func (s *smtpSession) Mail(from string, _ *smtp.MailOptions) error {
@@ -1127,9 +1183,11 @@ func (s *smtpSession) Mail(from string, _ *smtp.MailOptions) error {
 		log.Printf("SMTP MAIL rejected peer=%q code=530 reason=authentication-required", s.peer)
 		return &smtp.SMTPError{Code: 530, Message: "authentication required"}
 	}
-	if s.user != "" && localUser(from) != s.user {
-		log.Printf("SMTP MAIL rejected peer=%q user=%q code=553 reason=sender-mismatch", s.peer, s.user)
-		return &smtp.SMTPError{Code: 553, Message: "sender must match authenticated user"}
+	if s.user != "" {
+		identity, err := resolveIdentity(from)
+		if err != nil || identity.RootID != s.user {
+			return &smtp.SMTPError{Code: 553, Message: "sender must belong to authenticated account"}
+		}
 	}
 	s.Reset()
 	s.from = from
@@ -1159,12 +1217,14 @@ func (s *smtpSession) Rcpt(to string, _ *smtp.RcptOptions) error {
 		}
 		return nil
 	}
-	if _, err := userPassword(u); err != nil {
+	account, _, err := accountPassword(u)
+	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return &smtp.SMTPError{Code: 550, Message: "unknown local recipient"}
 		}
 		return &smtp.SMTPError{Code: 451, Message: "account storage unavailable"}
 	}
+	u = account.RootID
 	if !slices.Contains(s.recipients, u) {
 		s.recipients = append(s.recipients, u)
 	}
@@ -1232,6 +1292,7 @@ func newPOPServer(cfg *tls.Config) *pop3server.Server {
 }
 
 type popMailbox struct {
+	loginID string
 	user    string
 	msgs    []*memory.Message
 	deleted map[int]bool
@@ -1244,10 +1305,11 @@ func (p *popMailbox) Login(ctx context.Context, user, password string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !authenticate(user, password) {
+	account, err := authenticateAccount(user, password)
+	if err != nil {
 		return &pop3server.Error{Code: "AUTH", Message: "authentication failed"}
 	}
-	user = localUser(user)
+	user = account.RootID
 	v, _ := popLocks.LoadOrStore(user, &sync.Mutex{})
 	lock := v.(*sync.Mutex)
 	if !lock.TryLock() {
@@ -1263,7 +1325,7 @@ func (p *popMailbox) Login(ctx context.Context, user, password string) error {
 		lock.Unlock()
 		return &pop3server.Error{Code: "SYS/TEMP", Message: "storage unavailable"}
 	}
-	p.user, p.msgs, p.held = user, snapshot.Messages, lock
+	p.loginID, p.user, p.msgs, p.held = account.LoginID, user, snapshot.Messages, lock
 	return nil
 }
 func (p *popMailbox) Close() error {
@@ -1278,8 +1340,12 @@ func (p *popMailbox) Close() error {
 }
 func (p *popMailbox) AuthenticateMechanisms() []string { return []string{"PLAIN"} }
 func (p *popMailbox) AuthenticatePlain(ctx context.Context, identity, user, password string) error {
-	if identity != "" && localUser(identity) != localUser(user) {
-		return &pop3server.Error{Code: "AUTH", Message: "identity mismatch"}
+	if identity != "" {
+		a, err := resolveIdentity(identity)
+		b, otherErr := resolveIdentity(user)
+		if err != nil || otherErr != nil || a.RootID != b.RootID {
+			return &pop3server.Error{Code: "AUTH", Message: "identity mismatch"}
+		}
 	}
 	return p.Login(ctx, user, password)
 }
@@ -1392,7 +1458,7 @@ func (p *popMailbox) Quit(ctx context.Context) (int, error) {
 // Imap
 
 type imapBackend struct{}
-type imapUser struct{ name string }
+type imapUser struct{ name, loginID string }
 type inbox struct {
 	memory.Mailbox
 	user string
@@ -1403,13 +1469,19 @@ type inbox struct {
 }
 
 func (imapBackend) Login(_ *imap.ConnInfo, u, p string) (backend.User, error) {
-	if !authenticate(u, p) {
+	identity, err := authenticateAccount(u, p)
+	if err != nil {
 		return nil, backend.ErrInvalidCredentials
 	}
-	return &imapUser{localUser(u)}, nil
+	return &imapUser{name: identity.RootID, loginID: identity.LoginID}, nil
 }
-func (u *imapUser) Username() string { return u.name }
-func (u *imapUser) Logout() error    { return nil }
+func (u *imapUser) Username() string {
+	if u.loginID != "" {
+		return u.loginID
+	}
+	return u.name
+}
+func (u *imapUser) Logout() error { return nil }
 func (u *imapUser) ListMailboxes(subscribed bool) ([]backend.Mailbox, error) {
 	mu.Lock()
 	defer mu.Unlock()

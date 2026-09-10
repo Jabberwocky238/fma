@@ -237,3 +237,10 @@ These workflows expect this project directory to be the GitHub repository root.
 ## License
 
 [MIT](LICENSE). Copyright © 2026 Jabberwocky238.
+
+Alias accounts are provisioned externally: put the root username in `<alias>/.alias`.
+The alias keeps its own prefix and uses the root account password and mailbox.
+Alias chains are resolved on each login and recipient lookup; cycles and missing
+accounts are rejected. Hidden metadata objects such as `.profile.json` are excluded
+from mail listings. Protocol logins retain the login ID separately from the root ID;
+SMTP, POP3 and IMAP do not expose an avatar/profile management API.

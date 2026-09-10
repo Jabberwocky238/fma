@@ -1022,3 +1022,85 @@ func TestConfigEnvironmentPrefixAndOfflineVersion(t *testing.T) {
 		t.Fatal("version flag not set")
 	}
 }
+
+func TestAliasIdentityAndSharedMailbox(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	checkError(t, objects.Put("sales/.alias", []byte("alice\n")))
+	checkError(t, objects.Put("sales/.password", []byte("ignored")))
+	checkError(t, objects.Put("alice/.profile.json", []byte(`{"display_name":"Alice","avatar":"avatar.png"}`)))
+	identity, err := authenticateAccount("sales@t12e.cc", "secret")
+	checkError(t, err)
+	if identity.LoginID != "sales" || identity.RootID != "alice" || authenticate("sales", "ignored") {
+		t.Fatal("alias identity or credentials incorrect")
+	}
+	sender := &smtpSession{requireAuth: true}
+	checkError(t, sender.authenticate("alice", "sales", "secret"))
+	checkError(t, sender.Mail("sales@t12e.cc", nil))
+	checkError(t, sender.Rcpt("alice@t12e.cc", nil))
+	checkError(t, sender.Rcpt("sales@t12e.cc", nil))
+	if len(sender.recipients) != 1 {
+		t.Fatal("root and alias were not deduplicated")
+	}
+	checkError(t, sender.Data(strings.NewReader("Subject: aliases\r\n\r\nbody\r\n")))
+	mailbox, err := messages("alice")
+	checkError(t, err)
+	if len(mailbox) != 1 {
+		t.Fatal("metadata treated as mail or duplicate delivery")
+	}
+	aliasMail, err := messages("sales")
+	checkError(t, err)
+	if len(aliasMail) != 0 {
+		t.Fatal("mail stored under alias prefix")
+	}
+	user, err := (imapBackend{}).Login(nil, "sales", "secret")
+	checkError(t, err)
+	if user.Username() != "sales" || user.(*imapUser).name != "alice" {
+		t.Fatal("IMAP lost login or root ID")
+	}
+	pop := &popMailbox{deleted: map[int]bool{}}
+	checkError(t, pop.Login(context.Background(), "sales", "secret"))
+	defer pop.Close()
+	second := &popMailbox{deleted: map[int]bool{}}
+	if second.Login(context.Background(), "alice", "secret") == nil {
+		second.Close()
+		t.Fatal("alias bypassed root maildrop lock")
+	}
+	if pop.loginID != "sales" || pop.user != "alice" {
+		t.Fatal("POP identity incorrect")
+	}
+	checkError(t, pop.Dele(context.Background(), 1))
+	checkError(t, pop.Close())
+	mailbox, err = messages("alice")
+	checkError(t, err)
+	if len(mailbox) != 1 {
+		t.Fatal("disconnect committed alias deletes")
+	}
+	checkError(t, objects.Put("other/.password", []byte("different")))
+	checkError(t, objects.Put("sales/.alias", []byte("other")))
+	if authenticate("sales", "secret") || !authenticate("sales", "different") {
+		t.Fatal("alias target change not immediate")
+	}
+	if sender.Mail("sales@t12e.cc", nil) == nil {
+		t.Fatal("old session impersonated new alias owner")
+	}
+}
+
+func TestInvalidAliasesFailClosed(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	for _, target := range []string{"", "missing", "../alice", "alice@t12e.cc", "sales"} {
+		checkError(t, objects.Put("sales/.alias", []byte(target)))
+		if authenticate("sales", "secret") {
+			t.Fatalf("invalid alias accepted: %q", target)
+		}
+		if (&smtpSession{}).Rcpt("sales@t12e.cc", nil) == nil {
+			t.Fatal("invalid alias recipient accepted")
+		}
+	}
+	checkError(t, objects.Put("sales/.alias", []byte("support")))
+	checkError(t, objects.Put("support/.alias", []byte("sales")))
+	if authenticate("sales", "secret") {
+		t.Fatal("alias cycle accepted")
+	}
+}
