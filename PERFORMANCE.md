@@ -1590,3 +1590,43 @@ The timing overlay uses a temporary modfile selecting the local [MIME fork ea601
 Reports: `/tmp/fma-buffer-16-failed.json`, `/tmp/fma-buffer-32.json`, `/tmp/fma-buffer-split.json`, `/tmp/fma-branches.json`, `/tmp/fma-branches-16.json`. Each successful report retains SMTP and IMAP APPEND timing diagnostics; tables above isolate SMTP. The failed shared16 report retains the emitted transfer data. Timer code, modfiles and full logs remain temporary and are not embedded or committed. Application production source remains unchanged; this update records experiments and measurements.
 
 The timing overlay passed targeted race tests for MIME streaming and stored-part first reads (`/tmp/fma-branches-race.log`). All four diagnostics with the explicit 512 MiB assertion completed content, protocol and interruption checks. This commit changes documentation only; production code remains the previously tested `8b774f6` implementation.
+
+
+## Single-account load slowdown, stopped diagnostic (2026-09-10)
+
+The intended workload was 5,000 SMTP DATA deliveries, each with a distinct 2 MiB attachment, initially targeting one account with 16 persistent SMTP connections and four ingestion workers. Every subject, Message-ID and attachment payload was distinct; no automatic retries or repeated-file cache was used. The user then selected 16 accounts and subsequently paused further testing. The original single-account run was stopped, and **no 16-account run started**.
+
+The stopped run recorded **859 successful SMTP acknowledgements**. Its last complete progress sample was **856 successes in 371.73 s**, with zero observed errors during normal operation. Stopping fma generated 16 connection/disconnection errors and terminated the harness; these are shutdown artifacts, not a measured steady-state failure rate. The full 5,000-message target and post-load mailbox/content verification were not completed. Do not describe 859 SMTP acknowledgements as independently verified stored-email count.
+
+### Throughput decay
+
+Rows represent ranges of completed requests, not particular submission IDs; requests finish out of order. Throughput is calculated from client progress timestamps. Payload throughput counts decoded attachment bytes only.
+
+| Completion range | Interval s | Messages/s | Attachment MiB/s |
+| --- | ---: | ---: | ---: |
+| 1–250 | 18.24 | 13.706 | 27.412 |
+| 251–500 | 66.17 | 3.778 | 7.556 |
+| 501–750 | 178.57 | 1.400 | 2.800 |
+| 751–856 | 108.75 | 0.975 | 1.949 |
+
+The last interval is **92.9% slower in throughput** than the first, approximately a **14.1-fold** decline. Attachment size and configured concurrency stayed fixed. These are completion rates, not individual message latency percentiles. The interrupted harness did not finish persisting its latency distribution or integrated CPU/RSS measurements, so no p95/p99, whole-run CPU average or sampled peak is claimed.
+
+Read-only process observations during the run showed fma at roughly 680–782% CPU (100% = one core) and approximately 304–342 MiB RSS; one simultaneous observation showed Fals3y at 51.3% CPU and 21.1 MiB RSS. These are snapshots, not averages or maxima. A HEAD request during the run measured `alice/.jmap/state.json` at **2,092,645 bytes**. Its exact associated completed-message count was not sampled atomically.
+
+### Confirmed amplification in the metadata adapter
+
+The application stores an account's JMAP logical key/value database in one `state.json`. In `main.go`, `jmapBackend.snapshot` downloads that whole object and unmarshals the entire map; `Get` does this even for a single logical record. `Scan` also downloads/parses the entire map, sorts all keys, and only then filters the requested range. `WriteBatch` reads/parses the whole map, applies a small batch, marshals the whole map and conditionally replaces the object. Conflicts can repeat this work, with a maximum of 128 attempts; this run did **not** measure the actual retry count.
+
+There is an additional concrete integration gap: core v0.4.2's `objectdb.getManyRaw` supports the optional `backend.MultiGetter` interface, but the application's `jmapBackend` does not implement it. The library therefore falls back to sequential `Get` calls. Reading K records can cause K full account snapshot downloads/parses. Also, `deliverMailStream` obtains the mailbox catalog and then calls `mailbox`, which obtains the catalog again; `catalog → all → GetMany` repeats metadata reads before import. Normal incoming SMTP passes `unique=false` to `importStoredMail`, so its optional full-email deduplication scan is **not** the explanation for this particular workload.
+
+These verified code paths provide a strong explanation for degradation as account metadata grows. They do not constitute a CPU profile of this run: JSON time, S3 metadata read time, lease waiting, GC and conflict retries were not separately timed. The data do not establish an exact complexity exponent or prove that every lost second belongs to JSON processing. Buffer expansion alone cannot remove the demonstrated full-account read/write amplification.
+
+Next fixes to consider, without restarting load tests yet: implement request-local batch reads through `MultiGetter` (one fresh snapshot per batch, no cross-request cache); eliminate duplicate catalog reads; then replace monolithic account storage with indexed/sharded persistent records while preserving atomic batch visibility and account isolation. Simply mapping each key to an unrelated S3 object would lose existing multi-key transaction semantics and is not a complete replacement.
+
+### Version and data provenance
+
+This run used application `3ce6cb3` and a temporary modfile selecting the local MIME fork based on `ea6016819f55`, with **uncommitted encoded-read-ahead changes**. Base64 attachment ingestion reads ahead through four independently owned 1 MiB blocks and decodes concurrently; this path is restricted to required storage sinks. Generic identity-only parsing retains the earlier bounded path. The candidate passed the library's full race suite after this restriction. It was not published or selected by the production go.mod at the time of the load run. Go 1.25.3, AWS core v1.41.5 / S3 v1.97.3, SMTP b0673510e580, POP3 v0.1.6 and Fals3y 0.3.1-dev.b8e48bf remain unchanged.
+
+Measured executable SHA-256: `ccc1d2464dd8cdb0572008a86e0022c010b9d9e9e95b590595c3d1fa433f46e1`. Candidate `sinks.go` SHA-256: `9b1508a56f270e0f70d3caefe5a1beea7114ad1537b74eacbe35cd2f6baeea01`.
+
+The retained reports are `/tmp/fma-stress-single-partial.json` and `/tmp/fma-stress-single-partial.log`; `/tmp/fma-stress-single-server.log` records server messages before shutdown. Temporary fixture storage was cleaned up by the harness. No new benchmark, stress run or production code change was performed for this analysis.
