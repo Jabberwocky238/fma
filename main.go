@@ -491,6 +491,7 @@ type s3Bucket struct {
 func connectBucket(c S3Config) (*s3Bucket, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.MaxIdleConnsPerHost = 16
 	client := s3.NewFromConfig(aws.Config{
 		Region:           c.Region,
 		Credentials:      credentials.NewStaticCredentialsProvider(c.AccessKey, c.SecretKey, c.SessionToken),
@@ -4092,10 +4093,18 @@ func (b *s3Bucket) NewUpload(ctx context.Context, prefix string) (objectUpload, 
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, err
 	}
-	return &s3StreamUpload{bucket: b, ctx: ctx, key: prefix + hex.EncodeToString(id[:])}, ctx.Err()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	return &s3StreamUpload{bucket: b, ctx: ctx, cancel: cancel, key: prefix + hex.EncodeToString(id[:])}, nil
 }
 
 type s3StreamUpload struct {
+	cancel   context.CancelFunc
+	workers  sync.WaitGroup
+	partMu   sync.Mutex
+	partErr  error
 	bucket   *s3Bucket
 	ctx      context.Context
 	key      string
@@ -4142,13 +4151,29 @@ func (w *s3StreamUpload) flush() error {
 		}
 		w.uploadID = result.UploadId
 	}
-	number := int32(len(w.parts) + 1)
-	result, err := b.client.UploadPart(w.ctx, &s3.UploadPartInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, PartNumber: &number, Body: bytes.NewReader(w.buffer.Bytes()), ContentLength: aws.Int64(int64(w.buffer.Len()))})
-	if err != nil {
-		return objectError(w.key, err)
-	}
-	w.parts = append(w.parts, s3types.CompletedPart{ETag: result.ETag, PartNumber: &number})
-	w.buffer.Reset()
+	w.partMu.Lock()
+	index := len(w.parts)
+	w.parts = append(w.parts, s3types.CompletedPart{})
+	w.partMu.Unlock()
+	buffer := w.buffer
+	w.buffer = nil // The worker owns this buffer until UploadPart returns.
+	w.workers.Add(1)
+	go func() {
+		defer w.workers.Done()
+		defer s3BufferPool.Put(buffer)
+		number := int32(index + 1)
+		result, err := b.client.UploadPart(w.ctx, &s3.UploadPartInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, PartNumber: &number, Body: bytes.NewReader(buffer.Bytes()), ContentLength: aws.Int64(int64(buffer.Len()))})
+		w.partMu.Lock()
+		defer w.partMu.Unlock()
+		if err != nil {
+			if w.partErr == nil {
+				w.partErr = objectError(w.key, err)
+			}
+			w.cancel()
+		} else {
+			w.parts[index] = s3types.CompletedPart{ETag: result.ETag, PartNumber: &number}
+		}
+	}()
 	return nil
 }
 func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
@@ -4174,13 +4199,21 @@ func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
 				return err
 			}
 		}
+		w.workers.Wait()
+		if w.partErr != nil {
+			return w.partErr
+		}
+		completeStart := time.Now()
 		_, err := b.client.CompleteMultipartUpload(w.ctx, &s3.CompleteMultipartUploadInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, MultipartUpload: &s3types.CompletedMultipartUpload{Parts: w.parts}})
 		if err != nil {
 			return objectError(w.key, err)
 		}
+		completeElapsed := time.Since(completeStart)
+		copyStart := time.Now()
 		if err = b.copyStream(w.ctx, w.key, key, metadata); err != nil {
 			return err
 		}
+		logger.Debug("S3 stream commit", "parts", len(w.parts), "complete_seconds", completeElapsed.Seconds(), "copy_seconds", time.Since(copyStart).Seconds())
 		cleanup, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 30*time.Second)
 		defer cancel()
 		if _, err = b.client.DeleteObject(cleanup, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &w.key}); err != nil {
@@ -4188,6 +4221,8 @@ func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
 		}
 	}
 	w.finished = true
+	w.cancel()
+	w.workers.Wait()
 	if w.buffer != nil {
 		s3BufferPool.Put(w.buffer)
 		w.buffer = nil
@@ -4199,6 +4234,8 @@ func (w *s3StreamUpload) Abort() error {
 		return nil
 	}
 	w.finished = true
+	w.cancel()
+	w.workers.Wait()
 	if w.buffer != nil {
 		s3BufferPool.Put(w.buffer)
 		w.buffer = nil

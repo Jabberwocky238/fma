@@ -10,6 +10,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -117,7 +118,7 @@ def main():
             work = tmp / 'empty'; work.mkdir(mode=0o500)
             env = {**os.environ, 'FMA_S3_ENDPOINT': endpoint, 'FMA_S3_BUCKET': 'stream-test',
                    'FMA_S3_ACCESS_KEY_ID': 'test', 'FMA_S3_SECRET_ACCESS_KEY': 'test',
-                   'FMA_OUTBOUND_MODE': 'disabled', 'LOG_LEVEL': 'error'}
+                   'FMA_OUTBOUND_MODE': 'disabled', 'LOG_LEVEL': 'debug'}
             command = [str(binary), '-http', f'127.0.0.1:{port}']
             for protocol in ['smtp', 'submission', 'smtps', 'pop3', 'pop3s', 'imap', 'imaps']:
                 command += ['-' + protocol, '127.0.0.1:0']
@@ -171,6 +172,8 @@ def main():
                     else:
                         assert results['stored_bytes'] >= size * .99, results
 
+            results['s3_commit_timings'] = [dict(zip(['parts', 'complete_seconds', 'copy_seconds'], map(float, values)))
+                for values in re.findall(r'parts=(\d+) complete_seconds=([\d.e+-]+) copy_seconds=([\d.e+-]+)', (tmp / 'fma.log').read_text())]
             print(json.dumps({'upload': results['phases']['upload']}), flush=True)
             print('Streaming S3 through JMAP download; client hashes chunks without retaining the file', flush=True)
             measure = Measurement(proc.pid)

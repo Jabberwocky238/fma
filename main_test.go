@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -1451,14 +1452,23 @@ func TestS3BlobCompression(t *testing.T) {
 			bucket.Delete(key)
 		}
 	})
-	for _, size := range []int64{gzipThreshold - 1, gzipThreshold, gzipThreshold + 1, 17 << 20} {
-		t.Run(fmt.Sprint(size), func(t *testing.T) {
+	for _, tc := range []struct {
+		size   int64
+		random bool
+	}{{gzipThreshold - 1, false}, {gzipThreshold, false}, {gzipThreshold + 1, false}, {17 << 20, false}, {17 << 20, true}} {
+		size := tc.size
+		t.Run(fmt.Sprintf("%d-random-%v", size, tc.random), func(t *testing.T) {
 			ctx := context.Background()
 			w, err := blobs.Create(ctx, acct)
 			checkError(t, err)
 			defer w.Abort()
 			hash := sha256.New()
 			block := bytes.Repeat([]byte("binary\x00\xff"), 4096)
+			if tc.random {
+				block = make([]byte, 1<<20)
+				_, err = cryptorand.Read(block)
+				checkError(t, err)
+			}
 			for left := size; left > 0; {
 				part := block[:min(left, int64(len(block)))]
 				_, err = w.Write(part)
@@ -1483,7 +1493,7 @@ func TestS3BlobCompression(t *testing.T) {
 				if !bytes.Equal(prefix, []byte{0x1f, 0x8b}) {
 					t.Fatalf("not gzip: %x", prefix)
 				}
-				if *stored.ContentLength >= size {
+				if !tc.random && *stored.ContentLength >= size {
 					t.Fatal("compressible input was not reduced")
 				}
 			}
