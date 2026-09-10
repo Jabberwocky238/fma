@@ -2,12 +2,14 @@
 set -euo pipefail
 
 systemd=false
+uninstall=false
 generated=
 while (($#)); do
     case "$1" in
+        --uninstall) uninstall=true; shift ;;
         --systemd) systemd=true; shift ;;
         --config-dir) [[ $# -ge 2 ]] || { printf 'Missing --config-dir value\n' >&2; exit 1; }; generated=$2; shift 2 ;;
-        -h|--help) printf 'Usage: install.sh [--systemd [--config-dir deploy/generated]]\n'; exit 0 ;;
+        -h|--help) printf 'Usage: install.sh [--systemd [--config-dir deploy/generated]] | --uninstall\n'; exit 0 ;;
         *) printf 'Unknown argument: %s\n' "$1" >&2; exit 1 ;;
     esac
 done
@@ -16,7 +18,53 @@ done
 # Override FMA_REPO only when installing from a fork.
 repo=${FMA_REPO:-Jabberwocky238/fma}
 [[ "$repo" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]] || { printf 'Invalid GitHub repository.\n' >&2; exit 1; }
-install_dir=${FMA_INSTALL_DIR:-$HOME/.local/bin}
+ctl=(systemctl)
+if [[ $(id -u) == 0 ]]; then
+    mode=root
+    default_bin=/usr/local/bin
+    default_config=/etc/fma
+    default_units=/etc/systemd/system
+else
+    mode=user
+    default_bin=$HOME/.local/bin
+    default_config=$HOME/.config/fma
+    default_units=$HOME/.config/systemd/user
+    ctl+=(--user)
+fi
+printf 'WARNING: %s mode (UID %s); binary: %s; config: %s; systemd: %s\n' "$mode" "$(id -u)" "$default_bin" "$default_config" "$default_units"
+install_dir=${FMA_INSTALL_DIR:-$default_bin}
+service_config=$default_config
+service_units=$default_units
+deploy_dir=${FMA_DEPLOY_DIR:-$default_config/deploy}
+manifest=$default_config/install.paths
+valid_path() { [[ "$1" =~ ^/[a-zA-Z0-9_./-]+$ && "$1/" != *'/../'* && "$1" != / ]]; }
+if [[ "$uninstall" == true ]]; then
+    [[ "$systemd" == false && -z "$generated" ]] || { printf '--uninstall cannot be combined with install options.\n' >&2; exit 1; }
+    if [[ -f "$manifest" && ! -L "$manifest" ]]; then
+        { IFS= read -r install_dir; IFS= read -r service_config; IFS= read -r service_units; IFS= read -r deploy_dir; } < "$manifest"
+    fi
+    for value in "$install_dir" "$service_config" "$service_units" "$deploy_dir"; do
+        valid_path "$value" || { printf 'Invalid uninstall path.\n' >&2; exit 1; }
+    done
+    printf 'Removing %s/fma, %s/fma.service and fma configuration from %s\n' "$install_dir" "$service_units" "$service_config"
+    if [[ -e "$service_units/fma.service" || -L "$service_units/fma.service" ]]; then
+        "${ctl[@]}" disable --now fma.service
+        rm -f -- "$service_units/fma.service"
+        "${ctl[@]}" daemon-reload
+    fi
+    if [[ "$mode" == root && -L /bin/fma && "$(readlink /bin/fma)" == "$install_dir/fma" ]]; then
+        rm -f -- /bin/fma
+    fi
+    rm -f -- "$install_dir/fma" "$service_config/s3.env" "$service_config/outbound.env" "$manifest"
+    # Remove only fma's generated artifacts, preserving unrelated files.
+    for name in install.mk fma.service s3.env outbound.env nginx-http.conf nginx-https.conf nginx-stream.conf renew-hook.sh; do
+        rm -f -- "$deploy_dir/generated/$name" "$deploy_dir/template/$name.tmpl"
+    done
+    rm -f -- "$deploy_dir/gen.sh"
+    rmdir -- "$deploy_dir/generated" "$deploy_dir/template" "$deploy_dir" "$service_config" "$default_config" 2>/dev/null || true
+    printf 'Uninstalled fma in %s mode. S3 data is preserved.\n' "$mode"
+    exit 0
+fi
 binary=$install_dir/fma
 for tool in curl tar mktemp; do
     command -v "$tool" >/dev/null || { printf 'Required command not found: %s\n' "$tool" >&2; exit 1; }
@@ -29,7 +77,7 @@ esac
 if [[ "$systemd" == true ]]; then
     [[ "$platform" == linux ]] || { printf '--systemd requires Linux.\n' >&2; exit 1; }
     command -v systemctl >/dev/null || { printf 'systemctl is required.\n' >&2; exit 1; }
-    systemctl --user show-environment >/dev/null
+    "${ctl[@]}" show-environment >/dev/null
 fi
 case "$(uname -m)" in
     x86_64|amd64) arch=amd64 ;;
@@ -84,21 +132,21 @@ downloaded=true
 }
 install_service() {
     [[ "$systemd" == true ]] || return 0
-    install -d -m 700 "$service_config"
+    install -d -m 700 "$default_config" "$service_config"
+    (umask 077; printf '%s\n' "$install_dir" "$service_config" "$service_units" "$deploy_dir" > "$manifest")
     install -d "$service_units"
     install -m 600 "$generated/s3.env" "$service_config/s3.env"
     install -m 600 "$generated/outbound.env" "$service_config/outbound.env"
     install -m 644 "$generated/fma.service" "$service_units/fma.service"
-    systemctl --user daemon-reload
-    systemctl --user enable fma.service
-    systemctl --user restart fma.service
-    printf 'Installed and started systemd user service fma.service.\n'
+    "${ctl[@]}" daemon-reload
+    "${ctl[@]}" enable fma.service
+    "${ctl[@]}" restart fma.service
+    printf 'Installed and started %s systemd service fma.service.\n' "$mode"
 }
 if [[ "$systemd" == true ]]; then
     if [[ -z "$generated" ]]; then
         fetch_release
         tar -xzf "$work/$archive" -C "$work" deploy/gen.sh deploy/template
-        deploy_dir=${FMA_DEPLOY_DIR:-$HOME/.config/fma/deploy}
         install -d -m 700 "$deploy_dir" "$deploy_dir/template"
         install -m 700 "$work/deploy/gen.sh" "$deploy_dir/gen.sh"
         cp "$work"/deploy/template/*.tmpl "$deploy_dir/template/"
@@ -127,12 +175,26 @@ if [[ "$systemd" == true ]]; then
     binary=$install_dir/fma
 fi
 
+install_link() {
+    [[ "$mode" == root ]] || return 0
+    if [[ -e /bin/fma || -L /bin/fma ]]; then
+        [[ -L /bin/fma && "$(readlink /bin/fma)" == "$binary" ]] || { printf '/bin/fma belongs to another installation; refusing to replace it.\n' >&2; exit 1; }
+    else
+        ln -s "$binary" /bin/fma
+    fi
+}
+# Check collisions before replacing the binary.
+if [[ "$mode" == root && ( -e /bin/fma || -L /bin/fma ) ]]; then
+    [[ -L /bin/fma && "$(readlink /bin/fma)" == "$binary" ]] || { printf '/bin/fma already exists and is not our symlink.\n' >&2; exit 1; }
+fi
+
 if [[ -e "$binary" || -L "$binary" ]]; then
     current=$({ "$binary" --version || true; } 2>/dev/null)
     current=${current%%$'\n'*}
     current=${current#fma }
     if up_to_date "$current" "$latest"; then
         printf 'fma %s is already installed at %s; no update needed.\n' "$current" "$binary"
+        install_link
         install_service
         exit 0
     fi
@@ -164,10 +226,15 @@ cp "$work/fma" "$staged"
 chmod 755 "$staged"
 mv -f "$staged" "$binary"
 staged=
-printf 'Installed fma %s at %s\n' "$latest" "$binary"
+if [[ "$systemd" == false && ! -e "$manifest" ]]; then
+    install -d -m 700 "$default_config"
+    (umask 077; printf '%s\n' "$install_dir" "$service_config" "$service_units" "$deploy_dir" > "$manifest")
+fi
+printf 'Installed fma %s at %s\n'  "$latest" "$binary"
 case ":$PATH:" in
     *":$install_dir:"*) ;;
     *) printf 'Add %s to PATH to run fma by name.\n' "$install_dir" ;;
 esac
 
+install_link
 install_service

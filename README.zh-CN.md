@@ -10,7 +10,7 @@
 - **占用小**：单个 Go 二进制，无需本地数据库、Redis、邮件暂存目录或 Docker。实际内存和吞吐取决于邮件大小、连接数与 S3 延迟，目前没有公布生产环境基准数据。
 
 可用性依赖 S3，以及将客户端流量导向健康节点的接入设施。节点故障后，原有连接需要重连。
-账户、证书、邮件、文件夹、任务队列和租约全部存放在 S3。邮件二进制不提供注册、用户管理、CSV 导入、本地数据库、磁盘缓存或临时文件管理能力。HTTP 只提供存活检查，日志输出到 stderr。
+账户、证书、邮件、文件夹、任务队列和租约全部存放在 S3。邮件二进制不提供注册、用户管理、CSV 导入、本地数据库、磁盘缓存或临时文件管理能力。HTTP 只提供存活检查，DEBUG/INFO/WARN 日志输出到 stdout，ERROR/FATAL 输出到 stderr。
 
 ## 安装发行版
 
@@ -20,17 +20,17 @@
 curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh | bash
 ```
 
-支持 Linux、macOS 的 amd64 和 arm64，默认安装到 `~/.local/bin/fma`。下载后校验 SHA-256 和二进制版本号。运行 `fma --version` 查看版本；如有需要，将 `~/.local/bin` 加入 PATH。
+支持 Linux、macOS 的 amd64 和 arm64，普通用户默认安装到 `~/.local/bin/fma`，root 安装到 `/usr/local/bin/fma`。下载后校验 SHA-256 和二进制版本号。运行 `fma --version` 查看版本；如有需要，将 `~/.local/bin` 加入 PATH。
 
 已安装相同或更新版本时保持不变；旧版本或无法识别的版本会询问 `Update? [y/N]`，只有输入 `y` 才更新。下载、校验失败保留原二进制。`FMA_INSTALL_DIR` 可修改安装目录，`FMA_REPO` 可选择 fork 仓库。Windows 二进制通过 Releases 的 ZIP 提供。
 
-在 Linux 上同时安装 **systemd 用户服务**：
+在 Linux 上同时安装 **systemd 服务**：
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh) --systemd
 ```
 
-该模式使用发行包内的部署模板，交互生成配置，然后安装、启用并启动 `fma.service`。需要可用的 systemd 用户会话，并提前准备好 S3 桶和证书对象。生成器保存在 `~/.config/fma/deploy`，配置位于其 `generated/` 子目录；可通过 `FMA_DEPLOY_DIR` 修改位置。
+该模式使用发行包内的部署模板，交互生成配置，然后安装、启用并启动 `fma.service`。需要可用的 systemd 管理器（非 root 模式需要用户会话），并提前准备好 S3 桶和证书对象。普通用户的生成器保存在 `~/.config/fma/deploy`，root 则保存在 `/etc/fma/deploy`，配置位于其 `generated/` 子目录；可通过 `FMA_DEPLOY_DIR` 修改位置。
 
 复用仓库内已经生成的配置：
 
@@ -41,6 +41,24 @@ bash install.sh --systemd --config-dir deploy/generated
 此时以生成配置中的用户和路径为准，优先于 `FMA_INSTALL_DIR`。二进制已是最新版仍可安装服务；拒绝更新二进制时也跳过服务变更。不带 `--systemd` 只安装二进制。
 
 使用 `systemctl --user status fma` 查看状态，`journalctl --user -u fma` 查看日志。需要退出登录后持续运行时，在主机上配置该用户的 lingering。
+
+安装器会以 warning 明确打印当前是 **root 模式** 还是 **用户模式**，并显示路径：
+
+| 模式 | 二进制 | 配置 | systemd 单元 | 管理命令 |
+| --- | --- | --- | --- | --- |
+| root | `/usr/local/bin/fma` | `/etc/fma` | `/etc/systemd/system/fma.service` | `systemctl` |
+| 普通用户 | `~/.local/bin/fma` | `~/.config/fma` | `~/.config/systemd/user/fma.service` | `systemctl --user` |
+
+root 服务使用 `multi-user.target`，用户服务使用 `default.target`。root 查看日志使用 `journalctl -u fma`。
+以安装时相同的执行者直接卸载：
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh) --uninstall
+```
+
+卸载会停止并禁用对应服务，删除二进制、服务单元、安装的环境文件和安装器生成的部署文件，不请求下载发行包。自定义安装路径记录在对应默认配置目录的 `install.paths` 中。保留无关文件和所有 S3 数据；root 卸载不会遍历其他用户的家目录。
+
+root 安装还会创建 `/bin/fma` 到安装二进制的软链接，默认目标为 `/usr/local/bin/fma`。卸载时仅清除指向该安装二进制的软链接，不覆盖或删除其他程序占用的 `/bin/fma`。
 
 ## 本地运行
 
@@ -135,7 +153,31 @@ make install
 
 模板位于 `deploy/template/`，使用 `@@NAME@@` 占位符；输出到 `deploy/generated/`，Git 忽略该目录，发行包不包含生成配置。默认私有权限，覆盖前询问，取消输入不会破坏已有配置。
 
-在 Linux 目标机上以生成配置中选定的用户执行 `make install`，它读取生成配置、编译二进制、安装 systemd 用户服务和环境文件，再启用并重启服务。配置缺失会在编译或安装前报错。安装路径取自生成的 `install.mk`，修改路径需要重新生成。
+每次询问前先读取对应环境变量；已设置时直接校验并使用，不再询问。环境变量无效时直接报错退出，日志不打印密钥。Kubernetes 或其他自动化环境可使用：
+
+```sh
+export FMA_DOMAIN=example.com
+export FMA_S3_ENDPOINT=https://s3.example.com
+export FMA_S3_BUCKET=fma
+export FMA_S3_ACCESS_KEY_ID=your-access-key
+export FMA_S3_SECRET_ACCESS_KEY=your-secret-key
+bash deploy/gen.sh --non-interactive
+```
+
+非交互模式中，未设置的字段使用默认值，必填项缺失直接退出。Region 默认 `us-east-1`。覆盖已有生成文件需设置 `FMA_OVERWRITE=yes`，默认保留。交互模式同样优先使用环境变量。仅用于生成器的变量会渲染为服务启动参数，不会给邮件进程增加管理 API。
+
+| 配置项 | 环境变量 |
+| --- | --- |
+| 域名与服务身份 | `FMA_DOMAIN`、`FMA_DEPLOY_USER`、`FMA_DEPLOY_UID`、`FMA_DEPLOY_HOME` |
+| 安装路径 | `FMA_BINDIR`、`FMA_CONFIG_DIR`、`FMA_SYSTEMD_USER_DIR`（同样用于系统级单元） |
+| S3 | `FMA_S3_ENDPOINT`、`FMA_S3_BUCKET`、`FMA_S3_REGION`、`FMA_S3_ACCESS_KEY_ID`、`FMA_S3_SECRET_ACCESS_KEY`、`FMA_S3_SESSION_TOKEN` |
+| 证书对象键 | `FMA_CERT_KEY`、`FMA_KEY_KEY` |
+| 外发 | `FMA_OUTBOUND_MODE`、`FMA_RELAY_ADDR`、`FMA_RELAY_TLS`、`FMA_RELAY_USER`、`FMA_RELAY_PASSWORD`、`FMA_RELAY_PASSWORD_FILE`、`FMA_RELAY_CA_FILE`、`FMA_QUEUE_RETRY` |
+| 端口 | `FMA_SMTP_PORT`、`FMA_SUBMISSION_PORT`、`FMA_SMTPS_PORT`、`FMA_POP3_PORT`、`FMA_POP3S_PORT`、`FMA_IMAP_PORT`、`FMA_IMAPS_PORT`、`FMA_HTTP_PORT` |
+| Certbot 路径 | `FMA_LINEAGE`、`FMA_WEBROOT` |
+| 日志与覆盖 | 无前缀的 `LOG_LEVEL`、`FMA_OVERWRITE` |
+
+在 Linux 目标机上以生成配置中选定的用户执行 `make install`，它读取生成配置、编译二进制、安装对应的 systemd 服务和环境文件，再启用并重启服务。配置缺失会在编译或安装前报错。安装路径取自生成的 `install.mk`，修改路径需要重新生成。
 
 将生成的 `nginx-http.conf`、`nginx-https.conf` 放入 Nginx HTTP 上下文；`nginx-stream.conf` 放在顶层，位于 `http {}` 外。公开端口为标准邮件端口，上游回环端口与服务一致。HTTPS 证书需覆盖域名、`www.<domain>` 和 `mail.<domain>`。服务启动前上传初始证书和账户密码对象。
 

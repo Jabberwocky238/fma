@@ -1158,3 +1158,18 @@ func TestLogLevelFiltering(t *testing.T) {
 		t.Fatal("invalid log level accepted")
 	}
 }
+
+func TestLogOutputStreams(t *testing.T) {
+	var output, diagnostics bytes.Buffer
+	l := newLogger(&output, &diagnostics, slog.LevelDebug).With("service", "fma").WithGroup("request")
+	l.Debug("debug message")
+	l.Info("ordinary message")
+	l.Warn("warning message")
+	l.Error("error message")
+	if strings.Count(output.String(), "level=") != 3 || !strings.Contains(output.String(), "warning message") || !strings.Contains(output.String(), "ordinary message") {
+		t.Fatal("incorrect stdout routing", output.String())
+	}
+	if strings.Count(diagnostics.String(), "level=") != 1 || strings.Contains(diagnostics.String(), "ordinary message") || !strings.Contains(diagnostics.String(), "error message") {
+		t.Fatal("incorrect stderr routing", diagnostics.String())
+	}
+}

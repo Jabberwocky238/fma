@@ -22,6 +22,9 @@ class InstallTests(unittest.TestCase):
         self.bin = self.root / 'installed'
         self.mock = self.root / 'mock'
         self.mock.mkdir()
+        identity = self.mock / 'id'
+        identity.write_text('#!/bin/bash\ncase "$1" in -u) echo 1000 ;; -un) echo tester ;; esac\n')
+        identity.chmod(0o755)
         curl = self.mock / 'curl'
         curl.write_text(f'#!{sys.executable}\n' + '''import os, pathlib, shutil, sys
 args = sys.argv[1:]
@@ -47,7 +50,7 @@ else:
         (self.root / 'checksums.txt').write_text(f'{digest}  fma_1.2.0_{system}_{arch}.tar.gz\n')
         self.env = {**os.environ, 'PATH': str(self.mock) + os.pathsep + os.environ['PATH'],
                     'FMA_REPO': 'Jabberwocky238/fma', 'FMA_INSTALL_DIR': str(self.bin),
-                    'INSTALL_TEST_ROOT': str(self.root)}
+                    'INSTALL_TEST_ROOT': str(self.root), 'HOME': str(self.root / 'home')}
 
     def existing(self, version):
         self.bin.mkdir(exist_ok=True)
@@ -57,7 +60,7 @@ else:
         return f.read_bytes()
 
     def run_installer(self, answer='', args=()):
-        return subprocess.run(['bash', str(ROOT / 'install.sh'), *args], env=self.env,
+        return subprocess.run(['bash', str(getattr(self, 'installer', ROOT / 'install.sh')), *args], env=self.env,
                               input=answer, capture_output=True, text=True)
 
     def test_systemd_with_existing_binary(self):
@@ -68,7 +71,7 @@ else:
         units = self.root / 'units'
         import getpass
         (generated / 'install.mk').write_text(
-            f'DEPLOY_USER := {getpass.getuser()}\nDEPLOY_UID := {os.getuid()}\n'
+            'DEPLOY_USER := tester\nDEPLOY_UID := 1000\n'
             f'BINDIR := {self.bin}\nCONFIG_DIR := {config}\nSYSTEMD_USER_DIR := {units}\n')
         for name in ['s3.env', 'outbound.env', 'fma.service']:
             (generated / name).write_text('# test configuration\n')
@@ -87,6 +90,55 @@ else:
         self.assertEqual((config / 's3.env').stat().st_mode & 0o777, 0o600)
         self.assertIn('--user restart fma.service', (self.root / 'systemctl.log').read_text())
         self.assertNotIn('/download/', (self.root / 'requests').read_text())
+
+    def test_uninstall_without_network(self):
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        requests = (self.root / 'requests').read_text()
+        result = self.run_installer(args=('--uninstall',))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('user mode', result.stdout)
+        self.assertFalse((self.bin / 'fma').exists())
+        self.assertEqual(requests, (self.root / 'requests').read_text())
+        self.assertFalse((self.root / 'home/.config/fma/install.paths').exists())
+
+    def test_root_symlink_install_and_uninstall(self):
+        (self.mock / 'id').write_text('#!/bin/bash\necho 0\n')
+        self.env.pop('FMA_INSTALL_DIR')
+        root_bin = self.root / 'root-bin'
+        root_config = self.root / 'root-config'
+        link = self.root / 'bin/fma'
+        link.parent.mkdir()
+        self.installer = self.root / 'root-install.sh'
+        # Isolate root paths: never touch the host's /bin, /etc or /usr/local.
+        source = (ROOT / 'install.sh').read_text()
+        source = source.replace('/usr/local/bin', str(root_bin)).replace('/etc/fma', str(root_config))
+        source = source.replace('/etc/systemd/system', str(self.root / 'system-units')).replace('/bin/fma', str(link))
+        self.installer.write_text(source)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), (root_bin / 'fma').resolve())
+        result = self.run_installer(args=('--uninstall',))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(link.is_symlink())
+        self.assertFalse((root_bin / 'fma').exists())
+
+    def test_root_uninstall_routing(self):
+        (self.mock / 'id').write_text('#!/bin/bash\necho 0\n')
+        self.env.pop('FMA_INSTALL_DIR')
+        for name in ['rm', 'rmdir', 'systemctl']:
+            script = self.mock / name
+            script.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$INSTALL_TEST_ROOT/removals"\n')
+            script.chmod(0o755)
+        result = self.run_installer(args=('--uninstall',))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('root mode', result.stdout)
+        removals = (self.root / 'removals').read_text()
+        self.assertIn('/usr/local/bin/fma', removals)
+        self.assertIn('/etc/fma/s3.env', removals)
+        self.assertNotIn('--user', removals)
+        self.assertFalse((self.root / 'requests').exists())
 
     def test_unknown_option(self):
         result = self.run_installer(args=('--unknown',))

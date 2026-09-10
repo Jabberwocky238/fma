@@ -22,4 +22,8 @@ upload '@@CERT_KEY@@' < "$lineage/fullchain.pem"
 upload '@@KEY_KEY@@' < "$lineage/privkey.pem"
 nginx -t
 systemctl reload nginx
-runuser -u '@@DEPLOY_USER@@' -- env XDG_RUNTIME_DIR=/run/user/@@DEPLOY_UID@@ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@@DEPLOY_UID@@/bus systemctl --user restart fma.service
+if [[ '@@DEPLOY_UID@@' == 0 ]]; then
+    systemctl restart fma.service
+else
+    runuser -u '@@DEPLOY_USER@@' -- env XDG_RUNTIME_DIR=/run/user/@@DEPLOY_UID@@ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@@DEPLOY_UID@@/bus systemctl --user restart fma.service
+fi

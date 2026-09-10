@@ -19,7 +19,7 @@ must reconnect after a node fails.
 Accounts, certificates, messages, folders, outbound jobs, and leases live in S3.
 The mail binary has no registration API, user management commands, CSV import,
 local database, disk cache, or temporary file management. HTTP provides only a
-liveness endpoint. Logs go to stderr.
+liveness endpoint. DEBUG/INFO/WARN logs go to stdout; ERROR/FATAL go to stderr.
 
 ## Install a release
 
@@ -31,23 +31,23 @@ curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh 
 
 The installer downloads the latest stable GitHub Release for Linux or macOS
 (amd64 or arm64), checks its SHA-256 digest and reported version, and installs
-`~/.local/bin/fma`. Check the installed version with `fma --version`.
+`~/.local/bin/fma` for ordinary users or `/usr/local/bin/fma` for root. Check the installed version with `fma --version`.
 An existing current or newer version is left untouched. An older or unrecognized
 version prompts `Update? [y/N]`; only `y` proceeds. Download or verification failures
 preserve the existing binary. Add `~/.local/bin` to your PATH if needed.
 `FMA_INSTALL_DIR` overrides the installation directory; `FMA_REPO` selects a fork.
 Windows binaries are available as ZIP archives on the Releases page.
 
-To install the binary and a **systemd user service** on Linux, use:
+To install the binary and a **systemd service** on Linux, use:
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh) --systemd
 ```
 
 This uses the release's deployment templates and interactive generator, then installs,
-enables and starts `fma.service`. It needs a working systemd user session and existing
+enables and starts `fma.service`. It needs a working systemd manager (a user session for non-root installs) and existing
 S3 bucket/certificate objects. The generator and its `generated/` configuration are
-kept in `~/.config/fma/deploy` (`FMA_DEPLOY_DIR` overrides this location). To reuse
+kept in `~/.config/fma/deploy` for users or `/etc/fma/deploy` for root (`FMA_DEPLOY_DIR` overrides this location). To reuse
 configuration generated in a checkout:
 
 ```sh
@@ -59,6 +59,31 @@ mode. An up-to-date binary can still have its service installed. Declining a bin
 update also skips service changes. Inspect it with `systemctl --user status fma` and
 `journalctl --user -u fma`; persistent operation after logout requires user lingering
 configured on the host. Without `--systemd`, the installer only installs the binary.
+
+The installer prints a warning identifying **root** or **user** mode and its paths:
+
+| Mode | Binary | Configuration | Service | Manager |
+| --- | --- | --- | --- | --- |
+| root | `/usr/local/bin/fma` | `/etc/fma` | `/etc/systemd/system/fma.service` | `systemctl` |
+| user | `~/.local/bin/fma` | `~/.config/fma` | `~/.config/systemd/user/fma.service` | `systemctl --user` |
+
+Root services start with `multi-user.target`; user services use `default.target`.
+Use the matching manager for status and logs (root: `journalctl -u fma`).
+Uninstall directly as the same user who installed:
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh) --uninstall
+```
+
+Uninstall stops and disables the matching service, removes the binary, unit, installed
+environment files and the installer's generated deployment artifacts. It makes no
+release download requests. Custom installation paths are recorded in `install.paths`
+under the mode's default configuration directory. Unrelated files and all S3 data
+are preserved; root uninstallation does not search other users' home directories.
+
+Root installation also creates `/bin/fma` as a symlink to the installed binary. Root
+uninstallation removes this link only when it points to that binary. An unrelated
+existing `/bin/fma` is never overwritten.
 
 ## Run locally
 
@@ -137,7 +162,7 @@ starting. The `-cert` and `-key` flags specify object keys, not filesystem paths
 Certificates and relay configuration are loaded once at startup.
 
 Logging uses the global structured logger. Set `LOG_LEVEL=debug|info|warn|error`
-(default `info`); this variable has no `FMA_` prefix and is read before configuration.
+(default `info`). DEBUG/INFO/WARN use stdout and ERROR/FATAL use stderr; this variable has no `FMA_` prefix and is read before configuration.
 Startup validates the complete configuration before connecting to S3 or opening
 listeners, failing on missing required values and reporting warnings such as disabled
 outbound delivery. `--version` needs no S3 configuration; `--queue` only needs S3.
@@ -219,8 +244,38 @@ files live in `deploy/generated/`, which is ignored by Git and excluded from rel
 archives. Files are private by default; the generator asks before replacing existing
 configuration and preserves it if input is cancelled.
 
+The generator checks environment variables **before each prompt**. Set values are
+validated and used without asking; invalid environment values fail immediately and
+secrets are not echoed. For unattended deployments (including Kubernetes setup):
+
+```sh
+export FMA_DOMAIN=example.com
+export FMA_S3_ENDPOINT=https://s3.example.com
+export FMA_S3_BUCKET=fma
+export FMA_S3_ACCESS_KEY_ID=your-access-key
+export FMA_S3_SECRET_ACCESS_KEY=your-secret-key
+bash deploy/gen.sh --non-interactive
+```
+
+In this mode, unset fields use defaults and missing required fields fail instead of
+waiting for input. Region defaults to `us-east-1`. Set `FMA_OVERWRITE=yes` to replace
+existing generated files; the default preserves them. Environment lookup also works
+in interactive mode. Generator-only variables are rendered into service arguments;
+they do not add registration or configuration-management APIs to the mail process.
+
+| Generator fields | Environment variables |
+| --- | --- |
+| Domain, service identity | `FMA_DOMAIN`, `FMA_DEPLOY_USER`, `FMA_DEPLOY_UID`, `FMA_DEPLOY_HOME` |
+| Installation paths | `FMA_BINDIR`, `FMA_CONFIG_DIR`, `FMA_SYSTEMD_USER_DIR` (also for system units) |
+| S3 connection | `FMA_S3_ENDPOINT`, `FMA_S3_BUCKET`, `FMA_S3_REGION`, `FMA_S3_ACCESS_KEY_ID`, `FMA_S3_SECRET_ACCESS_KEY`, `FMA_S3_SESSION_TOKEN` |
+| Certificate object keys | `FMA_CERT_KEY`, `FMA_KEY_KEY` |
+| Outbound | `FMA_OUTBOUND_MODE`, `FMA_RELAY_ADDR`, `FMA_RELAY_TLS`, `FMA_RELAY_USER`, `FMA_RELAY_PASSWORD`, `FMA_RELAY_PASSWORD_FILE`, `FMA_RELAY_CA_FILE`, `FMA_QUEUE_RETRY` |
+| Ports | `FMA_SMTP_PORT`, `FMA_SUBMISSION_PORT`, `FMA_SMTPS_PORT`, `FMA_POP3_PORT`, `FMA_POP3S_PORT`, `FMA_IMAP_PORT`, `FMA_IMAPS_PORT`, `FMA_HTTP_PORT` |
+| Certbot paths | `FMA_LINEAGE`, `FMA_WEBROOT` |
+| Logging, overwrite | `LOG_LEVEL` (no prefix), `FMA_OVERWRITE` |
+
 Run `make install` as the selected user on the target Linux host. It requires the
-generated configuration, builds the binary, installs the generated systemd user unit
+generated configuration, builds the binary, installs the generated systemd unit
 and environment files, then enables and restarts `fma.service`. Missing configuration
 fails before building or installing anything. Installation paths come from the
 generated `install.mk`; regenerate configuration to change them.

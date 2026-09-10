@@ -20,13 +20,13 @@ class DeploymentTests(unittest.TestCase):
         shutil.copy2(ROOT / 'Makefile', self.root / 'Makefile')
 
     def answers(self, mode='disabled', secret='test-secret'):
-        answers = ['example.net', '', '', '/home/tester', '', '', '',
+        answers = ['example.net', 'tester', '1000', '/home/tester', '', '', '',
                    'https://s3.example.net', 'test-bucket', '', 'test-access', secret,
                    '', 'tls/fullchain.pem', 'tls/private.key', mode]
         if mode == 'relay':
             answers += ['smtp.example.net:587', '', 'test-user', '', secret, '']
         answers += ['', '', '', '', '', '', '', '', '', '', '']
-        return answers
+        return answers + ['']
 
     def generate(self, answers):
         return subprocess.run(['bash', 'deploy/gen.sh'], cwd=self.root,
@@ -93,6 +93,37 @@ class DeploymentTests(unittest.TestCase):
         generated = self.root / 'deploy/generated'
         self.assertIn('-domain example.net', (generated / 'fma.service').read_text())
         self.assertIn('us-east-1', (generated / 's3.env').read_text())
+
+    def test_noninteractive_environment(self):
+        env = {**os.environ, 'FMA_DOMAIN': 'mail.example.net',
+               'FMA_DEPLOY_USER': 'tester', 'FMA_DEPLOY_UID': '1000',
+               'FMA_DEPLOY_HOME': '/home/tester', 'FMA_S3_ACCESS_KEY_ID': 'access',
+               'FMA_S3_SECRET_ACCESS_KEY': 'do-not-print-this-secret'}
+        result = subprocess.run(['bash', 'deploy/gen.sh', '--non-interactive'],
+                                cwd=self.root, env=env, input='', capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('do-not-print-this-secret', result.stdout + result.stderr)
+        generated = self.root / 'deploy/generated'
+        self.assertIn('-domain mail.example.net', (generated / 'fma.service').read_text())
+        self.assertIn('us-east-1', (generated / 's3.env').read_text())
+        env['FMA_S3_ENDPOINT'] = 'http://999.0.0.1'
+        result = subprocess.run(['bash', 'deploy/gen.sh', '--non-interactive'],
+                                cwd=self.root, env=env, input='', capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Invalid or missing FMA_S3_ENDPOINT', result.stderr)
+
+    def test_root_service_defaults(self):
+        answers = self.answers()
+        answers[1:4] = ['root', '0', '/root']
+        result = self.generate(answers)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        generated = self.root / 'deploy/generated'
+        service = (generated / 'fma.service').read_text()
+        self.assertIn('ExecStart=/usr/local/bin/fma', service)
+        self.assertIn('EnvironmentFile=/etc/fma/s3.env', service)
+        self.assertIn('WantedBy=multi-user.target', service)
+        self.assertIn('SYSTEMD_USER_DIR := /etc/systemd/system', (generated / 'install.mk').read_text())
+        self.assertIn('SYSTEMD_FLAGS := \n', (generated / 'install.mk').read_text())
 
     def test_endpoint_parsing(self):
         for endpoint in ['http://127.0.0.1:9000', 'https://s3.example.net',

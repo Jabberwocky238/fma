@@ -5,10 +5,18 @@ COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 RELEASE_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.releaseTime=$(RELEASE_TIME)
 export FMA_BUILD_LDFLAGS := $(LDFLAGS)
+ifeq ($(shell id -u),0)
+PREFIX ?= /usr/local
+SYSTEMD_USER_DIR := /etc/systemd/system
+CONFIG_DIR := /etc/fma
+SYSTEMD_FLAGS :=
+else
 PREFIX ?= $(HOME)/.local
-BINDIR := $(PREFIX)/bin
 SYSTEMD_USER_DIR := $(HOME)/.config/systemd/user
 CONFIG_DIR := $(HOME)/.config/fma
+SYSTEMD_FLAGS := --user
+endif
+BINDIR := $(PREFIX)/bin
 GENERATED := deploy/generated
 -include $(GENERATED)/install.mk
 SERVICE := $(SYSTEMD_USER_DIR)/$(APP).service
@@ -36,6 +44,10 @@ install-config:
 	@command -v systemctl >/dev/null || { echo 'Installation requires Linux with systemd' >&2; exit 1; }
 
 install: install-config
+	@if test "$$(id -u)" = 0 && { test -e /bin/fma || test -L /bin/fma; }; then \
+		test -L /bin/fma && test "$$(readlink /bin/fma)" = "$(BINDIR)/$(APP)" || { echo '/bin/fma is occupied by another installation' >&2; exit 1; }; \
+	fi
+	@echo "WARNING: UID $$(id -u); systemctl $(SYSTEMD_FLAGS); config $(CONFIG_DIR)"
 	$(MAKE) build
 	install -d "$(BINDIR)" "$(SYSTEMD_USER_DIR)"
 	install -d -m 700 "$(CONFIG_DIR)"
@@ -43,13 +55,15 @@ install: install-config
 	install -m 600 "$(GENERATED)/outbound.env" "$(CONFIG_DIR)/outbound.env"
 	install -m 755 $(APP) "$(BINDIR)/$(APP).new"
 	mv "$(BINDIR)/$(APP).new" "$(BINDIR)/$(APP)"
+	@if test "$$(id -u)" = 0 && ! test -L /bin/fma; then ln -s "$(BINDIR)/$(APP)" /bin/fma; fi
 	install -m 644 "$(GENERATED)/fma.service" "$(SERVICE)"
-	systemctl --user daemon-reload
-	systemctl --user enable $(APP).service
-	systemctl --user restart $(APP).service
+	systemctl $(SYSTEMD_FLAGS) daemon-reload
+	systemctl $(SYSTEMD_FLAGS) enable $(APP).service
+	systemctl $(SYSTEMD_FLAGS) restart $(APP).service
 
 uninstall:
-	-systemctl --user disable --now $(APP).service
+	-systemctl $(SYSTEMD_FLAGS) disable --now $(APP).service
+	@if test "$$(id -u)" = 0 && test -L /bin/fma && test "$$(readlink /bin/fma)" = "$(BINDIR)/$(APP)"; then rm -f /bin/fma; fi
 	rm -f "$(SERVICE)" "$(BINDIR)/$(APP)"
-	systemctl --user daemon-reload
+	systemctl $(SYSTEMD_FLAGS) daemon-reload
 	@echo 'S3 bucket and connection configuration preserved'

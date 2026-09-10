@@ -70,7 +70,33 @@ type Config struct {
 }
 
 var config Config
-var logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+var logger = newLogger(os.Stdout, os.Stderr, slog.LevelInfo)
+
+// Keep ordinary output and diagnostics on separate streams without duplicating logs.
+type logStreams struct{ output, diagnostics slog.Handler }
+
+func (h logStreams) target(level slog.Level) slog.Handler {
+	if level >= slog.LevelError {
+		return h.diagnostics
+	}
+	return h.output
+}
+func (h logStreams) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.target(level).Enabled(ctx, level)
+}
+func (h logStreams) Handle(ctx context.Context, r slog.Record) error {
+	return h.target(r.Level).Handle(ctx, r)
+}
+func (h logStreams) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return logStreams{h.output.WithAttrs(attrs), h.diagnostics.WithAttrs(attrs)}
+}
+func (h logStreams) WithGroup(name string) slog.Handler {
+	return logStreams{h.output.WithGroup(name), h.diagnostics.WithGroup(name)}
+}
+func newLogger(output, diagnostics io.Writer, level slog.Level) *slog.Logger {
+	options := &slog.HandlerOptions{Level: level}
+	return slog.New(logStreams{slog.NewTextHandler(output, options), slog.NewTextHandler(diagnostics, options)})
+}
 
 func initLogger(value string) error {
 	level := slog.LevelInfo
@@ -79,7 +105,7 @@ func initLogger(value string) error {
 			return fmt.Errorf("invalid LOG_LEVEL: %w", err)
 		}
 	}
-	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger = newLogger(os.Stdout, os.Stderr, level)
 	slog.SetDefault(logger)
 	return nil
 }
