@@ -16,6 +16,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -45,6 +46,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
 	"github.com/emersion/go-imap"
@@ -486,10 +488,12 @@ type s3Bucket struct {
 }
 
 func connectBucket(c S3Config) (*s3Bucket, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
 	client := s3.NewFromConfig(aws.Config{
 		Region:           c.Region,
 		Credentials:      credentials.NewStaticCredentialsProvider(c.AccessKey, c.SecretKey, c.SessionToken),
-		HTTPClient:       &http.Client{Timeout: 30 * time.Second},
+		HTTPClient:       &http.Client{Transport: transport},
 		RetryMaxAttempts: 2,
 	}, func(o *s3.Options) {
 		o.UsePathStyle = true
@@ -513,7 +517,7 @@ func objectError(key string, err error) error {
 	var api smithy.APIError
 	if errors.As(err, &api) {
 		switch api.ErrorCode() {
-		case "NoSuchKey":
+		case "NoSuchKey", "NoSuchUpload":
 			return fmt.Errorf("object %q: %w", key, fs.ErrNotExist)
 		case "PreconditionFailed", "ConditionalRequestConflict":
 			return fmt.Errorf("object %q: %w", key, fs.ErrExist)
@@ -2759,21 +2763,15 @@ func (s jmapBlobs) Put(ctx context.Context, acct, id jmap.Id, data []byte) error
 	return err
 }
 func (s jmapBlobs) Open(ctx context.Context, acct, id jmap.Id) (io.ReadCloser, int64, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, 0, err
-	}
 	key, err := s.key(acct, id)
 	if err != nil {
 		return nil, 0, err
 	}
-	data, err := s.store.Get(key)
+	r, size, err := openObject(ctx, s.store, key)
 	if errors.Is(err, fs.ErrNotExist) {
 		err = jblob.ErrNotFound
 	}
-	if err != nil {
-		return nil, 0, err
-	}
-	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+	return r, size, err
 }
 func (s jmapBlobs) Delete(ctx context.Context, acct, id jmap.Id) error {
 	if err := ctx.Err(); err != nil {
@@ -2790,17 +2788,24 @@ func (s jmapBlobs) Delete(ctx context.Context, acct, id jmap.Id) error {
 	return err
 }
 func (s jmapBlobs) Create(ctx context.Context, acct jmap.Id) (jblob.BlobWriter, error) {
-	if _, err := jmapRoot(acct); err != nil {
+	root, err := jmapRoot(acct)
+	if err != nil {
 		return nil, err
 	}
-	return &jmapBlobWriter{ctx: ctx, store: s, account: acct}, ctx.Err()
+	writer, err := newObjectUpload(ctx, s.store, root+"/.jmap/uploads/")
+	if err != nil {
+		return nil, err
+	}
+	return &jmapBlobWriter{ctx: ctx, store: s, account: acct, writer: writer, digest: sha256.New()}, nil
 }
 
 type jmapBlobWriter struct {
-	bytes.Buffer
 	ctx      context.Context
 	store    jmapBlobs
 	account  jmap.Id
+	writer   objectUpload
+	digest   hash.Hash
+	size     int64
 	finished bool
 }
 
@@ -2811,25 +2816,33 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 	if err := w.ctx.Err(); err != nil {
 		return 0, err
 	}
-	if w.Len()+len(data) > 25<<20 {
-		return 0, fmt.Errorf("JMAP upload exceeds 25 MiB")
+	if w.size+int64(len(data)) > jmapMaxUpload {
+		return 0, fmt.Errorf("JMAP upload exceeds 4 GiB")
 	}
-	return w.Buffer.Write(data)
+	n, err := w.writer.Write(data)
+	w.digest.Write(data[:n])
+	w.size += int64(n)
+	return n, err
 }
-func (w *jmapBlobWriter) ID() jmap.Id { return jblob.IdFor(w.Bytes()) }
+func (w *jmapBlobWriter) ID() jmap.Id {
+	return jmap.Id("G" + base64.RawURLEncoding.EncodeToString(w.digest.Sum(nil)))
+}
 func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
 	if w.finished {
 		return "", fs.ErrClosed
 	}
 	id := w.ID()
-	if err := w.store.Put(w.ctx, w.account, id, w.Bytes()); err != nil {
+	key, err := w.store.key(w.account, id)
+	if err != nil {
+		return "", err
+	}
+	if err = w.writer.Commit(key); err != nil {
 		return "", err
 	}
 	w.finished = true
-	w.Reset()
 	return id, nil
 }
-func (w *jmapBlobWriter) Abort() error { w.finished = true; w.Reset(); return nil }
+func (w *jmapBlobWriter) Abort() error { w.finished = true; return w.writer.Abort() }
 
 type jmapAccount struct {
 	root  string
@@ -2869,7 +2882,7 @@ func newJMAPAccount(root string, store objectStore) (*jmapAccount, error) {
 }
 func jmapCore() jmap.CoreCapabilities {
 	c := jruntime.DefaultCoreCapabilities()
-	c.MaxSizeUpload = 25 << 20
+	c.MaxSizeUpload = jmapMaxUpload
 	return c
 }
 func (a *jmapAccount) identity() *jauth.Identity {
@@ -3649,7 +3662,7 @@ func scanJMAPTasks(ctx context.Context, lease *bucketLease, limit int) (int, err
 
 func jmapMailCapability() jmail.AccountCapability {
 	c := jmail.DefaultAccountCapability()
-	c.MaxSizeAttachmentsPerEmail = 18 << 20
+	c.MaxSizeAttachmentsPerEmail = 2 << 30
 	return c
 }
 func jmapSubmitLimits() jsubmit.Limits {
@@ -3824,4 +3837,257 @@ func jmapReferencedBlobs(value any, ids map[jmap.Id]bool) {
 			jmapReferencedBlobs(child, ids)
 		}
 	}
+}
+
+// Streaming object IO is separate from small, conditional metadata operations.
+// Multipart uploads keep at most one 8 MiB part in memory and use S3, never disk,
+// for staging while the content-addressed blob ID is still being calculated.
+const s3PartSize = 8 << 20
+const jmapMaxUpload int64 = 4 << 30
+
+type streamingStore interface {
+	OpenStream(context.Context, string) (io.ReadCloser, int64, error)
+	NewUpload(context.Context, string) (objectUpload, error)
+	CopyStream(context.Context, string, string) error
+}
+type objectUpload interface {
+	io.Writer
+	Commit(string) error
+	Abort() error
+}
+
+func openObject(ctx context.Context, store objectStore, key string) (io.ReadCloser, int64, error) {
+	if s, ok := store.(streamingStore); ok {
+		return s.OpenStream(ctx, key)
+	}
+	data, err := store.Get(key)
+	if err != nil {
+		return nil, 0, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
+}
+func newObjectUpload(ctx context.Context, store objectStore, prefix string) (objectUpload, error) {
+	if s, ok := store.(streamingStore); ok {
+		return s.NewUpload(ctx, prefix)
+	}
+	return &bufferedObjectUpload{ctx: ctx, store: store}, nil // Small in-memory test stores only.
+}
+
+type bufferedObjectUpload struct {
+	bytes.Buffer
+	ctx   context.Context
+	store objectStore
+}
+
+func (w *bufferedObjectUpload) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if w.Len()+len(p) > s3PartSize {
+		return 0, fmt.Errorf("store does not implement streaming uploads")
+	}
+	return w.Buffer.Write(p)
+}
+func (w *bufferedObjectUpload) Commit(key string) error {
+	err := w.store.Create(key, w.Bytes())
+	if errors.Is(err, fs.ErrExist) {
+		err = nil
+	}
+	w.Reset()
+	return err
+}
+func (w *bufferedObjectUpload) Abort() error { w.Reset(); return nil }
+func (b *s3Bucket) OpenStream(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &b.bucket, Key: &key})
+	if err != nil {
+		return nil, 0, objectError(key, err)
+	}
+	return result.Body, aws.ToInt64(result.ContentLength), nil
+}
+func (b *s3Bucket) CopyStream(ctx context.Context, src, dst string) error {
+	_, err := b.client.CopyObject(ctx, &s3.CopyObjectInput{Bucket: &b.bucket, Key: &dst, CopySource: aws.String(url.PathEscape(b.bucket + "/" + src))})
+	return objectError(dst, err)
+}
+func (b *s3Bucket) NewUpload(ctx context.Context, prefix string) (objectUpload, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return nil, err
+	}
+	return &s3StreamUpload{bucket: b, ctx: ctx, key: prefix + hex.EncodeToString(id[:])}, ctx.Err()
+}
+
+type s3StreamUpload struct {
+	bucket   *s3Bucket
+	ctx      context.Context
+	key      string
+	uploadID *string
+	parts    []s3types.CompletedPart
+	buffer   []byte
+	finished bool
+}
+
+func (w *s3StreamUpload) Write(data []byte) (int, error) {
+	if w.finished {
+		return 0, fs.ErrClosed
+	}
+	written := 0
+	for len(data) > 0 {
+		if err := w.ctx.Err(); err != nil {
+			return written, err
+		}
+		n := min(s3PartSize-len(w.buffer), len(data))
+		w.buffer = append(w.buffer, data[:n]...)
+		data = data[n:]
+		written += n
+		if len(w.buffer) == s3PartSize {
+			if err := w.flush(); err != nil {
+				return written, err
+			}
+		}
+	}
+	return written, nil
+}
+func (w *s3StreamUpload) flush() error {
+	b := w.bucket
+	if w.uploadID == nil {
+		result, err := b.client.CreateMultipartUpload(w.ctx, &s3.CreateMultipartUploadInput{Bucket: &b.bucket, Key: &w.key})
+		if err != nil {
+			return objectError(w.key, err)
+		}
+		w.uploadID = result.UploadId
+	}
+	number := int32(len(w.parts) + 1)
+	result, err := b.client.UploadPart(w.ctx, &s3.UploadPartInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, PartNumber: &number, Body: bytes.NewReader(w.buffer), ContentLength: aws.Int64(int64(len(w.buffer)))})
+	if err != nil {
+		return objectError(w.key, err)
+	}
+	w.parts = append(w.parts, s3types.CompletedPart{ETag: result.ETag, PartNumber: &number})
+	w.buffer = w.buffer[:0]
+	return nil
+}
+func (w *s3StreamUpload) Commit(key string) error {
+	if w.finished {
+		return fs.ErrClosed
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	b := w.bucket
+	if w.uploadID == nil {
+		_, err := b.client.PutObject(w.ctx, &s3.PutObjectInput{Bucket: &b.bucket, Key: &key, Body: bytes.NewReader(w.buffer), IfNoneMatch: aws.String("*")})
+		if err = objectError(key, err); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+	} else {
+		if len(w.buffer) > 0 {
+			if err := w.flush(); err != nil {
+				return err
+			}
+		}
+		_, err := b.client.CompleteMultipartUpload(w.ctx, &s3.CompleteMultipartUploadInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, MultipartUpload: &s3types.CompletedMultipartUpload{Parts: w.parts}})
+		if err != nil {
+			return objectError(w.key, err)
+		}
+		if err = b.CopyStream(w.ctx, w.key, key); err != nil {
+			return err
+		}
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 30*time.Second)
+		defer cancel()
+		if _, err = b.client.DeleteObject(cleanup, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &w.key}); err != nil {
+			logger.Warn("remove completed S3 upload staging object", "key", w.key, "error", err)
+		}
+	}
+	w.finished = true
+	w.buffer = nil
+	return nil
+}
+func (w *s3StreamUpload) Abort() error {
+	if w.finished {
+		return nil
+	}
+	w.finished = true
+	w.buffer = nil
+	if w.uploadID == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(w.ctx), 30*time.Second)
+	defer cancel()
+	b := w.bucket
+	_, err := b.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID})
+	// Complete may have succeeded before a failed Copy; remove that staging key too.
+	_, delErr := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &b.bucket, Key: &w.key})
+	if err = objectError(w.key, err); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return objectError(w.key, delErr)
+}
+
+type guardedReader struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (r *guardedReader) Close() error { err := r.ReadCloser.Close(); r.once.Do(r.release); return err }
+
+type guardedUpload struct {
+	objectUpload
+	once    sync.Once
+	release func()
+}
+
+func (w *guardedUpload) Commit(key string) error {
+	err := w.objectUpload.Commit(key)
+	if err == nil {
+		w.once.Do(w.release)
+	}
+	return err
+}
+func (w *guardedUpload) Abort() error {
+	err := w.objectUpload.Abort()
+	w.once.Do(w.release)
+	return err
+}
+func (g *guardedStore) OpenStream(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	g.mu.RLock()
+	if g.closed {
+		g.mu.RUnlock()
+		return nil, 0, net.ErrClosed
+	}
+	r, size, err := openObject(ctx, g.base, key)
+	if err != nil {
+		g.mu.RUnlock()
+		return nil, 0, err
+	}
+	return &guardedReader{ReadCloser: r, release: g.mu.RUnlock}, size, nil
+}
+func (g *guardedStore) NewUpload(ctx context.Context, prefix string) (objectUpload, error) {
+	g.mu.RLock()
+	if g.closed {
+		g.mu.RUnlock()
+		return nil, net.ErrClosed
+	}
+	w, err := newObjectUpload(ctx, g.base, prefix)
+	if err != nil {
+		g.mu.RUnlock()
+		return nil, err
+	}
+	return &guardedUpload{objectUpload: w, release: g.mu.RUnlock}, nil
+}
+func (g *guardedStore) CopyStream(ctx context.Context, src, dst string) error {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if g.closed {
+		return net.ErrClosed
+	}
+	return g.base.(streamingStore).CopyStream(ctx, src, dst)
+}
+func (s *jmapBootstrapStore) OpenStream(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	return openObject(ctx, s.objectStore, key)
+}
+func (s *jmapBootstrapStore) NewUpload(ctx context.Context, prefix string) (objectUpload, error) {
+	return newObjectUpload(ctx, s.objectStore, prefix)
+}
+func (s *jmapBootstrapStore) CopyStream(ctx context.Context, src, dst string) error {
+	return s.objectStore.(streamingStore).CopyStream(ctx, src, dst)
 }
