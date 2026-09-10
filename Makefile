@@ -21,7 +21,7 @@ GENERATED := deploy/generated
 -include $(GENERATED)/install.mk
 SERVICE := $(SYSTEMD_USER_DIR)/$(APP).service
 
-.PHONY: build check test install install-config uninstall
+.PHONY: build check test benchmark install install-config uninstall
 build: check
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(APP) .
 
@@ -35,6 +35,7 @@ test: check
 	python3 scripts/verify.py
 	python3 scripts/test_deploy.py
 	python3 scripts/test_install.py
+	python3 scripts/test_streaming.py --mail --size-mib 32
 
 install-config:
 	@for file in install.mk fma.service s3.env outbound.env nginx-http.conf nginx-https.conf nginx-stream.conf renew-hook.sh; do \
@@ -67,3 +68,6 @@ uninstall:
 	rm -f "$(SERVICE)" "$(BINDIR)/$(APP)"
 	systemctl $(SYSTEMD_FLAGS) daemon-reload
 	@echo 'S3 bucket and connection configuration preserved'
+
+benchmark:
+	python3 scripts/test_streaming.py --mail --report /tmp/fma-streaming.json

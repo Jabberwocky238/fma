@@ -12,6 +12,7 @@ require (
 	github.com/emersion/go-message v0.18.2
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.25.0
+	github.com/klauspost/compress v1.20.0
 	github.com/migadu/go-pop3 v0.1.4
 	github.com/naust-mail/naust-jmap/core v0.4.2
 	github.com/naust-mail/naust-jmap/datatypes/mail v0.3.3

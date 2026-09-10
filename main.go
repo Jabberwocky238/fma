@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -62,6 +61,7 @@ import (
 	msgtext "github.com/emersion/go-message/textproto"
 	"github.com/emersion/go-sasl"
 	smtp "github.com/emersion/go-smtp"
+	"github.com/klauspost/compress/gzip"
 	"github.com/migadu/go-pop3/pop3"
 	"github.com/migadu/go-pop3/pop3server"
 	jdescriptor "github.com/naust-mail/naust-jmap/core/descriptor"
@@ -4158,11 +4158,12 @@ func (b *s3Bucket) OpenStream(ctx context.Context, key string) (io.ReadCloser, i
 }
 
 type gzipObjectReader struct {
-	*gzip.Reader
+	Reader io.ReadCloser
 	source io.ReadCloser
 }
 
-func (r *gzipObjectReader) Close() error { return errors.Join(r.Reader.Close(), r.source.Close()) }
+func (r *gzipObjectReader) Read(p []byte) (int, error) { return r.Reader.Read(p) }
+func (r *gzipObjectReader) Close() error               { return errors.Join(r.Reader.Close(), r.source.Close()) }
 func (b *s3Bucket) CopyStream(ctx context.Context, src, dst string) error {
 	return b.copyStream(ctx, src, dst, nil)
 }

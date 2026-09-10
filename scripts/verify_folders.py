@@ -41,12 +41,19 @@ def verify_folders(host, port, context):
         assert not any(target.encode() in row for row in c.lsub()[1] if row), 'LSUB ignored unsubscribe'
         assert c.subscribe(target)[0]=='OK'
         # APPEND from another connection must become visible after NOOP.
+        idle_tag = c._new_tag()
+        c.send(idle_tag + b' IDLE\r\n')
+        assert c.readline().startswith(b'+')
         other=imaplib.IMAP4_SSL(host,port,ssl_context=context,timeout=15)
         other.login('jw238','123123')
         try:
             assert other.append(name,None,None,body.replace(name.encode(),b'second-message'))[0]=='OK'
         finally:
             other.logout()
+        while b'2 EXISTS' not in c.readline():
+            pass
+        c.send(b'DONE\r\n')
+        assert c._get_tagged_response(idle_tag)[0] == 'OK'
         assert c.noop()[0]=='OK'
         assert c.search(None,'ALL')[1]==[b'1 2'], 'NOOP did not refresh selected mailbox'
         assert c.store('1','+FLAGS',r'(\Deleted)')[0]=='OK'
