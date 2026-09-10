@@ -22,6 +22,7 @@ import uuid
 import urllib.request
 import xml.etree.ElementTree as ET
 from verify_folders import verify_folders
+from verify_jmap import verify_jmap, verify_jmap_restart
 
 
 def require(value, message):
@@ -352,6 +353,7 @@ def local():
                 del mime['Bcc']
                 expected_mime = mime.as_bytes()
                 verify_attachment_mailboxes('127.0.0.1', ports, context, expected_mime)
+                jmap_saved = verify_jmap('127.0.0.1', ports, context, lambda key, data: s3_request(f'/{bucket}/{key}', 'PUT', data))
                 proc.send_signal(signal.SIGTERM)
                 require(proc.wait(timeout=15) == 0, 'unclean shutdown')
                 proc = start()
@@ -362,9 +364,10 @@ def local():
                 require(len(ids)==12 and min(map(int,ids))>=4, 'restart lost mail or reused UID')
                 c.logout()
                 verify_attachment_mailboxes('127.0.0.1', ports, context, expected_mime)
+                verify_jmap_restart('127.0.0.1', ports, jmap_saved)
                 require(list(work.iterdir())==[], 'mail process wrote local files')
                 s3_request(f'/{bucket}/jw238/.password')
-                s3_request(f'/{bucket}/jw238/folders')
+                s3_request(f'/{bucket}/jw238/.jmap/state.json')
                 print('PASS S3-only storage / users and certificates in bucket / external credentials / restart / no local files')
             finally:
                 if proc.poll() is None:

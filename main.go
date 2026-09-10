@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +19,10 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net"
 	"net/http"
 	"net/mail"
@@ -52,17 +58,24 @@ import (
 	smtp "github.com/emersion/go-smtp"
 	"github.com/migadu/go-pop3/pop3"
 	"github.com/migadu/go-pop3/pop3server"
+	jdescriptor "github.com/naust-mail/naust-jmap/core/descriptor"
 	jmap "github.com/naust-mail/naust-jmap/core/jmap"
+	jdb "github.com/naust-mail/naust-jmap/core/objectdb"
 	jauth "github.com/naust-mail/naust-jmap/core/providers/auth"
 	jbackend "github.com/naust-mail/naust-jmap/core/providers/backend"
 	jblob "github.com/naust-mail/naust-jmap/core/providers/blob"
+	jlease "github.com/naust-mail/naust-jmap/core/providers/lease"
+	jruntime "github.com/naust-mail/naust-jmap/core/runtime"
+	jmail "github.com/naust-mail/naust-jmap/datatypes/mail"
+	jsearch "github.com/naust-mail/naust-jmap/datatypes/mail/search"
+	jsubmit "github.com/naust-mail/naust-jmap/datatypes/mail/submit"
 )
 
 // Main
 
 // Config is loaded once before startup; serving code only reads this snapshot.
 type Config struct {
-	Domain, CertFile, KeyFile, TLSDir                      string
+	Domain, CertFile, KeyFile, TLSDir, JMAPURL             string
 	SMTPAddr, SubmissionAddr, SMTPSAddr                    string
 	POP3Addr, POP3SAddr, IMAPAddr, IMAPSAddr, HTTPAddr     string
 	OutboundMode                                           string
@@ -155,7 +168,8 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	f.StringVar(&c.POP3SAddr, "pop3s", "127.0.0.1:1995", "POP3S backend")
 	f.StringVar(&c.IMAPAddr, "imap", "127.0.0.1:1143", "IMAP STARTTLS backend")
 	f.StringVar(&c.IMAPSAddr, "imaps", "127.0.0.1:1993", "IMAPS backend")
-	f.StringVar(&c.HTTPAddr, "http", "127.0.0.1:8080", "HTTP health backend")
+	f.StringVar(&c.JMAPURL, "jmap-url", getenv("JMAP_URL", ""), "public HTTPS origin for JMAP; defaults to https://mail.<domain>")
+	f.StringVar(&c.HTTPAddr, "http", "127.0.0.1:8080", "HTTP JMAP API and health backend")
 	f.StringVar(&c.OutboundMode, "outbound", getenv("OUTBOUND_MODE", ""), "disabled, relay or direct")
 	f.BoolVar(&c.ShowVersion, "version", false, "print version and exit")
 	f.BoolVar(&c.ShowQueue, "queue", false, "show outbound status without mail bodies")
@@ -199,6 +213,12 @@ func checkConfig(c Config) error {
 	for _, label := range strings.Split(c.Domain, ".") {
 		if !regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`).MatchString(label) {
 			return fmt.Errorf("invalid mail domain")
+		}
+	}
+	if c.JMAPURL != "" {
+		u, err := url.Parse(c.JMAPURL)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+			return fmt.Errorf("FMA_JMAP_URL must be a public HTTPS origin without credentials, path, query or fragment")
 		}
 	}
 	if c.TLSDir == "" && (strings.TrimSpace(c.CertFile) == "" || strings.TrimSpace(c.KeyFile) == "") {
@@ -294,6 +314,7 @@ func run() error {
 	defer cancel()
 	guard := &guardedStore{base: bucket}
 	objects = guard
+	useJMAP = true
 	defer guard.close()
 
 	if err := loadRelayObjects(&config); err != nil {
@@ -353,10 +374,7 @@ func run() error {
 	im.TLSConfig = cfg
 	im.MaxLiteralSize = 25 << 20
 	im.AutoLogout = 30 * time.Minute
-	web := &http.Server{ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError), ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, "fma mail server: SMTP, POP3S and IMAPS")
-	})}
+	web := &http.Server{ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError), ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(serveJMAP)}
 	pop, pops := newPOPServer(cfg), newPOPServer(cfg)
 	closers = append(closers, im, web, pop, pops)
 	wg.Add(2)
@@ -959,6 +977,9 @@ func updateJSON[T any](key string, change func(*T) error) error {
 	return fmt.Errorf("S3 update contention: %s", key)
 }
 func updateCatalog(user string, change func(map[string]folderMeta) error) error {
+	if useJMAP {
+		return jmapUpdateCatalog(user, change)
+	}
 	return updateJSON(catalogPath(user), func(c *map[string]folderMeta) error {
 		if *c == nil {
 			*c = map[string]folderMeta{}
@@ -1005,13 +1026,16 @@ func mailboxSnapshot(key string) (box memory.Mailbox, next uint32, err error) {
 	return
 }
 func removeMessage(key string, uid uint32) error {
+	if useJMAP {
+		return jmapRemoveMessage(key, uid)
+	}
 	err := objects.Delete(messagePath(key, uid))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	return err
 }
-func messages(key string) ([]*memory.Message, error) {
+func legacyMessages(key string) ([]*memory.Message, error) {
 	var result []*memory.Message
 	err := eachJSON(key, func(_ string, m *memory.Message, err error) error {
 		if err == nil {
@@ -1042,7 +1066,7 @@ func deleteMessages(u string, ids []uint32) error {
 	return nil
 }
 
-func nextUID(u string) (uint32, error) {
+func legacyNextUID(u string) (uint32, error) {
 	next, err := readJSON[uint32](path.Join(u, "next"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return 1, nil
@@ -1071,7 +1095,7 @@ func catalogPath(user string) string { return path.Join(user, "folders") }
 
 // A single catalog object makes RENAME atomic without copying message objects.
 // Folder storage IDs never change on rename and are never reused on recreation.
-func folderCatalog(user string) (map[string]folderMeta, error) {
+func legacyFolderCatalog(user string) (map[string]folderMeta, error) {
 	catalog, err := readJSON[map[string]folderMeta](catalogPath(user))
 	if errors.Is(err, fs.ErrNotExist) {
 		return map[string]folderMeta{}, nil
@@ -1244,6 +1268,22 @@ func appendMessage(key string, body []byte, flags []string, date time.Time, uniq
 				return nil
 			}
 		}
+	}
+	if useJMAP {
+		a, err := jmapForKey(key)
+		if err != nil {
+			return err
+		}
+		ctx := context.Background()
+		box, err := a.mailbox(ctx, key)
+		if err != nil {
+			return err
+		}
+		email, err := a.importMail(ctx, box, body, flags, date)
+		if err == nil {
+			_, err = a.uid(ctx, box, email)
+		}
+		return err
 	}
 	var next uint32
 	if err := updateJSON(path.Join(key, "next"), func(counter *uint32) error {
@@ -1900,6 +1940,14 @@ func (b *inbox) UpdateMessagesFlags(uid bool, set *imap.SeqSet, op imap.FlagsOp,
 		return err
 	}
 	for _, m := range b.selected(uid, set) {
+		if useJMAP {
+			updated, err := jmapUpdateFlags(b.key(), m.Uid, op, flags)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			m.Flags = updated
+			continue
+		}
 		path := messagePath(b.key(), m.Uid)
 		err := updateJSON(path, func(current **memory.Message) error {
 			if *current == nil {
@@ -2328,6 +2376,13 @@ func scanTasks(ctx context.Context, lease *bucketLease, slots chan struct{}, wor
 			}
 		}()
 	}
+	if useJMAP {
+		count, err := scanJMAPTasks(ctx, lease, min(maxClaimedTasks-claimed, cap(slots)-len(slots)))
+		claimed += count
+		if err != nil {
+			return false, err
+		}
+	}
 	return claimed == maxClaimedTasks || len(slots) == cap(slots), nil
 }
 
@@ -2353,7 +2408,7 @@ func serveQueue(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
-		if outboundEnabled() {
+		if outboundEnabled() || useJMAP {
 			if lease != nil && !lease.valid(time.Now()) {
 				release()
 			}
@@ -2574,6 +2629,16 @@ func (b *jmapBackend) WriteBatch(ctx context.Context, batch *jbackend.Batch) err
 	if b.closed {
 		return fs.ErrClosed
 	}
+	for _, op := range batch.Ops {
+		if op.Kind == jbackend.OpSet && bytes.Contains(op.Key, []byte("EmailSubmission\x00\x01")) {
+			root := strings.SplitN(b.key, "/", 2)[0]
+			err := b.store.Create(".jmap-queue/"+string(jmapAccountID(root)), []byte(root))
+			if err != nil && !errors.Is(err, fs.ErrExist) {
+				return err
+			}
+			break
+		}
+	}
 	for attempt := 0; attempt < 128; attempt++ {
 		state, etag, err := b.snapshot(ctx)
 		if err != nil {
@@ -2594,7 +2659,26 @@ func (b *jmapBackend) WriteBatch(ctx context.Context, batch *jbackend.Batch) err
 			key := hex.EncodeToString(op.Key)
 			switch op.Kind {
 			case jbackend.OpSet:
-				state[key] = bytes.Clone(op.Value)
+				value := bytes.Clone(op.Value)
+				if bytes.Contains(op.Key, []byte("\x00\x01o\x00\x01Email\x00\x01")) {
+					var email jdb.Object
+					if json.Unmarshal(value, &email) == nil {
+						uids := jvalue[map[jmap.Id]uint32](email, "fmaUIDs")
+						boxes := jvalue[map[jmap.Id]bool](email, "mailboxIds")
+						changed := false
+						for box := range uids {
+							if !boxes[box] {
+								delete(uids, box)
+								changed = true
+							}
+						}
+						if changed {
+							email["fmaUIDs"] = jraw(uids)
+							value = jraw(email)
+						}
+					}
+				}
+				state[key] = value
 			case jbackend.OpDelete:
 				delete(state, key)
 			case jbackend.OpAdd:
@@ -2633,6 +2717,8 @@ func (b *jmapBackend) Close() error { b.mu.Lock(); defer b.mu.Unlock(); b.closed
 
 type jmapBlobs struct{ store objectStore }
 
+var jmapBlobIDRE = regexp.MustCompile(`^G[A-Za-z0-9_-]{43}$`)
+
 func jmapAccountID(root string) jmap.Id { return jmap.Id("A" + hex.EncodeToString([]byte(root))) }
 func jmapRoot(acct jmap.Id) (string, error) {
 	if !strings.HasPrefix(string(acct), "A") {
@@ -2650,7 +2736,7 @@ func (s jmapBlobs) key(acct, id jmap.Id) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !regexp.MustCompile(`^G[A-Za-z0-9_-]{43}$`).MatchString(string(id)) {
+	if !jmapBlobIDRE.MatchString(string(id)) {
 		return "", jblob.ErrNotFound
 	}
 	return root + "/.jmap/blobs/" + string(id), nil
@@ -2744,3 +2830,998 @@ func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
 	return id, nil
 }
 func (w *jmapBlobWriter) Abort() error { w.finished = true; w.Reset(); return nil }
+
+type jmapAccount struct {
+	root  string
+	id    jmap.Id
+	db    *jdb.DB
+	proc  *jruntime.Processor
+	blobs jmapBlobs
+	queue *jsubmit.Queue
+}
+
+func newJMAPAccount(root string, store objectStore) (*jmapAccount, error) {
+	be := &jmapBackend{key: root + "/.jmap/state.json", store: store}
+	a := &jmapAccount{root: root, id: jmapAccountID(root), blobs: jmapBlobs{store: store}, proc: jruntime.NewProcessor()}
+	a.db = jdb.New(be, jlease.NewStoreLease(be, jlease.StoreLeaseConfig{}))
+	core := jmapCore()
+	for _, err := range []error{
+		jmail.RegisterMailbox(a.proc, jmail.MailboxConfig{DB: a.db, Core: core}),
+		jmail.RegisterThread(a.proc, jmail.ThreadConfig{DB: a.db, Core: core}),
+		jmail.RegisterEmail(a.proc, jmail.EmailConfig{DB: a.db, Store: a.blobs, Core: core, AccountCapability: jmapMailCapability(), Searcher: jsearch.New(a.blobs, jsearch.DefaultConfig()), MessageIDDomain: config.Domain, InternalProperties: map[string]jdescriptor.Property{"fmaUIDs": {Kind: jdescriptor.KindObject, Default: json.RawMessage(`{}`)}}}),
+		jmail.RegisterIdentity(a.proc, jmail.IdentityConfig{DB: a.db, Core: core, Policy: a}),
+	} {
+		if err != nil {
+			return nil, err
+		}
+	}
+	for name, prop := range map[string]jdescriptor.Property{
+		"fmaKey":      {Kind: jdescriptor.KindString, Internal: true},
+		"fmaValidity": {Kind: jdescriptor.KindUnsignedInt, Internal: true},
+		"fmaNext":     {Kind: jdescriptor.KindUnsignedInt, Internal: true},
+	} {
+		a.db.Type("Mailbox").Properties[name] = prop
+	}
+	var err error
+	limits := jmapSubmitLimits()
+	a.queue, err = jsubmit.Register(a.proc, jsubmit.Config{DB: a.db, Store: a.blobs, Core: core, Policy: a, Limits: &limits})
+	return a, err
+}
+func jmapCore() jmap.CoreCapabilities {
+	c := jruntime.DefaultCoreCapabilities()
+	c.MaxSizeUpload = 25 << 20
+	return c
+}
+func (a *jmapAccount) identity() *jauth.Identity {
+	return &jauth.Identity{Username: a.root, Primary: a.id, Accounts: map[jmap.Id]jauth.Access{a.id: {Name: a.root + "@" + config.Domain, Personal: true}}}
+}
+func (a *jmapAccount) CanSend(ctx context.Context, id jmap.Id) (bool, string) {
+	if err := ctx.Err(); err != nil {
+		return false, err.Error()
+	}
+	if id != a.id {
+		return false, "account not accessible"
+	}
+	root, err := resolveIdentity(a.root)
+	return err == nil && root.RootID == a.root, "account is unavailable"
+}
+func (a *jmapAccount) CanSendAs(ctx context.Context, id jmap.Id, address string) bool {
+	if ctx.Err() != nil || id != a.id {
+		return false
+	}
+	user := localUser(address)
+	if user == "" {
+		return false
+	}
+	root, err := resolveIdentity(user)
+	return err == nil && root.RootID == a.root
+}
+func jraw(value any) json.RawMessage {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+func jvalue[T any](obj jdb.Object, key string) (value T) {
+	_ = json.Unmarshal(obj[key], &value)
+	return
+}
+func (a *jmapAccount) call(ctx context.Context, method string, request any) (jdb.Object, error) {
+	var args jdb.Object
+	data, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal(data, &args); err != nil {
+		return nil, err
+	}
+	if args == nil {
+		args = jdb.Object{}
+	}
+	args["accountId"] = jraw(a.id)
+	resp := a.proc.Process(ctx, &jmap.Request{Using: []string{jmap.CoreCapability, jmail.CapabilityURI, jsubmit.CapabilityURI}, MethodCalls: []jmap.Invocation{{Name: method, Args: jraw(args), CallID: "fma"}}}, a.identity(), "")
+	if len(resp.MethodResponses) == 0 {
+		return nil, fmt.Errorf("JMAP %s returned no response", method)
+	}
+	var obj jdb.Object
+	if err := json.Unmarshal(resp.MethodResponses[0].Args, &obj); err != nil {
+		return nil, err
+	}
+	if resp.MethodResponses[0].Name == "error" {
+		return nil, fmt.Errorf("JMAP %s: %s", method, resp.MethodResponses[0].Args)
+	}
+	for _, key := range []string{"notCreated", "notUpdated", "notDestroyed"} {
+		if len(jvalue[map[string]any](obj, key)) != 0 {
+			return nil, fmt.Errorf("JMAP %s %s: %s", method, key, obj[key])
+		}
+	}
+	return obj, nil
+}
+func (a *jmapAccount) all(ctx context.Context, typ string) ([]jdb.Object, error) {
+	ids, err := a.db.AllIds(ctx, a.id, typ, 0)
+	if err != nil {
+		return nil, err
+	}
+	return a.db.GetMany(ctx, a.id, typ, ids)
+}
+func (a *jmapAccount) importMail(ctx context.Context, mailbox jmap.Id, body []byte, flags []string, date time.Time) (jmap.Id, error) {
+	bw, err := a.blobs.Create(ctx, a.id)
+	if err != nil {
+		return "", err
+	}
+	defer bw.Abort()
+	if _, err = bw.Write(body); err != nil {
+		return "", err
+	}
+	blob, err := a.db.FinalizeBlobUpload(ctx, a.id, bw, a.root, time.Now())
+	if err != nil {
+		return "", err
+	}
+	if date.IsZero() {
+		date = time.Now()
+	}
+	result, err := a.call(ctx, "Email/import", jmapImportRequest{Emails: map[string]jmapImportEmail{"fma": {BlobID: blob, MailboxIDs: map[jmap.Id]bool{mailbox: true}, Keywords: jmapKeywords(flags), ReceivedAt: date.UTC().Truncate(time.Second)}}})
+	if err != nil {
+		return "", err
+	}
+	return jvalue[jmap.Id](jvalue[map[string]jdb.Object](result, "created")["fma"], "id"), nil
+}
+
+var jmapFlagNames = map[string]string{imap.SeenFlag: "$seen", imap.AnsweredFlag: "$answered", imap.FlaggedFlag: "$flagged", imap.DraftFlag: "$draft", imap.DeletedFlag: "fma-deleted"}
+
+func jmapKeywords(flags []string) map[string]bool {
+	result := map[string]bool{}
+	for _, f := range flags {
+		if f == imap.RecentFlag {
+			continue
+		}
+		if keyword, ok := jmapFlagNames[f]; ok {
+			f = keyword
+		}
+		result[f] = true
+	}
+	return result
+}
+func jmapFlags(keywords map[string]bool) []string {
+	var result []string
+	for k, present := range keywords {
+		if !present {
+			continue
+		}
+		for flag, keyword := range jmapFlagNames {
+			if k == keyword {
+				k = flag
+				break
+			}
+		}
+		result = append(result, k)
+	}
+	sort.Strings(result)
+	return result
+}
+
+// The legacy wire protocols project the same JMAP records into IMAP mailboxes.
+// UIDs are private bookkeeping; changing them never advances JMAP public state.
+func (a *jmapAccount) catalog(ctx context.Context) (map[string]folderMeta, map[string]jmap.Id, error) {
+	boxes, err := a.all(ctx, "Mailbox")
+	if err != nil {
+		return nil, nil, err
+	}
+	byID := map[jmap.Id]jdb.Object{}
+	for _, box := range boxes {
+		byID[jvalue[jmap.Id](box, "id")] = box
+	}
+	var nameOf func(jmap.Id, int) string
+	nameOf = func(id jmap.Id, depth int) string {
+		b := byID[id]
+		if b == nil || depth > 100 {
+			return ""
+		}
+		name := jvalue[string](b, "name")
+		if jvalue[string](b, "role") == "inbox" {
+			return "INBOX"
+		}
+		if parent := jvalue[jmap.Id](b, "parentId"); parent != "" {
+			name = nameOf(parent, depth+1) + "/" + name
+		}
+		return name
+	}
+	catalog, ids := map[string]folderMeta{}, map[string]jmap.Id{}
+	for id, box := range byID {
+		name := nameOf(id, 0)
+		key := jvalue[string](box, "fmaKey")
+		validity := jvalue[uint32](box, "fmaValidity")
+		if key == "" {
+			key = a.root + "/.folders/" + string(id)
+			if jvalue[string](box, "role") == "inbox" {
+				key = a.root
+			}
+		}
+		if validity == 0 {
+			sum := sha256.Sum256([]byte(id))
+			validity = binary.BigEndian.Uint32(sum[:4]) | 1
+			if key == a.root {
+				validity = 1
+			}
+		}
+		catalog[name] = folderMeta{Subscribed: jvalue[bool](box, "isSubscribed"), Validity: validity, Key: key}
+		ids[key] = id
+	}
+	return catalog, ids, nil
+}
+func (a *jmapAccount) mailbox(ctx context.Context, key string) (jmap.Id, error) {
+	_, ids, err := a.catalog(ctx)
+	if err != nil {
+		return "", err
+	}
+	if id := ids[key]; id != "" {
+		return id, nil
+	}
+	return "", backend.ErrNoSuchMailbox
+}
+func (a *jmapAccount) private(ctx context.Context, typ string, id jmap.Id, metadata any) error {
+	var values jdb.Object
+	if err := json.Unmarshal(jraw(metadata), &values); err != nil {
+		return err
+	}
+	_, err := a.db.Update(ctx, a.id, func(u *jdb.Update) error {
+		obj, err := u.Get(typ, id)
+		if err != nil {
+			return err
+		}
+		obj = maps.Clone(obj)
+		for k, v := range values {
+			obj[k] = v
+		}
+		return u.PutInternal(typ, id, obj)
+	})
+	return err
+}
+func (a *jmapAccount) uid(ctx context.Context, boxID, emailID jmap.Id) (uint32, error) {
+	var uid uint32
+	_, err := a.db.Update(ctx, a.id, func(u *jdb.Update) error {
+		email, err := u.Get("Email", emailID)
+		if err != nil {
+			return err
+		}
+		if !jvalue[map[jmap.Id]bool](email, "mailboxIds")[boxID] {
+			return fs.ErrNotExist
+		}
+		uids := jvalue[map[jmap.Id]uint32](email, "fmaUIDs")
+		uid = uids[boxID]
+		if uid != 0 {
+			return nil
+		}
+		if uids == nil {
+			uids = map[jmap.Id]uint32{}
+		}
+		box, err := u.Get("Mailbox", boxID)
+		if err != nil {
+			return err
+		}
+		uid = jvalue[uint32](box, "fmaNext")
+		if uid == 0 {
+			uid = 1
+		}
+		if uid == ^uint32(0) {
+			return fmt.Errorf("UID exhausted")
+		}
+		box = maps.Clone(box)
+		box["fmaNext"] = jraw(uid + 1)
+		if err = u.PutInternal("Mailbox", boxID, box); err != nil {
+			return err
+		}
+		email = maps.Clone(email)
+		uids[boxID] = uid
+		email["fmaUIDs"] = jraw(uids)
+		return u.PutInternal("Email", emailID, email)
+	})
+	return uid, err
+}
+func (a *jmapAccount) messages(ctx context.Context, key string) ([]*memory.Message, map[uint32]jmap.Id, error) {
+	box, err := a.mailbox(ctx, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	emails, err := a.all(ctx, "Email")
+	if err != nil {
+		return nil, nil, err
+	}
+	result := []*memory.Message{}
+	ids := map[uint32]jmap.Id{}
+	for _, email := range emails {
+		if !jvalue[map[jmap.Id]bool](email, "mailboxIds")[box] {
+			continue
+		}
+		id := jvalue[jmap.Id](email, "id")
+		uid := jvalue[map[jmap.Id]uint32](email, "fmaUIDs")[box]
+		if uid == 0 {
+			uid, err = a.uid(ctx, box, id)
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, jdb.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		r, size, err := a.blobs.Open(ctx, a.id, jvalue[jmap.Id](email, "blobId"))
+		if err != nil {
+			return nil, nil, err
+		}
+		body, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			return nil, nil, err
+		}
+		result = append(result, &memory.Message{Uid: uid, Date: jvalue[time.Time](email, "receivedAt"), Size: uint32(size), Flags: jmapFlags(jvalue[map[string]bool](email, "keywords")), Body: body})
+		ids[uid] = id
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Uid < result[j].Uid })
+	return result, ids, nil
+}
+func jmapForKey(key string) (*jmapAccount, error) {
+	return openJMAPAccount(context.Background(), strings.SplitN(key, "/", 2)[0])
+}
+func jmapUpdateCatalog(user string, change func(map[string]folderMeta) error) error {
+	ctx := context.Background()
+	a, err := jmapForKey(user)
+	if err != nil {
+		return err
+	}
+	state, err := a.db.TypeState(ctx, a.id, "Mailbox")
+	if err != nil {
+		return err
+	}
+	before, ids, err := a.catalog(ctx)
+	if err != nil {
+		return err
+	}
+	after := maps.Clone(before)
+	if err = change(after); err != nil {
+		return err
+	}
+	create, update := map[string]jmapMailboxCreate{}, map[jmap.Id]jmapPatch{}
+	destroy := []jmap.Id{}
+	metas := map[string]folderMeta{}
+	kept := map[string]bool{}
+	for name, meta := range after {
+		kept[meta.Key] = true
+		if id := ids[meta.Key]; id != "" {
+			if old, ok := before[name]; !ok || old != meta {
+				update[id] = jmapPatch{"name": name, "isSubscribed": meta.Subscribed}
+			}
+		} else {
+			token := fmt.Sprintf("f%d", len(create))
+			create[token] = jmapMailboxCreate{Name: name, IsSubscribed: meta.Subscribed}
+			metas[token] = meta
+		}
+	}
+	for key, id := range ids {
+		if !kept[key] {
+			destroy = append(destroy, id)
+		}
+	}
+	if len(create)+len(update)+len(destroy) == 0 {
+		return nil
+	}
+	result, err := a.call(ctx, "Mailbox/set", jmapSetRequest[jmapMailboxCreate]{IfInState: state, Create: create, Update: update, Destroy: destroy, OnDestroyRemoveEmails: true})
+	if err != nil {
+		return err
+	}
+	for token, obj := range jvalue[map[string]jdb.Object](result, "created") {
+		meta := metas[token]
+		if err = a.private(ctx, "Mailbox", jvalue[jmap.Id](obj, "id"), jmapMailboxMetadata{Key: meta.Key, Validity: meta.Validity, Next: 1}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Bootstrap an existing mailbox in a private metadata transaction. Publishing
+// uses Create, so concurrent nodes agree on one complete image; old objects stay
+// untouched. Only immutable MIME blobs can precede that atomic publication.
+type jmapBootstrapStore struct {
+	objectStore
+	key      string
+	data     []byte
+	revision int
+}
+
+func (s *jmapBootstrapStore) GetVersion(key string) ([]byte, string, error) {
+	if key != s.key {
+		return s.objectStore.(versionedStore).GetVersion(key)
+	}
+	if s.data == nil {
+		return nil, "", fs.ErrNotExist
+	}
+	return bytes.Clone(s.data), strconv.Itoa(s.revision), nil
+}
+func (s *jmapBootstrapStore) Get(key string) ([]byte, error) {
+	if key != s.key {
+		return s.objectStore.Get(key)
+	}
+	data, _, err := s.GetVersion(key)
+	return data, err
+}
+func (s *jmapBootstrapStore) Create(key string, data []byte) error {
+	if key != s.key {
+		return s.objectStore.Create(key, data)
+	}
+	if s.data != nil {
+		return fs.ErrExist
+	}
+	s.data = bytes.Clone(data)
+	s.revision++
+	return nil
+}
+func (s *jmapBootstrapStore) Swap(key string, data []byte, etag string) error {
+	if key != s.key {
+		return s.objectStore.(versionedStore).Swap(key, data, etag)
+	}
+	if etag != strconv.Itoa(s.revision) {
+		return fs.ErrExist
+	}
+	s.data = bytes.Clone(data)
+	s.revision++
+	return nil
+}
+func openJMAPAccount(ctx context.Context, root string) (*jmapAccount, error) {
+	if !usernameRE.MatchString(root) {
+		return nil, jauth.ErrUnauthenticated
+	}
+	key := root + "/.jmap/state.json"
+	if _, err := objects.Get(key); err == nil {
+		return newJMAPAccount(root, objects)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+	staged := &jmapBootstrapStore{objectStore: objects, key: key}
+	a, err := newJMAPAccount(root, staged)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := legacyFolderCatalog(root)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range standardFolders {
+		if _, ok := catalog[name]; !ok {
+			meta, err := newFolderMeta(root, name)
+			if err != nil {
+				return nil, err
+			}
+			catalog[name] = meta
+		}
+	}
+	names := make([]string, 0, len(catalog))
+	for name := range catalog {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		meta := catalog[name]
+		box := jmapMailboxCreate{Name: name, IsSubscribed: meta.Subscribed}
+		for _, standard := range standardFolders {
+			if name == standard {
+				box.Role = strings.ToLower(standard)
+			}
+		}
+		result, err := a.call(ctx, "Mailbox/set", jmapSetRequest[jmapMailboxCreate]{Create: map[string]jmapMailboxCreate{"fma": box}})
+		if err != nil {
+			return nil, err
+		}
+		id := jvalue[jmap.Id](jvalue[map[string]jdb.Object](result, "created")["fma"], "id")
+		next, err := legacyNextUID(meta.Key)
+		if err != nil {
+			return nil, err
+		}
+		emails, err := legacyMessages(meta.Key)
+		if err != nil {
+			return nil, err
+		}
+		for _, email := range emails {
+			eid, err := a.importMail(ctx, id, email.Body, email.Flags, email.Date)
+			if err != nil {
+				return nil, err
+			}
+			if err = a.private(ctx, "Email", eid, jmapEmailMetadata{UIDs: map[jmap.Id]uint32{id: email.Uid}}); err != nil {
+				return nil, err
+			}
+			if email.Uid >= next {
+				next = email.Uid + 1
+			}
+		}
+		if err = a.private(ctx, "Mailbox", id, jmapMailboxMetadata{Key: meta.Key, Validity: meta.Validity, Next: next}); err != nil {
+			return nil, err
+		}
+	}
+	if _, err = a.call(ctx, "Identity/set", jmapSetRequest[jmapIdentityCreate]{Create: map[string]jmapIdentityCreate{"fma": {Name: root, Email: root + "@" + config.Domain}}}); err != nil {
+		return nil, err
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err = objects.Create(key, staged.data); err != nil && !errors.Is(err, fs.ErrExist) {
+		return nil, err
+	}
+	return newJMAPAccount(root, objects)
+}
+
+var useJMAP bool
+
+func folderCatalog(user string) (map[string]folderMeta, error) {
+	if !useJMAP {
+		return legacyFolderCatalog(user)
+	}
+	a, err := jmapForKey(user)
+	if err != nil {
+		return nil, err
+	}
+	catalog, _, err := a.catalog(context.Background())
+	return catalog, err
+}
+func messages(key string) ([]*memory.Message, error) {
+	if !useJMAP {
+		return legacyMessages(key)
+	}
+	a, err := jmapForKey(key)
+	if err != nil {
+		return nil, err
+	}
+	messages, _, err := a.messages(context.Background(), key)
+	return messages, err
+}
+func nextUID(key string) (uint32, error) {
+	if !useJMAP {
+		return legacyNextUID(key)
+	}
+	a, err := jmapForKey(key)
+	if err != nil {
+		return 0, err
+	}
+	ctx := context.Background()
+	id, err := a.mailbox(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	box, err := a.db.Get(ctx, a.id, "Mailbox", id)
+	if err != nil {
+		return 0, err
+	}
+	return max(1, jvalue[uint32](box, "fmaNext")), nil
+}
+
+type jmapAuth struct{ identity *jauth.Identity }
+
+func (a jmapAuth) Authenticate(r *http.Request) (*jauth.Identity, error) { return a.identity, nil }
+
+var jmapHTTPSlots = make(chan struct{}, 4)
+
+func serveJMAP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintln(w, "fma mail server: SMTP, POP3, IMAP and JMAP")
+		return
+	}
+	switch {
+	case r.URL.Path == "/.well-known/jmap", r.URL.Path == "/api", r.URL.Path == "/eventsource", strings.HasPrefix(r.URL.Path, "/upload/"), strings.HasPrefix(r.URL.Path, "/download/"):
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	user, password, ok := r.BasicAuth()
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Basic realm="fma", charset="UTF-8"`)
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return
+	}
+	identity, err := authenticateAccount(user, password)
+	if err != nil {
+		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		return
+	}
+	select {
+	case jmapHTTPSlots <- struct{}{}:
+		defer func() { <-jmapHTTPSlots }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+	a, err := openJMAPAccount(r.Context(), identity.RootID)
+	if err != nil {
+		logger.Error("JMAP account", "error", err)
+		http.Error(w, "storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	partIDs := map[jmap.Id]bool{}
+	if strings.HasPrefix(r.URL.Path, "/download/") {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/download/"), "/")
+		if len(parts) == 3 && parts[0] == string(a.id) {
+			partIDs[jmap.Id(parts[1])] = true
+		}
+	}
+	if r.URL.Path == "/api" && r.Method == http.MethodPost {
+		data, err := io.ReadAll(io.LimitReader(r.Body, jmapCore().MaxSizeRequest+1))
+		r.Body.Close()
+		if err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(data))
+		var request any
+		if int64(len(data)) <= jmapCore().MaxSizeRequest && json.Unmarshal(data, &request) == nil {
+			jmapReferencedBlobs(request, partIDs)
+		}
+	}
+	for id := range partIDs {
+		if err = a.materializePart(r.Context(), id, identity.LoginID); err != nil && !errors.Is(err, jblob.ErrNotFound) {
+			logger.Error("JMAP attachment", "error", err)
+			http.Error(w, "attachment storage unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	auth := a.identity()
+	auth.Username = identity.LoginID
+	base := config.JMAPURL
+	if base == "" {
+		base = "https://mail." + config.Domain
+	}
+	srv, err := jruntime.NewServer(jmapAuth{auth}, a.proc, base, jmapCore())
+	if err != nil {
+		logger.Error("JMAP server", "error", err)
+		http.Error(w, "JMAP unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer srv.Close()
+	srv.EnableBlobs(a.db, a.blobs)
+	if err = srv.Capability(jmail.CapabilityURI).Advertise(struct{}{}, jmapMailCapability()).Err(); err == nil {
+		err = srv.Capability(jsubmit.CapabilityURI).Advertise(map[string]any{}, jsubmit.AccountCapabilityFor(jmapSubmitLimits())).Err()
+	}
+	if err != nil {
+		logger.Error("JMAP capabilities", "error", err)
+		http.Error(w, "JMAP unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	srv.ServeHTTP(w, r)
+}
+func jmapRemoveMessage(key string, uid uint32) error {
+	a, err := jmapForKey(key)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	_, ids, err := a.messages(ctx, key)
+	if err != nil {
+		return err
+	}
+	id := ids[uid]
+	if id == "" {
+		return nil
+	}
+	box, err := a.mailbox(ctx, key)
+	if err != nil {
+		return err
+	}
+	email, err := a.db.Get(ctx, a.id, "Email", id)
+	if errors.Is(err, jdb.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	boxes := jvalue[map[jmap.Id]bool](email, "mailboxIds")
+	args := map[string]any{"destroy": []jmap.Id{id}}
+	if len(boxes) > 1 {
+		args = map[string]any{"update": map[jmap.Id]any{id: map[string]any{"mailboxIds/" + string(box): nil}}}
+	}
+	_, err = a.call(ctx, "Email/set", args)
+	return err
+}
+func jmapUpdateFlags(key string, uid uint32, op imap.FlagsOp, flags []string) ([]string, error) {
+	a, err := jmapForKey(key)
+	if err != nil {
+		return nil, err
+	}
+	ctx := context.Background()
+	_, ids, err := a.messages(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	id := ids[uid]
+	if id == "" {
+		return nil, fs.ErrNotExist
+	}
+	email, err := a.db.Get(ctx, a.id, "Email", id)
+	if err != nil {
+		return nil, err
+	}
+	updated := backendutil.UpdateFlags(jmapFlags(jvalue[map[string]bool](email, "keywords")), op, flags)
+	patch := map[string]any{"keywords": jmapKeywords(updated)}
+	if op != imap.SetFlags {
+		patch = map[string]any{}
+		for keyword := range jmapKeywords(flags) {
+			var value any = true
+			if op == imap.RemoveFlags {
+				value = nil
+			}
+			patch["keywords/"+strings.ReplaceAll(strings.ReplaceAll(keyword, "~", "~0"), "/", "~1")] = value
+		}
+	}
+	_, err = a.call(ctx, "Email/set", map[string]any{"update": map[jmap.Id]any{id: patch}})
+	return updated, err
+}
+
+type jmapSubmitter struct{}
+
+func (jmapSubmitter) Submit(ctx context.Context, env jsubmit.Envelope, r io.Reader) ([]jsubmit.Result, error) {
+	body, err := readMail(r)
+	if err != nil {
+		return nil, err
+	}
+	var results []jsubmit.Result
+	for _, rcpt := range env.Recipients {
+		if err = ctx.Err(); err != nil {
+			return results, err
+		}
+		var sendErr error
+		address := rcpt.Email
+		if user := localUser(address); user != "" {
+			local, remote, _, err := resolveDelivery(user)
+			if err != nil {
+				sendErr = &textproto.Error{Code: 550, Msg: "recipient unavailable"}
+			} else if local != "" {
+				sendErr = deliver([]string{local}, body)
+			} else {
+				address = remote
+			}
+			if err == nil && local != "" {
+				address = ""
+			}
+		}
+		if sendErr == nil && address != "" {
+			if !outboundEnabled() {
+				sendErr = &textproto.Error{Code: 550, Msg: "external delivery disabled"}
+			} else {
+				sendErr = sendRemote(ctx, &outboundJob{From: env.MailFrom, Body: body}, address)
+			}
+		}
+		result := jsubmit.Result{Recipient: rcpt.Email, Outcome: jmail.Accepted, Reply: "250 2.0.0 delivered"}
+		if sendErr != nil {
+			result.Outcome = jmail.TempFailed
+			result.Reply = "451 4.0.0 " + sendErr.Error()
+			var response *textproto.Error
+			if errors.As(sendErr, &response) && response.Code >= 500 {
+				result.Outcome = jmail.Rejected
+				result.Reply = response.Error()
+			}
+		}
+		results = append(results, result)
+	}
+	return results, nil
+}
+func scanJMAPTasks(ctx context.Context, lease *bucketLease, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	keys, err := objects.List(".jmap-queue/")
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, key := range keys {
+		if ctx.Err() != nil || !lease.valid(time.Now()) || count >= limit {
+			break
+		}
+		root, err := jmapRoot(jmap.Id(path.Base(key)))
+		if err != nil {
+			continue
+		}
+		a, err := newJMAPAccount(root, objects)
+		if err != nil {
+			return count, err
+		}
+		cfg := jsubmit.DefaultWorkerConfig()
+		cfg.ClaimWindow = 20 * time.Second
+		cfg.TransmitTimeout = 6 * time.Second
+		cfg.BatchSize = 1
+		cfg.QueueScanInterval = taskScanEvery
+		worker, err := jsubmit.NewWorker(a.queue, jmapSubmitter{}, cfg)
+		if err != nil {
+			return count, err
+		}
+		// A short sweep claims one item at a time, checking the scanner lease
+		// before each further claim. The library fences and clears each claim.
+		for count < limit && lease.valid(time.Now()) && ctx.Err() == nil {
+			sent, _, err := worker.ProcessDue(ctx, 1)
+			count += sent
+			if err != nil {
+				return count, err
+			}
+			if sent == 0 {
+				break
+			}
+		}
+	}
+	return count, nil
+}
+
+func jmapMailCapability() jmail.AccountCapability {
+	c := jmail.DefaultAccountCapability()
+	c.MaxSizeAttachmentsPerEmail = 18 << 20
+	return c
+}
+func jmapSubmitLimits() jsubmit.Limits {
+	c := jsubmit.DefaultLimits()
+	c.MaxMessageBytes = 25 << 20
+	return c
+}
+
+// Wire structures owned by fma. The library owns JMAP methods, errors,
+// envelopes, states, MIME body parts and all public Email records.
+type jmapSetRequest[T any] struct {
+	AccountID             jmap.Id               `json:"accountId,omitempty"`
+	IfInState             string                `json:"ifInState,omitempty"`
+	Create                map[string]T          `json:"create,omitempty"`
+	Update                map[jmap.Id]jmapPatch `json:"update,omitempty"`
+	Destroy               []jmap.Id             `json:"destroy,omitempty"`
+	OnDestroyRemoveEmails bool                  `json:"onDestroyRemoveEmails,omitempty"`
+}
+type jmapPatch map[string]any
+
+type jmapMailboxCreate struct {
+	Name         string   `json:"name"`
+	ParentID     *jmap.Id `json:"parentId,omitempty"`
+	Role         string   `json:"role,omitempty"`
+	IsSubscribed bool     `json:"isSubscribed"`
+}
+type jmapIdentityCreate struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+type jmapImportEmail struct {
+	BlobID     jmap.Id          `json:"blobId"`
+	MailboxIDs map[jmap.Id]bool `json:"mailboxIds"`
+	Keywords   map[string]bool  `json:"keywords"`
+	ReceivedAt time.Time        `json:"receivedAt"`
+}
+type jmapImportRequest struct {
+	AccountID jmap.Id                    `json:"accountId,omitempty"`
+	Emails    map[string]jmapImportEmail `json:"emails"`
+}
+type jmapMailboxMetadata struct {
+	Key      string `json:"fmaKey"`
+	Validity uint32 `json:"fmaValidity"`
+	Next     uint32 `json:"fmaNext"`
+}
+type jmapEmailMetadata struct {
+	UIDs map[jmap.Id]uint32 `json:"fmaUIDs"`
+}
+
+// naust-jmap returns hashes for MIME parts, but its blob provider stores whole
+// messages. Resolve a missing part only through an Email in this account; an
+// unreferenced blob or another account's hash never grants access.
+func (a *jmapAccount) materializePart(ctx context.Context, id jmap.Id, uploader string) error {
+	if !jmapBlobIDRE.MatchString(string(id)) {
+		return jblob.ErrNotFound
+	}
+	ident := a.identity()
+	ident.Username = uploader
+	if r, _, err := jruntime.OpenBlob(ctx, a.db, a.blobs, a.id, id, ident); err == nil {
+		r.Close()
+		return nil
+	} else if !errors.Is(err, jblob.ErrNotFound) {
+		return err
+	}
+	emails, err := a.all(ctx, "Email")
+	if err != nil {
+		return err
+	}
+	for _, email := range emails {
+		r, _, err := a.blobs.Open(ctx, a.id, jvalue[jmap.Id](email, "blobId"))
+		if err != nil {
+			return err
+		}
+		msg, err := mail.ReadMessage(r)
+		if err != nil {
+			r.Close()
+			continue
+		}
+		part, found, err := jmapFindPart(ctx, textproto.MIMEHeader(msg.Header), msg.Body, id, 0)
+		r.Close()
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		bw, err := a.blobs.Create(ctx, a.id)
+		if err != nil {
+			return err
+		}
+		defer bw.Abort()
+		if _, err = bw.Write(part); err != nil {
+			return err
+		}
+		_, err = a.db.FinalizeBlobUpload(ctx, a.id, bw, uploader, time.Now())
+		return err
+	}
+	return jblob.ErrNotFound
+}
+func jmapFindPart(ctx context.Context, h textproto.MIMEHeader, r io.Reader, wanted jmap.Id, depth int) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if depth > 30 {
+		return nil, false, fmt.Errorf("MIME nesting exceeds 30")
+	}
+	switch strings.ToLower(h.Get("Content-Transfer-Encoding")) {
+	case "base64":
+		r = base64.NewDecoder(base64.StdEncoding, r)
+	case "quoted-printable":
+		r = quotedprintable.NewReader(r)
+	}
+	typ, params, err := mime.ParseMediaType(h.Get("Content-Type"))
+	if err != nil {
+		typ = "text/plain"
+	}
+	if strings.HasPrefix(typ, "multipart/") {
+		parts := multipart.NewReader(r, params["boundary"])
+		for {
+			p, err := parts.NextRawPart()
+			if errors.Is(err, io.EOF) {
+				return nil, false, nil
+			}
+			if err != nil {
+				return nil, false, err
+			}
+			data, found, err := jmapFindPart(ctx, p.Header, p, wanted, depth+1)
+			p.Close()
+			if found || err != nil {
+				return data, found, err
+			}
+		}
+	}
+	data, err := readMail(r)
+	if err != nil {
+		return nil, false, err
+	}
+	if jblob.IdFor(data) == wanted {
+		return data, true, nil
+	}
+	if typ == "message/rfc822" {
+		msg, err := mail.ReadMessage(bytes.NewReader(data))
+		if err == nil {
+			return jmapFindPart(ctx, textproto.MIMEHeader(msg.Header), msg.Body, wanted, depth+1)
+		}
+	}
+	return nil, false, nil
+}
+func jmapReferencedBlobs(value any, ids map[jmap.Id]bool) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			switch key {
+			case "blobId":
+				if id, ok := child.(string); ok {
+					ids[jmap.Id(id)] = true
+				}
+			case "blobIds":
+				if list, ok := child.([]any); ok {
+					for _, entry := range list {
+						if id, ok := entry.(string); ok {
+							ids[jmap.Id(id)] = true
+						}
+					}
+				}
+			default:
+				jmapReferencedBlobs(child, ids)
+			}
+		}
+	case []any:
+		for _, child := range value {
+			jmapReferencedBlobs(child, ids)
+		}
+	}
+}

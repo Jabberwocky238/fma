@@ -13,6 +13,7 @@ require (
 	github.com/emersion/go-smtp v0.25.0
 	github.com/migadu/go-pop3 v0.1.4
 	github.com/naust-mail/naust-jmap/core v0.4.2
+	github.com/naust-mail/naust-jmap/datatypes/mail v0.3.3
 )
 
 require (

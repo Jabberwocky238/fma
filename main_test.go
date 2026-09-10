@@ -26,8 +26,10 @@ import (
 
 	"github.com/emersion/go-sasl"
 	smtp "github.com/emersion/go-smtp"
+	jmap "github.com/naust-mail/naust-jmap/core/jmap"
 	jbackend "github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/backendtest"
+	"slices"
 )
 
 // Outbound Test
@@ -332,8 +334,8 @@ func TestConfigDefaultsAndFlagPrecedence(t *testing.T) {
 	if c.Domain != "example.org" || c.OutboundMode != "direct" || c.QueueRetry != 2*time.Second || c.SMTPSAddr != "127.0.0.1:2465" || c.POP3SAddr != "127.0.0.1:1995" {
 		t.Fatal("configuration defaults or flag precedence changed")
 	}
-	if len(calls) != 13 {
-		t.Fatalf("expected 13 environment inputs, got %d", len(calls))
+	if len(calls) != 14 {
+		t.Fatalf("expected 14 environment inputs, got %d", len(calls))
 	}
 	for key, count := range calls {
 		if count != 1 {
@@ -1384,4 +1386,47 @@ func TestJMAPS3BackendContract(t *testing.T) {
 			return &jmapBackend{key: b.key, store: b.store}
 		},
 	})
+}
+
+func TestJMAPSharedMailbox(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
+	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	body := []byte("From: alice@t12e.cc\r\nTo: alice@t12e.cc\r\nSubject: shared\r\nMessage-ID: <shared@t12e.cc>\r\n\r\nhello\r\n")
+	checkError(t, appendMessage("alice", body, nil, time.Now(), false))
+	old := useJMAP
+	useJMAP = true
+	t.Cleanup(func() { useJMAP = old })
+	a, err := openJMAPAccount(context.Background(), "alice")
+	checkError(t, err)
+	result, err := a.call(context.Background(), "Email/query", map[string]any{})
+	checkError(t, err)
+	ids := jvalue[[]jmap.Id](result, "ids")
+	if len(ids) != 1 {
+		t.Fatalf("bootstrap ids: %s", result)
+	}
+	stored, err := messages("alice")
+	checkError(t, err)
+	if len(stored) != 1 || stored[0].Uid != 1 || !bytes.Equal(stored[0].Body, body) {
+		t.Fatalf("shared mailbox: %+v", stored)
+	}
+	_, err = a.call(context.Background(), "Email/set", map[string]any{"update": map[jmap.Id]any{ids[0]: map[string]any{"keywords/$seen": true}}})
+	checkError(t, err)
+	stored, err = messages("alice")
+	checkError(t, err)
+	if !slices.Contains(stored[0].Flags, imap.SeenFlag) {
+		t.Fatal("JMAP flags not visible in IMAP")
+	}
+	checkError(t, appendMessage("alice", body, nil, time.Now(), false))
+	stored, err = messages("alice")
+	checkError(t, err)
+	if len(stored) != 2 || stored[1].Uid != 2 {
+		t.Fatalf("append: %+v", stored)
+	}
+	checkError(t, removeMessage("alice", 1))
+	result, err = a.call(context.Background(), "Email/query", map[string]any{})
+	checkError(t, err)
+	if len(jvalue[[]jmap.Id](result, "ids")) != 1 {
+		t.Fatal("POP/IMAP deletion not visible in JMAP")
+	}
 }
