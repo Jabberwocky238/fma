@@ -56,7 +56,10 @@ import (
 	"github.com/emersion/go-imap/backend/memory"
 	"github.com/emersion/go-imap/responses"
 	"github.com/emersion/go-imap/server"
+	imap2 "github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-message"
+	msgtext "github.com/emersion/go-message/textproto"
 	"github.com/emersion/go-sasl"
 	smtp "github.com/emersion/go-smtp"
 	"github.com/migadu/go-pop3/pop3"
@@ -371,12 +374,10 @@ func run() error {
 		l := listeners[i]
 		jobs = append(jobs, func() error { return s.Serve(l) })
 	}
-	im := server.New(imapBackend{})
-	im.ErrorLog = slog.NewLogLogger(logger.Handler(), slog.LevelError)
-	im.Enable(mailboxExtension{})
-	im.TLSConfig = cfg
-	im.MaxLiteralSize = 25 << 20
-	im.AutoLogout = 30 * time.Minute
+	im := imapserver.New(&imapserver.Options{TLSConfig: cfg, Logger: slog.NewLogLogger(logger.Handler(), slog.LevelError), Caps: imap2.CapSet{imap2.CapIMAP4rev1: {}, imap2.CapUIDPlus: {}, imap2.CapSpecialUse: {}}, NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+		ctx, cancel := context.WithCancel(ctx)
+		return &imapStreamSession{ctx: ctx, cancel: cancel}, nil, nil
+	}})
 	web := &http.Server{ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError), ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(serveJMAP)}
 	pop, pops := newPOPServer(cfg), newPOPServer(cfg)
 	closers = append(closers, im, web, pop, pops)
@@ -1599,6 +1600,7 @@ type popMailbox struct {
 	loginID string
 	user    string
 	msgs    []*memory.Message
+	refs    map[uint32]jmapBlobRef
 	deleted map[int]bool
 	held    *sync.Mutex
 }
@@ -1629,6 +1631,12 @@ func (p *popMailbox) Login(ctx context.Context, user, password string) error {
 		lock.Unlock()
 		return &pop3server.Error{Code: "SYS/TEMP", Message: "storage unavailable"}
 	}
+	refs, err := mailBlobRefs(ctx, user)
+	if err != nil {
+		lock.Unlock()
+		return err
+	}
+	p.refs = refs
 	p.loginID, p.user, p.msgs, p.held = account.LoginID, user, snapshot.Messages, lock
 	return nil
 }
@@ -1671,12 +1679,12 @@ func (p *popMailbox) List(ctx context.Context, n int) ([]pop3.MessageInfo, error
 		if err != nil {
 			return nil, err
 		}
-		return []pop3.MessageInfo{{Num: n, Size: int64(len(m.Body))}}, nil
+		return []pop3.MessageInfo{{Num: n, Size: storedMessageSize(m, p.refs)}}, nil
 	}
 	var result []pop3.MessageInfo
 	for i, m := range p.msgs {
 		if !p.deleted[i+1] {
-			result = append(result, pop3.MessageInfo{Num: i + 1, Size: int64(len(m.Body))})
+			result = append(result, pop3.MessageInfo{Num: i + 1, Size: storedMessageSize(m, p.refs)})
 		}
 	}
 	return result, nil
@@ -1702,7 +1710,8 @@ func (p *popMailbox) Retr(ctx context.Context, n int) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	return io.NopCloser(bytes.NewReader(m.Body)), nil
+	r, _, err := openStoredMessage(ctx, m, p.refs)
+	return r, err
 }
 func (p *popMailbox) Top(ctx context.Context, n, lines int) (io.ReadCloser, error) {
 	m, err := p.message(ctx, n)
@@ -1712,22 +1721,40 @@ func (p *popMailbox) Top(ctx context.Context, n, lines int) (io.ReadCloser, erro
 	if lines < 0 {
 		return nil, fmt.Errorf("invalid line count")
 	}
-	r := bufio.NewReader(bytes.NewReader(m.Body))
-	var result bytes.Buffer
-	inBody := false
-	for !inBody || lines > 0 {
-		line, err := r.ReadBytes('\n')
-		result.Write(line)
-		if inBody {
-			lines--
-		} else if len(bytes.TrimRight(line, "\r\n")) == 0 {
-			inBody = true
-		}
-		if err != nil {
-			break
-		}
+	r, _, err := openStoredMessage(ctx, m, p.refs)
+	if err != nil {
+		return nil, err
 	}
-	return io.NopCloser(bytes.NewReader(result.Bytes())), nil
+	reader, writer := io.Pipe()
+	go func() {
+		defer r.Close()
+		buffer := bufio.NewReader(r)
+		inBody, fragment := false, false
+		for !inBody || lines > 0 {
+			line, e := buffer.ReadSlice('\n')
+			if _, err := writer.Write(line); err != nil {
+				writer.CloseWithError(err)
+				return
+			}
+			if e != bufio.ErrBufferFull {
+				if inBody {
+					lines--
+				} else if !fragment && len(bytes.TrimRight(line, "\r\n")) == 0 {
+					inBody = true
+				}
+			}
+			fragment = e == bufio.ErrBufferFull
+			if e != nil && e != bufio.ErrBufferFull {
+				if e == io.EOF {
+					e = nil
+				}
+				writer.CloseWithError(e)
+				return
+			}
+		}
+		writer.Close()
+	}()
+	return reader, nil
 }
 func (p *popMailbox) Dele(ctx context.Context, n int) error {
 	if _, err := p.message(ctx, n); err != nil {
@@ -2472,6 +2499,7 @@ func serveQueue(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			notifyIMAP()
 		}
 	}
 }
@@ -2748,6 +2776,9 @@ func (b *jmapBackend) WriteBatch(ctx context.Context, batch *jbackend.Batch) err
 			err = b.store.(versionedStore).Swap(b.key, data, etag)
 		}
 		if !errors.Is(err, fs.ErrExist) {
+			if err == nil {
+				notifyIMAP()
+			}
 			return err
 		}
 	}
@@ -2809,7 +2840,22 @@ func (s jmapBlobs) Open(ctx context.Context, acct, id jmap.Id) (io.ReadCloser, i
 	}
 	r, size, err := openObject(ctx, s.store, key)
 	if errors.Is(err, fs.ErrNotExist) {
-		err = jblob.ErrNotFound
+		data, e := s.store.Get(key + ".part")
+		if errors.Is(e, fs.ErrNotExist) {
+			return nil, 0, jblob.ErrNotFound
+		}
+		if e != nil {
+			return nil, 0, e
+		}
+		var part jmapPartManifest
+		if e = json.Unmarshal(data, &part); e != nil {
+			return nil, 0, e
+		}
+		if part.Source == id || part.Size < 0 || part.Size > maxAttachmentSize {
+			return nil, 0, fmt.Errorf("invalid attachment reference")
+		}
+		r, e = s.openPart(ctx, acct, part)
+		return r, part.Size, e
 	}
 	return r, size, err
 }
@@ -3264,16 +3310,8 @@ func (a *jmapAccount) messages(ctx context.Context, key string) ([]*memory.Messa
 				return nil, nil, err
 			}
 		}
-		r, size, err := a.blobs.Open(ctx, a.id, jvalue[jmap.Id](email, "blobId"))
-		if err != nil {
-			return nil, nil, err
-		}
-		body, err := io.ReadAll(r)
-		r.Close()
-		if err != nil {
-			return nil, nil, err
-		}
-		result = append(result, &memory.Message{Uid: uid, Date: jvalue[time.Time](email, "receivedAt"), Size: uint32(size), Flags: jmapFlags(jvalue[map[string]bool](email, "keywords")), Body: body})
+		size := jvalue[int64](email, "size")
+		result = append(result, &memory.Message{Uid: uid, Date: jvalue[time.Time](email, "receivedAt"), Size: uint32(min(size, int64(^uint32(0)))), Flags: jmapFlags(jvalue[map[string]bool](email, "keywords"))})
 		ids[uid] = id
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Uid < result[j].Uid })
@@ -3847,7 +3885,7 @@ func (a *jmapAccount) materializePart(ctx context.Context, id jmap.Id, uploader 
 			r.Close()
 			continue
 		}
-		part, found, err := jmapFindPart(ctx, textproto.MIMEHeader(msg.Header), msg.Body, id, 0)
+		part, found, err := a.findPart(ctx, textproto.MIMEHeader(msg.Header), msg.Body, id, jvalue[jmap.Id](email, "blobId"), nil)
 		r.Close()
 		if err != nil {
 			return err
@@ -3855,67 +3893,153 @@ func (a *jmapAccount) materializePart(ctx context.Context, id jmap.Id, uploader 
 		if !found {
 			continue
 		}
-		bw, err := a.blobs.Create(ctx, a.id)
-		if err != nil {
-			return err
-		}
-		defer bw.Abort()
-		if _, err = bw.Write(part); err != nil {
-			return err
-		}
-		_, err = a.db.FinalizeBlobUpload(ctx, a.id, bw, uploader, time.Now())
+		_, err = a.db.FinalizeBlobUpload(ctx, a.id, jmapPartWriter{store: a.blobs, account: a.id, id: id, part: part}, uploader, time.Now())
 		return err
 	}
 	return jblob.ErrNotFound
 }
-func jmapFindPart(ctx context.Context, h textproto.MIMEHeader, r io.Reader, wanted jmap.Id, depth int) ([]byte, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, false, err
+
+// Decoded attachments are virtual views of the immutable original MIME blob.
+// Store a small locator instead of a second multi-gigabyte copy.
+type jmapPartManifest struct {
+	Source jmap.Id `json:"source"`
+	Path   []int   `json:"path"`
+	Size   int64   `json:"size"`
+}
+type jmapPartWriter struct {
+	store       jmapBlobs
+	account, id jmap.Id
+	part        jmapPartManifest
+}
+
+func (w jmapPartWriter) Write([]byte) (int, error) { return 0, fmt.Errorf("immutable part reference") }
+func (w jmapPartWriter) ID() jmap.Id               { return w.id }
+func (w jmapPartWriter) Abort() error              { return nil }
+func (w jmapPartWriter) Commit() (jmap.Id, error) {
+	key, err := w.store.key(w.account, w.id)
+	if err != nil {
+		return "", err
 	}
-	if depth > 30 {
-		return nil, false, fmt.Errorf("MIME nesting exceeds 30")
+	data, err := json.Marshal(w.part)
+	if err != nil {
+		return "", err
 	}
+	err = w.store.store.Create(key+".part", data)
+	if errors.Is(err, fs.ErrExist) {
+		err = nil
+	}
+	return w.id, err
+}
+func decodeMIME(r io.Reader, h textproto.MIMEHeader) io.Reader {
 	switch strings.ToLower(h.Get("Content-Transfer-Encoding")) {
 	case "base64":
-		r = base64.NewDecoder(base64.StdEncoding, r)
+		return base64.NewDecoder(base64.StdEncoding, r)
 	case "quoted-printable":
-		r = quotedprintable.NewReader(r)
+		return quotedprintable.NewReader(r)
 	}
+	return r
+}
+func (s jmapBlobs) openPart(ctx context.Context, acct jmap.Id, part jmapPartManifest) (io.ReadCloser, error) {
+	key, err := s.key(acct, part.Source)
+	if err != nil {
+		return nil, err
+	}
+	// A locator can only refer to a physical original, never another locator.
+	source, _, err := openObject(ctx, s.store, key)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (io.ReadCloser, error) { source.Close(); return nil, err }
+	msg, err := mail.ReadMessage(source)
+	if err != nil {
+		return fail(err)
+	}
+	h := textproto.MIMEHeader(msg.Header)
+	body := msg.Body
+	if len(part.Path) > 30 {
+		return fail(fmt.Errorf("MIME nesting exceeds 30"))
+	}
+	for _, index := range part.Path {
+		body = decodeMIME(body, h)
+		if index == 0 {
+			msg, err = mail.ReadMessage(body)
+			if err != nil {
+				return fail(err)
+			}
+			h = textproto.MIMEHeader(msg.Header)
+			body = msg.Body
+			continue
+		}
+		_, params, err := mime.ParseMediaType(h.Get("Content-Type"))
+		if err != nil {
+			return fail(err)
+		}
+		parts := multipart.NewReader(body, params["boundary"])
+		for n := 1; n <= index; n++ {
+			p, err := parts.NextRawPart()
+			if err != nil {
+				return fail(err)
+			}
+			h = p.Header
+			body = p
+		}
+	}
+	return &sectionReadCloser{Reader: decodeMIME(body, h), Closer: source}, nil
+}
+func (a *jmapAccount) findPart(ctx context.Context, h textproto.MIMEHeader, r io.Reader, wanted, source jmap.Id, indices []int) (jmapPartManifest, bool, error) {
+	var empty jmapPartManifest
+	if err := ctx.Err(); err != nil {
+		return empty, false, err
+	}
+	if len(indices) > 30 {
+		return empty, false, fmt.Errorf("MIME nesting exceeds 30")
+	}
+	r = decodeMIME(r, h)
 	typ, params, err := mime.ParseMediaType(h.Get("Content-Type"))
 	if err != nil {
 		typ = "text/plain"
 	}
 	if strings.HasPrefix(typ, "multipart/") {
 		parts := multipart.NewReader(r, params["boundary"])
-		for {
+		for index := 1; ; index++ {
 			p, err := parts.NextRawPart()
-			if errors.Is(err, io.EOF) {
-				return nil, false, nil
+			if err == io.EOF {
+				return empty, false, nil
 			}
 			if err != nil {
-				return nil, false, err
+				return empty, false, err
 			}
-			data, found, err := jmapFindPart(ctx, p.Header, p, wanted, depth+1)
+			part, found, err := a.findPart(ctx, p.Header, p, wanted, source, append(slices.Clone(indices), index))
 			p.Close()
 			if found || err != nil {
-				return data, found, err
+				return part, found, err
 			}
 		}
 	}
-	data, err := readMail(r)
+	digest := sha256.New()
+	size, err := copyStream(ctx, digest, io.LimitReader(r, maxAttachmentSize+1))
 	if err != nil {
-		return nil, false, err
+		return empty, false, err
 	}
-	if jblob.IdFor(data) == wanted {
-		return data, true, nil
+	if size > maxAttachmentSize {
+		return empty, false, fmt.Errorf("attachment exceeds 4 GiB")
 	}
-	if typ == "message/rfc822" {
-		msg, err := mail.ReadMessage(bytes.NewReader(data))
+	part := jmapPartManifest{Source: source, Path: indices, Size: size}
+	if jmap.Id("G"+base64.RawURLEncoding.EncodeToString(digest.Sum(nil))) == wanted {
+		return part, true, nil
+	}
+	if typ == "message/rfc822" || typ == "message/global" {
+		reader, err := a.blobs.openPart(ctx, a.id, part)
+		if err != nil {
+			return empty, false, err
+		}
+		defer reader.Close()
+		msg, err := mail.ReadMessage(reader)
 		if err == nil {
-			return jmapFindPart(ctx, textproto.MIMEHeader(msg.Header), msg.Body, wanted, depth+1)
+			return a.findPart(ctx, textproto.MIMEHeader(msg.Header), msg.Body, wanted, source, append(slices.Clone(indices), 0))
 		}
 	}
-	return nil, false, nil
+	return empty, false, nil
 }
 func jmapReferencedBlobs(value any, ids map[jmap.Id]bool) {
 	switch value := value.(type) {
@@ -4606,4 +4730,783 @@ func copyStream(ctx context.Context, dst io.Writer, src io.Reader) (int64, error
 	}
 	defer copyBufferPool.Put(buffer)
 	return io.CopyBuffer(dst, src, buffer.AvailableBuffer()[:buffer.Cap()])
+}
+
+// Protocol snapshots contain metadata only. Blob references remain stable even
+// when another session changes mailbox membership while a download is active.
+func mailBlobRefs(ctx context.Context, key string) (map[uint32]jmapBlobRef, error) {
+	if !useJMAP {
+		return nil, nil
+	}
+	a, err := jmapForKey(key)
+	if err != nil {
+		return nil, err
+	}
+	box, err := a.mailbox(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	emails, err := a.all(ctx, "Email")
+	if err != nil {
+		return nil, err
+	}
+	refs := make(map[uint32]jmapBlobRef)
+	for _, email := range emails {
+		if !jvalue[map[jmap.Id]bool](email, "mailboxIds")[box] {
+			continue
+		}
+		uid := jvalue[map[jmap.Id]uint32](email, "fmaUIDs")[box]
+		if uid != 0 {
+			refs[uid] = jmapBlobRef{AccountID: a.id, BlobID: jvalue[jmap.Id](email, "blobId"), Size: jvalue[int64](email, "size")}
+		}
+	}
+	return refs, nil
+}
+func storedMessageSize(m *memory.Message, refs map[uint32]jmapBlobRef) int64 {
+	if ref, ok := refs[m.Uid]; ok {
+		return ref.Size
+	}
+	return int64(len(m.Body))
+}
+func openStoredMessage(ctx context.Context, m *memory.Message, refs map[uint32]jmapBlobRef) (io.ReadCloser, int64, error) {
+	if ref, ok := refs[m.Uid]; ok {
+		return (jmapBlobs{store: objects}).Open(ctx, ref.AccountID, ref.BlobID)
+	}
+	if useJMAP {
+		return nil, 0, fs.ErrNotExist
+	}
+	return io.NopCloser(bytes.NewReader(m.Body)), int64(len(m.Body)), nil
+}
+
+// IMAP v2 parses APPEND as a LiteralReader; the v1 parser allocates the
+// entire literal before calling the backend. Reuse mailbox mutations while
+// keeping payload IO out of metadata snapshots and response buffers.
+type imapStreamSession struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	user     *imapUser
+	box      *inbox
+	refs     map[uint32]jmapBlobRef
+	readOnly bool
+}
+
+func (s *imapStreamSession) Close() error { s.cancel(); return nil }
+func (s *imapStreamSession) Login(name, password string) error {
+	account, err := authenticateAccount(name, password)
+	if err != nil {
+		return imapserver.ErrAuthFailed
+	}
+	s.user = &imapUser{name: account.RootID, loginID: account.LoginID}
+	return nil
+}
+func imapFlags2(flags []string) []imap2.Flag {
+	out := make([]imap2.Flag, len(flags))
+	for i, f := range flags {
+		out[i] = imap2.Flag(f)
+	}
+	return out
+}
+func imapFlags1(flags []imap2.Flag) []string {
+	out := make([]string, len(flags))
+	for i, f := range flags {
+		out[i] = string(f)
+	}
+	return out
+}
+func (s *imapStreamSession) Select(name string, opts *imap2.SelectOptions) (*imap2.SelectData, error) {
+	mailbox, err := s.user.GetMailbox(name)
+	if err != nil {
+		return nil, err
+	}
+	s.box = mailbox.(*inbox)
+	s.readOnly = opts.ReadOnly
+	s.refs, err = mailBlobRefs(s.ctx, s.box.key())
+	if err != nil {
+		return nil, err
+	}
+	status, err := s.box.Status([]imap.StatusItem{imap.StatusMessages})
+	if err != nil {
+		return nil, err
+	}
+	data := &imap2.SelectData{Flags: imapFlags2(status.Flags), PermanentFlags: imapFlags2(status.PermanentFlags), NumMessages: uint32(len(s.box.Messages)), UIDNext: imap2.UID(s.box.next), UIDValidity: s.box.meta.Validity}
+	for i, m := range s.box.Messages {
+		if !slices.Contains(m.Flags, imap.SeenFlag) {
+			data.FirstUnseenSeqNum = uint32(i + 1)
+			break
+		}
+	}
+	return data, nil
+}
+func (s *imapStreamSession) Create(name string, _ *imap2.CreateOptions) error {
+	return s.user.CreateMailbox(name)
+}
+func (s *imapStreamSession) Delete(name string) error { return s.user.DeleteMailbox(name) }
+func (s *imapStreamSession) Rename(old, name string, _ *imap2.RenameOptions) error {
+	return s.user.RenameMailbox(old, name)
+}
+func (s *imapStreamSession) Subscribe(name string) error   { return s.subscribe(name, true) }
+func (s *imapStreamSession) Unsubscribe(name string) error { return s.subscribe(name, false) }
+func (s *imapStreamSession) subscribe(name string, value bool) error {
+	box, err := s.user.GetMailbox(name)
+	if err != nil {
+		return err
+	}
+	return box.SetSubscribed(value)
+}
+func (s *imapStreamSession) List(w *imapserver.ListWriter, ref string, patterns []string, opts *imap2.ListOptions) error {
+	boxes, err := s.user.ListMailboxes(opts.SelectSubscribed)
+	if err != nil {
+		return err
+	}
+	for _, box := range boxes {
+		matched := false
+		for _, pattern := range patterns {
+			if imapserver.MatchList(box.Name(), '/', ref, pattern) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		info, err := box.Info()
+		if err != nil {
+			return err
+		}
+		data := &imap2.ListData{Mailbox: box.Name(), Delim: '/'}
+		for _, attr := range info.Attributes {
+			data.Attrs = append(data.Attrs, imap2.MailboxAttr(attr))
+		}
+		if opts.ReturnStatus != nil {
+			data.Status, err = s.Status(box.Name(), opts.ReturnStatus)
+			if err != nil {
+				return err
+			}
+		}
+		if err = w.WriteList(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (s *imapStreamSession) Status(name string, opts *imap2.StatusOptions) (*imap2.StatusData, error) {
+	mailbox, err := s.user.GetMailbox(name)
+	if err != nil {
+		return nil, err
+	}
+	b := mailbox.(*inbox)
+	status, err := b.Status([]imap.StatusItem{imap.StatusMessages})
+	if err != nil {
+		return nil, err
+	}
+	data := &imap2.StatusData{Mailbox: b.name, UIDNext: imap2.UID(b.next), UIDValidity: b.meta.Validity}
+	count := uint32(len(b.Messages))
+	recent := uint32(0)
+	if opts.NumMessages {
+		data.NumMessages = &count
+	}
+	if opts.NumRecent {
+		data.NumRecent = &recent
+	}
+	if opts.NumUnseen {
+		data.NumUnseen = &status.Unseen
+	}
+	return data, nil
+}
+func (s *imapStreamSession) AppendLimit() uint32 { return ^uint32(0) }
+func (s *imapStreamSession) Append(name string, r imap2.LiteralReader, opts *imap2.AppendOptions) (*imap2.AppendData, error) {
+	meta, err := getFolder(s.user.name, canonicalFolder(name))
+	if err != nil {
+		return nil, err
+	}
+	ref, err := storeMailStream(s.ctx, s.user.name, r)
+	if err != nil {
+		return nil, err
+	}
+	a, err := jmapForKey(meta.Key)
+	if err != nil {
+		return nil, err
+	}
+	box, err := a.mailbox(s.ctx, meta.Key)
+	if err != nil {
+		return nil, err
+	}
+	id, err := a.importStoredMail(s.ctx, box, ref, imapFlags1(opts.Flags), opts.Time, false)
+	if err != nil {
+		return nil, err
+	}
+	uid, err := a.uid(s.ctx, box, id)
+	return &imap2.AppendData{UID: imap2.UID(uid), UIDValidity: meta.Validity}, err
+}
+func (s *imapStreamSession) Unselect() error { s.box = nil; s.refs = nil; return nil }
+func (s *imapStreamSession) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
+	if s.box == nil {
+		return nil
+	}
+	old := s.box.Messages
+	oldNext := s.box.next
+	if err := s.box.Poll(); err != nil {
+		return err
+	}
+	now := s.box.Messages
+	byUID := map[uint32]*memory.Message{}
+	for _, m := range now {
+		byUID[m.Uid] = m
+	}
+	var removed []uint32
+	for i := len(old) - 1; i >= 0; i-- {
+		if byUID[old[i].Uid] == nil {
+			removed = append(removed, uint32(i+1))
+		}
+	}
+	if len(removed) > 0 && !allowExpunge {
+		s.box.Messages = old
+		s.box.next = oldNext
+		return nil
+	}
+	refs, err := mailBlobRefs(s.ctx, s.box.key())
+	if err != nil {
+		return err
+	}
+	s.refs = refs
+	for _, seq := range removed {
+		if err = w.WriteExpunge(seq); err != nil {
+			return err
+		}
+	}
+	if len(now) != len(old) {
+		if err = w.WriteNumMessages(uint32(len(now))); err != nil {
+			return err
+		}
+	}
+	oldFlags := map[uint32][]string{}
+	for _, m := range old {
+		oldFlags[m.Uid] = m.Flags
+	}
+	for i, m := range now {
+		if previous, ok := oldFlags[m.Uid]; ok && !slices.Equal(previous, m.Flags) {
+			if err = w.WriteMessageFlags(uint32(i+1), imap2.UID(m.Uid), imapFlags2(m.Flags)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+func (s *imapStreamSession) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
+	for {
+		changed := imapChangeSignal()
+		if err := s.Poll(w, true); err != nil {
+			return err
+		}
+		select {
+		case <-stop:
+			return nil
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-changed:
+		}
+	}
+}
+func (s *imapStreamSession) Expunge(w *imapserver.ExpungeWriter, uids *imap2.UIDSet) error {
+	if s.readOnly {
+		return nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i := len(s.box.Messages) - 1; i >= 0; i-- {
+		m := s.box.Messages[i]
+		if !slices.Contains(m.Flags, imap.DeletedFlag) || uids != nil && !uids.Contains(imap2.UID(m.Uid)) {
+			continue
+		}
+		if err := removeMessage(s.box.key(), m.Uid); err != nil {
+			return err
+		}
+		s.box.Messages = slices.Delete(s.box.Messages, i, i+1)
+		delete(s.refs, m.Uid)
+		if err := w.WriteExpunge(uint32(i + 1)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func imapSet1(set imap2.NumSet) (bool, *imap.SeqSet, error) {
+	_, uid := set.(imap2.UIDSet)
+	parsed, err := imap.ParseSeqSet(set.String())
+	return uid, parsed, err
+}
+func (s *imapStreamSession) Store(w *imapserver.FetchWriter, set imap2.NumSet, flags *imap2.StoreFlags, _ *imap2.StoreOptions) error {
+	if s.readOnly {
+		return fmt.Errorf("mailbox is read-only")
+	}
+	uid, seq, err := imapSet1(set)
+	if err != nil {
+		return err
+	}
+	op := imap.SetFlags
+	if flags.Op == imap2.StoreFlagsAdd {
+		op = imap.AddFlags
+	} else if flags.Op == imap2.StoreFlagsDel {
+		op = imap.RemoveFlags
+	}
+	if err = s.box.UpdateMessagesFlags(uid, seq, op, imapFlags1(flags.Flags)); err != nil {
+		return err
+	}
+	if !flags.Silent {
+		return s.Fetch(w, set, &imap2.FetchOptions{Flags: true, UID: uid})
+	}
+	return nil
+}
+func (s *imapStreamSession) Copy(set imap2.NumSet, dest string) (*imap2.CopyData, error) {
+	uid, seq, err := imapSet1(set)
+	if err != nil {
+		return nil, err
+	}
+	meta, err := getFolder(s.user.name, canonicalFolder(dest))
+	if err != nil {
+		return nil, err
+	}
+	a, err := jmapForKey(meta.Key)
+	if err != nil {
+		return nil, err
+	}
+	box, err := a.mailbox(s.ctx, meta.Key)
+	if err != nil {
+		return nil, err
+	}
+	data := &imap2.CopyData{UIDValidity: meta.Validity}
+	for _, m := range s.box.selected(uid, seq) {
+		ref, ok := s.refs[m.Uid]
+		if !ok {
+			return nil, fs.ErrNotExist
+		}
+		id, err := a.importStoredMail(s.ctx, box, &ref, m.Flags, m.Date, false)
+		if err != nil {
+			return nil, err
+		}
+		n, err := a.uid(s.ctx, box, id)
+		if err != nil {
+			return nil, err
+		}
+		data.SourceUIDs.AddNum(imap2.UID(m.Uid))
+		data.DestUIDs.AddNum(imap2.UID(n))
+	}
+	return data, nil
+}
+func (s *imapStreamSession) Fetch(w *imapserver.FetchWriter, set imap2.NumSet, opts *imap2.FetchOptions) error {
+	uid, seq, err := imapSet1(set)
+	if err != nil {
+		return err
+	}
+	s.box.resolve(seq, uid)
+	for i, m := range s.box.Messages {
+		n := uint32(i + 1)
+		selected := n
+		if uid {
+			selected = m.Uid
+		}
+		if !seq.Contains(selected) {
+			continue
+		}
+		if !s.readOnly {
+			for _, section := range opts.BodySection {
+				if !section.Peek {
+					single := new(imap.SeqSet)
+					single.AddNum(m.Uid)
+					if err = s.box.UpdateMessagesFlags(true, single, imap.AddFlags, []string{imap.SeenFlag}); err != nil {
+						return err
+					}
+					break
+				}
+			}
+		}
+		response := w.CreateMessage(n)
+		if opts.UID || uid {
+			response.WriteUID(imap2.UID(m.Uid))
+		}
+		if opts.Flags {
+			response.WriteFlags(imapFlags2(m.Flags))
+		}
+		if opts.InternalDate {
+			response.WriteInternalDate(m.Date)
+		}
+		if opts.RFC822Size {
+			response.WriteRFC822Size(storedMessageSize(m, s.refs))
+		}
+		if opts.Envelope || opts.BodyStructure != nil {
+			r, _, err := openStoredMessage(s.ctx, m, s.refs)
+			if err != nil {
+				return err
+			}
+			br := bufio.NewReader(r)
+			h, err := msgtext.ReadHeader(br)
+			if err != nil {
+				r.Close()
+				return err
+			}
+			if opts.Envelope {
+				response.WriteEnvelope(imapserver.ExtractEnvelope(h))
+			}
+			if opts.BodyStructure != nil {
+				bs, err := backendutil.FetchBodyStructure(h, br, opts.BodyStructure.Extended)
+				if err != nil {
+					r.Close()
+					return err
+				}
+				response.WriteBodyStructure(imapBodyStructure2(bs))
+			}
+			r.Close()
+		}
+		for _, section := range opts.BodySection {
+			open := func() (io.ReadCloser, int64, error) { return openIMAPSection(s.ctx, m, s.refs, section) }
+			r, size, err := open()
+			if err != nil {
+				return err
+			}
+			if size < 0 {
+				size, err = copyStream(s.ctx, io.Discard, r)
+				r.Close()
+				if err != nil {
+					return err
+				}
+				r, _, err = open()
+				if err != nil {
+					return err
+				}
+			}
+			dst := response.WriteBodySection(section, size)
+			_, err = copyStream(s.ctx, dst, r)
+			r.Close()
+			closeErr := dst.Close()
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		}
+		if err = response.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func imapBodyStructure2(bs *imap.BodyStructure) imap2.BodyStructure {
+	disp := &imap2.BodyStructureDisposition{Value: bs.Disposition, Params: bs.DispositionParams}
+	if bs.Disposition == "" {
+		disp = nil
+	}
+	if bs.MIMEType == "multipart" {
+		out := &imap2.BodyStructureMultiPart{Subtype: bs.MIMESubType, Extended: &imap2.BodyStructureMultiPartExt{Params: bs.Params, Disposition: disp, Language: bs.Language, Location: strings.Join(bs.Location, " ")}}
+		for _, part := range bs.Parts {
+			out.Children = append(out.Children, imapBodyStructure2(part))
+		}
+		return out
+	}
+	out := &imap2.BodyStructureSinglePart{Type: bs.MIMEType, Subtype: bs.MIMESubType, Params: bs.Params, ID: bs.Id, Description: bs.Description, Encoding: bs.Encoding, Size: bs.Size, Extended: &imap2.BodyStructureSinglePartExt{Disposition: disp, Language: bs.Language, Location: strings.Join(bs.Location, " ")}}
+	if bs.MIMEType == "text" {
+		out.Text = &imap2.BodyStructureText{NumLines: int64(bs.Lines)}
+	}
+	if bs.BodyStructure != nil {
+		envelope := &imap2.Envelope{}
+		if bs.Envelope != nil {
+			envelope.Subject = bs.Envelope.Subject
+			envelope.Date = bs.Envelope.Date
+		}
+		out.MessageRFC822 = &imap2.BodyStructureMessageRFC822{Envelope: envelope, BodyStructure: imapBodyStructure2(bs.BodyStructure), NumLines: int64(bs.Lines)}
+	}
+	return out
+}
+
+type sectionReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+func openIMAPSection(ctx context.Context, m *memory.Message, refs map[uint32]jmapBlobRef, item *imap2.FetchItemBodySection) (io.ReadCloser, int64, error) {
+	source, size, err := openStoredMessage(ctx, m, refs)
+	if err != nil {
+		return nil, 0, err
+	}
+	var body io.Reader = source
+	fail := func(err error) (io.ReadCloser, int64, error) { source.Close(); return nil, 0, err }
+	if len(item.Part) > 0 || item.Specifier != "" || len(item.HeaderFields) > 0 || len(item.HeaderFieldsNot) > 0 {
+		br := bufio.NewReader(source)
+		h, err := msgtext.ReadHeader(br)
+		if err != nil {
+			return fail(err)
+		}
+		body = br
+		for i, n := range item.Part {
+			typ, params, _ := mime.ParseMediaType(h.Get("Content-Type"))
+			if typ == "message/rfc822" || typ == "message/global" {
+				nested := bufio.NewReader(body)
+				h, err = msgtext.ReadHeader(nested)
+				if err != nil {
+					return fail(err)
+				}
+				body = nested
+				typ, params, _ = mime.ParseMediaType(h.Get("Content-Type"))
+			}
+			if !strings.HasPrefix(typ, "multipart/") {
+				if i == 0 && n == 1 {
+					continue
+				}
+				source.Close()
+				return io.NopCloser(strings.NewReader("")), 0, nil
+			}
+			parts := msgtext.NewMultipartReader(body, params["boundary"])
+			for j := 1; j <= n; j++ {
+				part, err := parts.NextPart()
+				if errors.Is(err, io.EOF) {
+					source.Close()
+					return io.NopCloser(strings.NewReader("")), 0, nil
+				}
+				if err != nil {
+					return fail(err)
+				}
+				h = part.Header
+				body = part
+			}
+		}
+		if len(item.Part) > 0 && (item.Specifier == imap2.PartSpecifierHeader || item.Specifier == imap2.PartSpecifierText) {
+			typ, _, _ := mime.ParseMediaType(h.Get("Content-Type"))
+			if typ == "message/rfc822" || typ == "message/global" {
+				nested := bufio.NewReader(body)
+				h, err = msgtext.ReadHeader(nested)
+				if err != nil {
+					return fail(err)
+				}
+				body = nested
+			}
+		}
+		if len(item.HeaderFields) > 0 {
+			fields := map[string]bool{}
+			for _, k := range item.HeaderFields {
+				fields[strings.ToLower(k)] = true
+			}
+			for f := h.Fields(); f.Next(); {
+				if !fields[strings.ToLower(f.Key())] {
+					f.Del()
+				}
+			}
+		}
+		for _, k := range item.HeaderFieldsNot {
+			h.Del(k)
+		}
+		header := new(bytes.Buffer)
+		writeHeader := item.Specifier == imap2.PartSpecifierHeader || item.Specifier == imap2.PartSpecifierMIME || item.Specifier == "" && len(item.Part) == 0
+		if writeHeader {
+			if err = msgtext.WriteHeader(header, h); err != nil {
+				return fail(err)
+			}
+		}
+		if item.Specifier == imap2.PartSpecifierHeader || item.Specifier == imap2.PartSpecifierMIME {
+			body = header
+			size = int64(header.Len())
+		} else {
+			body = io.MultiReader(header, body)
+			size = -1
+		}
+	}
+	if item.Partial != nil {
+		skip := item.Partial.Offset
+		n, err := io.CopyN(io.Discard, body, skip)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fail(err)
+		}
+		if n < skip {
+			size = 0
+			body = strings.NewReader("")
+		} else {
+			if size >= 0 {
+				size = min(max(0, size-skip), item.Partial.Size)
+			}
+			body = io.LimitReader(body, item.Partial.Size)
+		}
+	}
+	return &sectionReadCloser{Reader: body, Closer: source}, size, nil
+}
+
+func (s *imapStreamSession) Search(kind imapserver.NumKind, c *imap2.SearchCriteria, _ *imap2.SearchOptions) (*imap2.SearchData, error) {
+	result := &imap2.SearchData{}
+	var seqs imap2.SeqSet
+	var uids imap2.UIDSet
+	for i, m := range s.box.Messages {
+		seq := uint32(i + 1)
+		ok, err := s.matchMessage(m, seq, c)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		n := seq
+		if kind == imapserver.NumKindUID {
+			n = m.Uid
+			uids.AddNum(imap2.UID(n))
+		} else {
+			seqs.AddNum(n)
+		}
+		if result.Count == 0 {
+			result.Min = n
+		}
+		result.Max = n
+		result.Count++
+	}
+	if kind == imapserver.NumKindUID {
+		result.All = uids
+	} else {
+		result.All = seqs
+	}
+	return result, nil
+}
+func (s *imapStreamSession) matchMessage(m *memory.Message, seq uint32, c *imap2.SearchCriteria) (bool, error) {
+	for _, sets := range []struct {
+		uid  bool
+		sets []string
+	}{{false, imapSetStrings(c.SeqNum)}, {true, imapSetStrings(c.UID)}} {
+		for _, text := range sets.sets {
+			set, err := imap.ParseSeqSet(text)
+			if err != nil {
+				return false, err
+			}
+			s.box.resolve(set, sets.uid)
+			n := seq
+			if sets.uid {
+				n = m.Uid
+			}
+			if !set.Contains(n) {
+				return false, nil
+			}
+		}
+	}
+	size := storedMessageSize(m, s.refs)
+	if c.Larger > 0 && size <= c.Larger || c.Smaller > 0 && size >= c.Smaller {
+		return false, nil
+	}
+	r, _, err := openStoredMessage(s.ctx, m, s.refs)
+	if err != nil {
+		return false, err
+	}
+	entity, err := message.Read(r)
+	if entity == nil {
+		r.Close()
+		return false, err
+	}
+	r.Close()
+	basic := &imap.SearchCriteria{Since: c.Since, Before: c.Before, SentSince: c.SentSince, SentBefore: c.SentBefore, WithFlags: imapFlags1(c.Flag), WithoutFlags: imapFlags1(c.NotFlag), Header: make(textproto.MIMEHeader)}
+	if !basic.Since.IsZero() {
+		basic.Since = basic.Since.AddDate(0, 0, -1)
+	}
+	for _, h := range c.Header {
+		basic.Header.Add(h.Key, h.Value)
+	}
+	ok, err := backendutil.Match(entity, seq, m.Uid, m.Date, m.Flags, basic)
+	if err != nil || !ok {
+		return false, err
+	}
+	for _, term := range c.Body {
+		ok, err := s.bodyContains(m, term)
+		if err != nil || !ok {
+			return false, err
+		}
+	}
+	for _, term := range c.Text {
+		found := false
+		for h := entity.Header.Fields(); h.Next(); {
+			value, _ := h.Text()
+			if strings.Contains(strings.ToLower(h.Key()+": "+value), strings.ToLower(term)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			ok, err := s.bodyContains(m, term)
+			if err != nil || !ok {
+				return false, err
+			}
+		}
+	}
+	for _, not := range c.Not {
+		ok, err := s.matchMessage(m, seq, &not)
+		if err != nil || ok {
+			return false, err
+		}
+	}
+	for _, pair := range c.Or {
+		one, err := s.matchMessage(m, seq, &pair[0])
+		if err != nil {
+			return false, err
+		}
+		if !one {
+			two, err := s.matchMessage(m, seq, &pair[1])
+			if err != nil || !two {
+				return false, err
+			}
+		}
+	}
+	return true, nil
+}
+func imapSetStrings[T interface{ String() string }](sets []T) []string {
+	out := make([]string, len(sets))
+	for i, set := range sets {
+		out[i] = set.String()
+	}
+	return out
+}
+func (s *imapStreamSession) bodyContains(m *memory.Message, term string) (bool, error) {
+	if term == "" {
+		return true, nil
+	}
+	r, _, err := openStoredMessage(s.ctx, m, s.refs)
+	if err != nil {
+		return false, err
+	}
+	defer r.Close()
+	entity, err := message.Read(r)
+	if entity == nil {
+		return false, err
+	}
+	needle := strings.ToLower(term)
+	buffer, err := copyBufferPool.Get(s.ctx)
+	if err != nil {
+		return false, err
+	}
+	defer copyBufferPool.Put(buffer)
+	chunk := buffer.AvailableBuffer()[:buffer.Cap()]
+	var tail []byte
+	for {
+		n, e := entity.Body.Read(chunk)
+		if n > 0 {
+			data := append(tail, chunk[:n]...)
+			if strings.Contains(strings.ToLower(string(data)), needle) {
+				return true, nil
+			}
+			keep := min(len(data), len(needle)*4+4)
+			tail = append(tail[:0], data[len(data)-keep:]...)
+		}
+		if e == io.EOF {
+			return false, nil
+		}
+		if e != nil {
+			return false, e
+		}
+	}
+}
+
+var imapChanges = struct {
+	sync.Mutex
+	signal chan struct{}
+}{signal: make(chan struct{})}
+
+func imapChangeSignal() <-chan struct{} {
+	imapChanges.Lock()
+	defer imapChanges.Unlock()
+	return imapChanges.signal
+}
+func notifyIMAP() {
+	imapChanges.Lock()
+	close(imapChanges.signal)
+	imapChanges.signal = make(chan struct{})
+	imapChanges.Unlock()
 }

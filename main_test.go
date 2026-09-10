@@ -1410,8 +1410,18 @@ func TestJMAPSharedMailbox(t *testing.T) {
 	}
 	stored, err := messages("alice")
 	checkError(t, err)
-	if len(stored) != 1 || stored[0].Uid != 1 || !bytes.Equal(stored[0].Body, body) {
+	if len(stored) != 1 || stored[0].Uid != 1 || stored[0].Body != nil {
 		t.Fatalf("shared mailbox: %+v", stored)
+	}
+	refs, err := mailBlobRefs(context.Background(), "alice")
+	checkError(t, err)
+	r, _, err := openStoredMessage(context.Background(), stored[0], refs)
+	checkError(t, err)
+	raw, err := io.ReadAll(r)
+	r.Close()
+	checkError(t, err)
+	if !bytes.Equal(raw, body) {
+		t.Fatal("streamed mailbox body differs")
 	}
 	_, err = a.call(context.Background(), "Email/set", map[string]any{"update": map[jmap.Id]any{ids[0]: map[string]any{"keywords/$seen": true}}})
 	checkError(t, err)

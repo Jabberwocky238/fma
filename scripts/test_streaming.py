@@ -68,11 +68,126 @@ class Measurement:
                 'rss_sample_interval_seconds': .05}
 
 
+def mail_benchmark(proc, ports, conn, auth, account, size, block, results):
+    """Real MIME attachment IO, with no full-message client buffers."""
+    import imaplib
+    import smtplib
+    import poplib
+    from contextlib import closing
+    boundary = 'fma-streaming-benchmark-boundary'
+    prefix = (f'From: sender@example.net\r\nTo: alice@t12e.cc\r\nSubject: streaming attachment benchmark\r\n'
+              f'Message-ID: <streaming-benchmark@example.net>\r\nMIME-Version: 1.0\r\n'
+              f'Content-Type: multipart/mixed; boundary="{boundary}"\r\n\r\n'
+              f'--{boundary}\r\nContent-Type: text/plain\r\n\r\nStreaming attachment.\r\n'
+              f'--{boundary}\r\nContent-Type: application/octet-stream\r\n'
+              'Content-Disposition: attachment; filename="large.bin"\r\n'
+              'Content-Transfer-Encoding: base64\r\n\r\n').encode()
+    suffix = f'\r\n--{boundary}--\r\n'.encode()
+    block = block[:len(block) // 57 * 57]
+    encoded = base64.encodebytes(block).replace(b'\n', b'\r\n')
+    def chunks():
+        yield prefix
+        left = size
+        while left:
+            n = min(left, len(block))
+            yield encoded if n == len(block) else base64.encodebytes(block[:n]).replace(b'\n', b'\r\n')
+            left -= n
+        yield suffix
+    raw_hash, attachment_hash, raw_size = hashlib.sha256(), hashlib.sha256(), 0
+    for chunk in chunks():
+        raw_hash.update(chunk); raw_size += len(chunk)
+    left = size
+    while left:
+        n = min(left, len(block)); attachment_hash.update(block[:n]); left -= n
+    results['mail'] = {'attachment_bytes': size, 'mime_bytes': raw_size,
+                       'mime_sha256': raw_hash.hexdigest(), 'attachment_sha256': attachment_hash.hexdigest()}
+    def phase(name, operation):
+        print('Measuring ' + name, flush=True)
+        measure = Measurement(proc.pid)
+        result = operation()
+        results['phases'][name] = measure.finish()
+        print(json.dumps({name: results['phases'][name]}), flush=True)
+        return result
+    def copy_exact(reader, length, expected):
+        digest, count = hashlib.sha256(), 0
+        while count < length:
+            chunk = reader.read(min(1 << 20, length-count))
+            assert chunk, (count, length)
+            digest.update(chunk); count += len(chunk)
+        assert digest.hexdigest() == expected, (digest.hexdigest(), expected)
+    def smtp_upload():
+        with smtplib.SMTP('127.0.0.1', ports['smtp'], timeout=600) as client:
+            client.ehlo()
+            assert client.mail('sender@example.net')[0] == 250
+            assert client.rcpt('alice@t12e.cc')[0] == 250
+            assert client.docmd('DATA')[0] == 354
+            for chunk in chunks(): client.sock.sendall(chunk)
+            client.sock.sendall(b'.\r\n')
+            reply = client.getreply()
+            assert reply[0] == 250, reply
+    phase('smtp_mime_upload', smtp_upload)
+    context = ssl._create_unverified_context()
+    with imaplib.IMAP4_SSL('127.0.0.1', ports['imaps'], ssl_context=context, timeout=600) as client:
+        client.login('alice', 'password')
+        assert client.select('INBOX')[0] == 'OK'
+        uid = client.uid('search', None, 'ALL')[1][0].split()[0]
+        def fetch():
+            tag = client._new_tag()
+            client.send(tag + b' UID FETCH ' + uid + b' (BODY.PEEK[])\r\n')
+            header = client.readline()
+            match = re.search(rb'\{(\d+)\}\r\n$', header)
+            assert match and int(match[1]) == raw_size, header
+            copy_exact(client, raw_size, raw_hash.hexdigest())
+            assert client.readline() == b')\r\n'
+            assert client._get_tagged_response(tag)[0] == 'OK'
+        phase('imap_mime_download', fetch)
+        def append():
+            tag = client._new_tag()
+            client.send(tag + b' APPEND INBOX {' + str(raw_size).encode() + b'}\r\n')
+            assert client.readline().startswith(b'+')
+            for chunk in chunks(): client.send(chunk)
+            client.send(b'\r\n')
+            assert client._get_tagged_response(tag)[0] == 'OK'
+        phase('imap_mime_append', append)
+    with closing(poplib.POP3_SSL('127.0.0.1', ports['pop3s'], context=context, timeout=600)) as client:
+        client.user('alice'); client.pass_('password')
+        assert client.stat() == (2, 2*raw_size)
+        def retr():
+            client._putcmd('RETR 1'); assert client._getresp().startswith(b'+OK')
+            # Generated MIME contains no dot-leading lines, so its POP wire body
+            # is byte-identical. Dot stuffing is covered by verify.py.
+            copy_exact(client.file, raw_size, raw_hash.hexdigest())
+            assert client.file.readline() == b'.\r\n'
+        phase('pop3_mime_download', retr)
+        client.quit()
+    def jmap(method, arguments):
+        request = {'using': ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
+                   'methodCalls': [[method, {'accountId': account, **arguments}, 'b']]}
+        conn.request('POST', '/api', json.dumps(request), {**auth, 'Content-Type': 'application/json'})
+        response = conn.getresponse(); body = json.load(response)
+        assert response.status == 200, body
+        invocation = body['methodResponses'][0]; assert invocation[0] == method, invocation
+        return invocation[1]
+    query = jmap('Email/query', {})
+    def attachment_metadata():
+        data = jmap('Email/get', {'ids': query['ids'][:1], 'properties': ['id', 'attachments']})
+        attachment = data['list'][0]['attachments'][0]
+        assert attachment['size'] == size, attachment
+        return attachment['blobId']
+    blob_id = phase('jmap_attachment_metadata', attachment_metadata)
+    def attachment_download():
+        conn.request('GET', f'/download/{account}/{blob_id}/large.bin', headers=auth)
+        response = conn.getresponse(); assert response.status == 200, response.read(1000) if response.status != 200 else ''
+        copy_exact(response, size, attachment_hash.hexdigest())
+        assert response.read(1) == b''
+    phase('jmap_attachment_download', attachment_download)
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--size-mib', type=int, default=2048)
     parser.add_argument('--max-rss-mib', type=int, default=256)
     parser.add_argument('--report', type=Path)
+    parser.add_argument('--mail', action='store_true', help='also send and receive a real MIME attachment through SMTP, IMAP, POP3 and JMAP')
     parser.add_argument('--data', choices=['compressible', 'incompressible'], default='incompressible')
     args = parser.parse_args()
     # Repeat a random 1 MiB block: its period exceeds gzip's 32 KiB window.
@@ -119,9 +234,10 @@ def main():
             env = {**os.environ, 'FMA_S3_ENDPOINT': endpoint, 'FMA_S3_BUCKET': 'stream-test',
                    'FMA_S3_ACCESS_KEY_ID': 'test', 'FMA_S3_SECRET_ACCESS_KEY': 'test',
                    'FMA_OUTBOUND_MODE': 'disabled', 'LOG_LEVEL': 'debug'}
+            mail_ports = {name: free_port() for name in ['smtp', 'imaps', 'pop3s']}
             command = [str(binary), '-http', f'127.0.0.1:{port}']
             for protocol in ['smtp', 'submission', 'smtps', 'pop3', 'pop3s', 'imap', 'imaps']:
-                command += ['-' + protocol, '127.0.0.1:0']
+                command += ['-' + protocol, f'127.0.0.1:{mail_ports.get(protocol, 0)}']
             with (tmp / 'fma.log').open('wb') as output:
                 proc = subprocess.Popen(command, env=env, cwd=work, stdout=output, stderr=output)
             for _ in range(200):
@@ -185,6 +301,8 @@ def main():
                 received += len(chunk); digest.update(chunk)
             results['phases']['download'] = measure.finish()
             assert received == size and digest.hexdigest() == results['sha256'], (received, digest.hexdigest())
+            if args.mail:
+                mail_benchmark(proc, mail_ports, conn, auth, account, size, block, results)
             conn.close()
             assert list(work.iterdir()) == [], 'fma wrote local temporary data'
             assert max(phase['peak_rss_bytes'] for phase in results['phases'].values()) <= args.max_rss_mib << 20, results

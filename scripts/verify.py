@@ -231,7 +231,7 @@ def verify_attachment_mailboxes(host, ports, context, expected):
             ids = c.uid('search', None, 'ALL')[1][0].split()
             require(len(ids) == 1, 'To/Cc/Bcc recipient missing or duplicate delivery: ' + user)
             status, data = c.uid('fetch', ids[0], '(RFC822.SIZE BODYSTRUCTURE BODY.PEEK[])')
-            raw = next(item[1] for item in data if isinstance(item, tuple))
+            raw = next(item[1] for item in data if isinstance(item, tuple) and b"BODY[]" in item[0])
             require(status == 'OK' and raw == expected, 'IMAP changed MIME message: ' + user)
             structure = b' '.join(item[0] if isinstance(item, tuple) else item for item in data if item)
             require(b'ATTACHMENT' in structure.upper() and b'BASE64' in structure.upper(), 'IMAP attachment BODYSTRUCTURE missing')

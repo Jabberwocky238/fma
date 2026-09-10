@@ -14,7 +14,7 @@ def verify_folders(host, port, context):
             'Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n中文显示验证\r\n').encode()
     c = imaplib.IMAP4_SSL(host,port,ssl_context=context,timeout=15)
     c.login('jw238','123123')
-    assert 'IDLE' not in c.capability()[1][0].decode().split()
+    assert 'IDLE' in c.capability()[1][0].decode().split()
     assert 'MOVE' not in c.capability()[1][0].decode().split()
     created=[]
     try:
