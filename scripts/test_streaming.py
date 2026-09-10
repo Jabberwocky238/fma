@@ -72,12 +72,16 @@ def main():
     parser.add_argument('--size-mib', type=int, default=2048)
     parser.add_argument('--max-rss-mib', type=int, default=256)
     parser.add_argument('--report', type=Path)
+    parser.add_argument('--data', choices=['compressible', 'incompressible'], default='incompressible')
     args = parser.parse_args()
+    # Repeat a random 1 MiB block: its period exceeds gzip's 32 KiB window.
+    # Generate it outside the timed phase, keeping client memory bounded.
+    block = BLOCK if args.data == 'compressible' else os.urandom(1 << 20)
     assert args.size_mib > 0
     size = args.size_mib << 20
     results = {'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
                'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
-               'working_tree': 'measured from working tree; see git status', 'phases': {}}
+               'working_tree': 'measured from working tree; see git status', 'phases': {}, 'data': args.data}
     with tempfile.TemporaryDirectory(prefix='fma-streaming-') as directory:
         tmp = Path(directory)
         binary = tmp / 'fma'
@@ -144,7 +148,7 @@ def main():
             conn.endheaders()
             sent = 0
             while sent < size:
-                chunk = BLOCK[:min(len(BLOCK), size - sent)]
+                chunk = block[:min(len(block), size - sent)]
                 conn.send(chunk); digest.update(chunk); sent += len(chunk)
                 if sent % (256 << 20) == 0:
                     print(f'  uploaded {sent >> 20} MiB', flush=True)
@@ -162,7 +166,10 @@ def main():
                 assert (results['storage_encoding'] == 'gzip') == (size > (10 << 20)), dict(stored.headers)
                 if size > (10 << 20):
                     assert int(stored.headers['x-amz-meta-fma-size']) == size
-                    assert results['stored_bytes'] < size, results
+                    if args.data == 'compressible':
+                        assert results['stored_bytes'] < size, results
+                    else:
+                        assert results['stored_bytes'] >= size * .99, results
 
             print(json.dumps({'upload': results['phases']['upload']}), flush=True)
             print('Streaming S3 through JMAP download; client hashes chunks without retaining the file', flush=True)

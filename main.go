@@ -2571,7 +2571,7 @@ func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient s
 		return err
 	}
 	defer body.Close()
-	if _, err = io.Copy(writer, body); err != nil {
+	if _, err = copyStream(ctx, writer, body); err != nil {
 		return err
 	}
 	// Only the final DATA response confirms acceptance; QUIT failure must not resend it.
@@ -2844,9 +2844,10 @@ type jmapBlobWriter struct {
 	account  jmap.Id
 	writer   objectUpload
 	digest   hash.Hash
-	probe    []byte
+	probe    *bytes.Buffer
 	gzip     *gzip.Writer
 	writeErr error
+	metadata map[string]string
 	size     int64
 	finished bool
 }
@@ -2867,15 +2868,25 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 	var n int
 	var err error
 	if w.gzip == nil && w.size+int64(len(data)) <= gzipThreshold {
-		w.probe = append(w.probe, data...)
-		n = len(data)
+		if w.probe == nil {
+			w.probe, err = mailProbePool.Get(w.ctx)
+			if err != nil {
+				return 0, err
+			}
+		}
+		n, err = w.probe.Write(data)
 	} else {
 		if w.gzip == nil {
-			w.gzip, err = gzip.NewWriterLevel(w.writer, gzip.BestSpeed)
-			if err == nil {
-				_, err = w.gzip.Write(w.probe)
+			w.gzip, err = gzipWriters.Get(w.ctx)
+			if err != nil {
+				return 0, err
 			}
-			w.probe = nil
+			w.gzip.Reset(w.writer)
+			if w.probe != nil {
+				_, err = w.gzip.Write(w.probe.Bytes())
+				mailProbePool.Put(w.probe)
+				w.probe = nil
+			}
 			if err != nil {
 				w.writeErr = err
 				return 0, err
@@ -2903,25 +2914,40 @@ func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
 	if w.writeErr != nil {
 		return "", w.writeErr
 	}
-	var metadata map[string]string
 	if w.gzip != nil {
 		err = w.gzip.Close()
-		metadata = map[string]string{"fma-encoding": "gzip", "fma-size": strconv.FormatInt(w.size, 10)}
+		gzipWriters.Put(w.gzip)
+		w.gzip = nil
+		w.metadata = map[string]string{"fma-encoding": "gzip", "fma-size": strconv.FormatInt(w.size, 10)}
 	} else {
-		_, err = w.writer.Write(w.probe)
-		w.probe = nil
+		if w.probe != nil {
+			_, err = w.writer.Write(w.probe.Bytes())
+			mailProbePool.Put(w.probe)
+			w.probe = nil
+		}
 	}
 	if err != nil {
 		w.writeErr = err
 		return "", err
 	}
-	if err = w.writer.Commit(key, metadata); err != nil {
+	if err = w.writer.Commit(key, w.metadata); err != nil {
 		return "", err
 	}
 	w.finished = true
 	return id, nil
 }
-func (w *jmapBlobWriter) Abort() error { w.finished = true; w.probe = nil; return w.writer.Abort() }
+func (w *jmapBlobWriter) Abort() error {
+	w.finished = true
+	if w.probe != nil {
+		mailProbePool.Put(w.probe)
+		w.probe = nil
+	}
+	if w.gzip != nil {
+		gzipWriters.Put(w.gzip)
+		w.gzip = nil
+	}
+	return w.writer.Abort()
+}
 
 type jmapAccount struct {
 	root  string
@@ -4075,7 +4101,7 @@ type s3StreamUpload struct {
 	key      string
 	uploadID *string
 	parts    []s3types.CompletedPart
-	buffer   []byte
+	buffer   *bytes.Buffer
 	finished bool
 }
 
@@ -4088,11 +4114,18 @@ func (w *s3StreamUpload) Write(data []byte) (int, error) {
 		if err := w.ctx.Err(); err != nil {
 			return written, err
 		}
-		n := min(s3PartSize-len(w.buffer), len(data))
-		w.buffer = append(w.buffer, data[:n]...)
+		if w.buffer == nil {
+			var err error
+			w.buffer, err = s3BufferPool.Get(w.ctx)
+			if err != nil {
+				return written, err
+			}
+		}
+		n := min(s3PartSize-w.buffer.Len(), len(data))
+		w.buffer.Write(data[:n])
 		data = data[n:]
 		written += n
-		if len(w.buffer) == s3PartSize {
+		if w.buffer.Len() == s3PartSize {
 			if err := w.flush(); err != nil {
 				return written, err
 			}
@@ -4110,12 +4143,12 @@ func (w *s3StreamUpload) flush() error {
 		w.uploadID = result.UploadId
 	}
 	number := int32(len(w.parts) + 1)
-	result, err := b.client.UploadPart(w.ctx, &s3.UploadPartInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, PartNumber: &number, Body: bytes.NewReader(w.buffer), ContentLength: aws.Int64(int64(len(w.buffer)))})
+	result, err := b.client.UploadPart(w.ctx, &s3.UploadPartInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, PartNumber: &number, Body: bytes.NewReader(w.buffer.Bytes()), ContentLength: aws.Int64(int64(w.buffer.Len()))})
 	if err != nil {
 		return objectError(w.key, err)
 	}
 	w.parts = append(w.parts, s3types.CompletedPart{ETag: result.ETag, PartNumber: &number})
-	w.buffer = w.buffer[:0]
+	w.buffer.Reset()
 	return nil
 }
 func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
@@ -4127,12 +4160,16 @@ func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
 	}
 	b := w.bucket
 	if w.uploadID == nil {
-		_, err := b.client.PutObject(w.ctx, &s3.PutObjectInput{Bucket: &b.bucket, Key: &key, Body: bytes.NewReader(w.buffer), IfNoneMatch: aws.String("*"), Metadata: metadata})
+		var data []byte
+		if w.buffer != nil {
+			data = w.buffer.Bytes()
+		}
+		_, err := b.client.PutObject(w.ctx, &s3.PutObjectInput{Bucket: &b.bucket, Key: &key, Body: bytes.NewReader(data), IfNoneMatch: aws.String("*"), Metadata: metadata})
 		if err = objectError(key, err); err != nil && !errors.Is(err, fs.ErrExist) {
 			return err
 		}
 	} else {
-		if len(w.buffer) > 0 {
+		if w.buffer != nil && w.buffer.Len() > 0 {
 			if err := w.flush(); err != nil {
 				return err
 			}
@@ -4151,7 +4188,10 @@ func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
 		}
 	}
 	w.finished = true
-	w.buffer = nil
+	if w.buffer != nil {
+		s3BufferPool.Put(w.buffer)
+		w.buffer = nil
+	}
 	return nil
 }
 func (w *s3StreamUpload) Abort() error {
@@ -4159,7 +4199,10 @@ func (w *s3StreamUpload) Abort() error {
 		return nil
 	}
 	w.finished = true
-	w.buffer = nil
+	if w.buffer != nil {
+		s3BufferPool.Put(w.buffer)
+		w.buffer = nil
+	}
 	if w.uploadID == nil {
 		return nil
 	}
@@ -4259,7 +4302,7 @@ func storeMailStream(ctx context.Context, root string, r io.Reader) (*jmapBlobRe
 		return nil, err
 	}
 	defer writer.Abort()
-	size, err := io.Copy(writer, io.LimitReader(r, maxMailSize+1))
+	size, err := copyStream(ctx, writer, io.LimitReader(r, maxMailSize+1))
 	if err != nil {
 		return nil, err
 	}
@@ -4447,4 +4490,83 @@ func (s *smtpSession) streamData(r io.Reader) error {
 	}
 	logger.Info("SMTP DATA stored as S3 stream", "user", s.user, "bytes", ref.Size, "local", len(s.recipients), "remote", len(s.remote))
 	return nil
+}
+
+// WaitPool follows WireGuard's count/condition-variable design, with typed
+// values and cancellable waits. Copyright (C) 2017-2025 WireGuard LLC.
+// Adapted under the MIT license; see LICENSE and README acknowledgements.
+// A borrowed value belongs exclusively to its caller until Put.
+type WaitPool[T any] struct {
+	pool       sync.Pool
+	cond       *sync.Cond
+	mu         sync.Mutex
+	count, max int
+	reset      func(T)
+}
+
+func newWaitPool[T any](max int, create func() T, reset func(T)) *WaitPool[T] {
+	if max <= 0 {
+		panic("WaitPool requires a positive capacity")
+	}
+	p := &WaitPool[T]{max: max, reset: reset}
+	p.pool.New = func() any { return create() }
+	p.cond = sync.NewCond(&p.mu)
+	return p
+}
+func (p *WaitPool[T]) Get(ctx context.Context) (T, error) {
+	var zero T
+	p.mu.Lock()
+	if p.count >= p.max {
+		stop := context.AfterFunc(ctx, func() { p.mu.Lock(); p.cond.Broadcast(); p.mu.Unlock() })
+		defer stop()
+		for p.count >= p.max && ctx.Err() == nil {
+			p.cond.Wait()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		p.mu.Unlock()
+		return zero, err
+	}
+	p.count++
+	p.mu.Unlock()
+	return p.pool.Get().(T), nil
+}
+func (p *WaitPool[T]) Put(value T) {
+	if p.reset != nil {
+		p.reset(value)
+	}
+	p.pool.Put(value)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.count <= 0 {
+		panic("WaitPool Put without Get")
+	}
+	p.count--
+	p.cond.Signal()
+}
+func (p *WaitPool[T]) outstanding() int { p.mu.Lock(); defer p.mu.Unlock(); return p.count }
+func newBufferPool(count, size int) *WaitPool[*bytes.Buffer] {
+	return newWaitPool(count, func() *bytes.Buffer { return bytes.NewBuffer(make([]byte, 0, size)) }, func(b *bytes.Buffer) {
+		if b.Cap() != size {
+			*b = *bytes.NewBuffer(make([]byte, 0, size))
+		} else {
+			b.Reset()
+		}
+	})
+}
+
+var (
+	mailProbePool  = newBufferPool(4, gzipThreshold)
+	s3BufferPool   = newBufferPool(4, s3PartSize)
+	copyBufferPool = newBufferPool(32, 128<<10)
+	gzipWriters    = newWaitPool(4, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
+)
+
+func copyStream(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	buffer, err := copyBufferPool.Get(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer copyBufferPool.Put(buffer)
+	return io.CopyBuffer(dst, src, buffer.AvailableBuffer()[:buffer.Cap()])
 }

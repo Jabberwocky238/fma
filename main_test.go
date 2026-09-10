@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -1509,5 +1510,191 @@ func TestS3BlobCompression(t *testing.T) {
 				t.Fatal("copy lost compression metadata")
 			}
 		})
+	}
+}
+
+// Isolate compression + hashing from S3 and network latency.
+func BenchmarkBlobUploadPipeline(b *testing.B) {
+	block := make([]byte, 1<<20)
+	for i := range block {
+		block[i] = byte(i)
+	}
+	b.SetBytes(2 << 30)
+	b.ReportAllocs()
+	for b.Loop() {
+		w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("bench"), digest: sha256.New(), writer: discardObjectUpload{}}
+		for range 2048 {
+			if _, err := w.Write(block); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if _, err := w.Commit(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+type discardObjectUpload struct{}
+
+func (discardObjectUpload) Write(p []byte) (int, error)            { return len(p), nil }
+func (discardObjectUpload) Commit(string, map[string]string) error { return nil }
+func (discardObjectUpload) Abort() error                           { return nil }
+
+func TestBufferPoolWaitCancelAndReuse(t *testing.T) {
+	pool := newBufferPool(1, 128)
+	first, err := pool.Get(context.Background())
+	checkError(t, err)
+	first.WriteString("private data")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { _, err := pool.Get(ctx); done <- err }()
+	select {
+	case <-done:
+		t.Fatal("pool exceeded capacity")
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err = <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled wait blocked")
+	}
+	pool.Put(first)
+	next, err := pool.Get(context.Background())
+	checkError(t, err)
+	if next.Len() != 0 || next.Cap() != 128 {
+		t.Fatal("buffer not reset")
+	}
+	pool.Put(next)
+	if pool.outstanding() != 0 {
+		t.Fatal("leaked permit")
+	}
+}
+
+type shortErrorReader struct {
+	left int
+	err  error
+}
+
+func (r *shortErrorReader) Read(p []byte) (int, error) {
+	if r.left == 0 {
+		return 0, r.err
+	}
+	n := min(7, min(len(p), r.left))
+	clear(p[:n])
+	r.left -= n
+	return n, nil
+}
+func TestCopyStreamShortReadsAndErrors(t *testing.T) {
+	for _, terminal := range []error{io.EOF, io.ErrUnexpectedEOF} {
+		var dst bytes.Buffer
+		n, err := copyStream(context.Background(), &dst, &shortErrorReader{left: 12345, err: terminal})
+		if n != 12345 || dst.Len() != 12345 {
+			t.Fatalf("short read lost bytes: %d", n)
+		}
+		if terminal == io.EOF && err != nil || terminal != io.EOF && !errors.Is(err, terminal) {
+			t.Fatal(err)
+		}
+	}
+	if copyBufferPool.outstanding() != 0 {
+		t.Fatal("copy error leaked buffer")
+	}
+}
+func TestBlobWriterAbortReturnsBuffers(t *testing.T) {
+	for _, size := range []int{1, gzipThreshold, gzipThreshold + 1} {
+		w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("test"), digest: sha256.New(), writer: discardObjectUpload{}}
+		block := make([]byte, 32768)
+		for left := size; left > 0; {
+			n := min(left, len(block))
+			_, err := w.Write(block[:n])
+			checkError(t, err)
+			left -= n
+		}
+		checkError(t, w.Abort())
+		checkError(t, w.Abort())
+		if mailProbePool.outstanding() != 0 {
+			t.Fatal("abort leaked probe buffer")
+		}
+	}
+}
+func TestGzipObjectReaderCorruption(t *testing.T) {
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	_, err := writer.Write(bytes.Repeat([]byte("payload"), 10000))
+	checkError(t, err)
+	checkError(t, writer.Close())
+	valid := bytes.Clone(compressed.Bytes())
+	corrupt := bytes.Clone(valid)
+	corrupt[len(corrupt)-8] ^= 1
+	for _, data := range [][]byte{valid, valid[:len(valid)-4], corrupt} {
+		source := &closeTrackingReader{Reader: bytes.NewReader(data)}
+		reader, err := gzip.NewReader(source)
+		checkError(t, err)
+		stream := &gzipObjectReader{Reader: reader, source: source}
+		n, readErr := copyStream(context.Background(), io.Discard, stream)
+		checkError(t, stream.Close())
+		if !source.closed {
+			t.Fatal("S3 reader was not closed")
+		}
+		if bytes.Equal(data, valid) {
+			if n != 70000 || readErr != nil {
+				t.Fatalf("round trip: %d %v", n, readErr)
+			}
+		} else if readErr == nil {
+			t.Fatal("corrupt gzip accepted")
+		}
+	}
+}
+
+type closeTrackingReader struct {
+	io.Reader
+	closed bool
+}
+
+func (r *closeTrackingReader) Close() error { r.closed = true; return nil }
+
+func TestWaitPoolConcurrentCapacity(t *testing.T) {
+	pool := newBufferPool(3, 256)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var active, peak atomic.Int32
+	var wg sync.WaitGroup
+	for worker := range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				buffer, err := pool.Get(ctx)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				n := active.Add(1)
+				for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
+				}
+				if n > 3 {
+					t.Error("capacity exceeded")
+				}
+				buffer.Write(bytes.Repeat([]byte{byte(worker)}, 256))
+				for _, value := range buffer.Bytes() {
+					if value != byte(worker) {
+						t.Error("buffer shared by concurrent callers")
+						break
+					}
+				}
+				active.Add(-1)
+				pool.Put(buffer)
+			}
+		}()
+	}
+	wg.Wait()
+	if pool.outstanding() != 0 || active.Load() != 0 {
+		t.Fatal("leaked borrower")
+	}
+	if peak.Load() > 3 {
+		t.Fatal("maximum exceeded")
 	}
 }
