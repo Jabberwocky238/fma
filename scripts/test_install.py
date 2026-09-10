@@ -140,6 +140,23 @@ else:
         self.assertNotIn('--user', removals)
         self.assertFalse((self.root / 'requests').exists())
 
+    def test_windows_zip_install_and_uninstall(self):
+        import zipfile
+        uname = self.mock / 'uname'
+        uname.write_text('#!/bin/bash\nif [[ "$1" == -s ]]; then echo MINGW64_NT-10.0; else echo x86_64; fi\n')
+        uname.chmod(0o755)
+        with zipfile.ZipFile(self.root / 'archive.tar.gz', 'w') as archive:
+            archive.writestr('fma.exe', '#!/bin/bash\nprintf "fma 1.2.0\\n"\n')
+        digest = hashlib.sha256((self.root / 'archive.tar.gz').read_bytes()).hexdigest()
+        (self.root / 'checksums.txt').write_text(f'{digest}  fma_1.2.0_windows_amd64.zip\n')
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.bin / 'fma.exe').exists())
+        self.assertIn('windows_amd64.zip', (self.root / 'requests').read_text())
+        result = self.run_installer(args=('--uninstall',))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.bin / 'fma.exe').exists())
+
     def test_unknown_option(self):
         result = self.run_installer(args=('--unknown',))
         self.assertNotEqual(result.returncode, 0)

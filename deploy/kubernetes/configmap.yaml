@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: fma
+  name: fma-config
+data:
+  FMA_DOMAIN: example.com
+  FMA_S3_ENDPOINT: https://s3.example.com
+  FMA_S3_BUCKET: fma
+  FMA_S3_REGION: us-east-1
+  FMA_QUEUE_RETRY: 1m
+  FMA_OUTBOUND_MODE: disabled
+  LOG_LEVEL: info

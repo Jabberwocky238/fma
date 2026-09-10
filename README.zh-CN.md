@@ -10,7 +10,7 @@
 - **占用小**：单个 Go 二进制，无需本地数据库、Redis、邮件暂存目录或 Docker。实际内存和吞吐取决于邮件大小、连接数与 S3 延迟，目前没有公布生产环境基准数据。
 
 可用性依赖 S3，以及将客户端流量导向健康节点的接入设施。节点故障后，原有连接需要重连。
-账户、证书、邮件、文件夹、任务队列和租约全部存放在 S3。邮件二进制不提供注册、用户管理、CSV 导入、本地数据库、磁盘缓存或临时文件管理能力。HTTP 只提供存活检查，DEBUG/INFO/WARN 日志输出到 stdout，ERROR/FATAL 输出到 stderr。
+账户、邮件、文件夹、任务队列和租约全部存放在 S3。证书默认从 S3 读取，Kubernetes 部署则直接只读挂载 TLS Secret。邮件二进制不提供注册、用户管理、CSV 导入、本地数据库、磁盘缓存或临时文件管理能力。HTTP 只提供存活检查，DEBUG/INFO/WARN 日志输出到 stdout，ERROR/FATAL 输出到 stderr。
 
 ## 安装发行版
 
@@ -20,9 +20,9 @@
 curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh | bash
 ```
 
-支持 Linux、macOS 的 amd64 和 arm64，普通用户默认安装到 `~/.local/bin/fma`，root 安装到 `/usr/local/bin/fma`。下载后校验 SHA-256 和二进制版本号。运行 `fma --version` 查看版本；如有需要，将 `~/.local/bin` 加入 PATH。
+支持 Linux、macOS、Windows 的 amd64 和 arm64，普通用户默认安装到 `~/.local/bin/fma`，root 安装到 `/usr/local/bin/fma`。下载后校验 SHA-256 和二进制版本号。运行 `fma --version` 查看版本；如有需要，将 `~/.local/bin` 加入 PATH。
 
-已安装相同或更新版本时保持不变；旧版本或无法识别的版本会询问 `Update? [y/N]`，只有输入 `y` 才更新。下载、校验失败保留原二进制。`FMA_INSTALL_DIR` 可修改安装目录，`FMA_REPO` 可选择 fork 仓库。Windows 二进制通过 Releases 的 ZIP 提供。
+已安装相同或更新版本时保持不变；旧版本或无法识别的版本会询问 `Update? [y/N]`，只有输入 `y` 才更新。下载、校验失败保留原二进制。`FMA_INSTALL_DIR` 可修改安装目录，`FMA_REPO` 可选择 fork 仓库。Windows 在 Git Bash/MSYS/Cygwin 中运行安装器，需要 Bash、curl 和 unzip；脚本识别平台和架构后下载 ZIP 并安装 `fma.exe`。Linux/macOS 使用 tar.gz，`--systemd` 仅支持 Linux。
 
 在 Linux 上同时安装 **systemd 服务**：
 
@@ -105,7 +105,7 @@ export FMA_S3_SECRET_ACCESS_KEY=local
 
 Fals3y 接受任意凭证，但 SDK 仍需要密钥对。其他 S3 服务应使用真实凭证，临时凭证可设置 `FMA_S3_SESSION_TOKEN`。邮件服务不读取本地 AWS 配置文件。邮件配置统一自动添加 `FMA_` 前缀；命令行 `-s3-endpoint`、`-s3-bucket`、`-s3-region` 优先于环境变量。桶不可用时启动失败。默认监听回环地址，使用 `./fma -h` 查看端口。
 
-启动前将 TLS 证书链和私钥上传为 `cert.pem`、`key.pem`。`-cert`、`-key` 指定桶内对象键，不是本地路径。`FMA_RELAY_PASSWORD_FILE`、`FMA_RELAY_CA_FILE` 同样指向桶内对象。证书和中继配置只在启动时加载。
+启动前将 TLS 证书链和私钥上传为 `cert.pem`、`key.pem`。`-cert`、`-key` 指定桶内对象键，不是本地路径。`FMA_RELAY_PASSWORD_FILE`、`FMA_RELAY_CA_FILE` 同样指向桶内对象。证书和中继配置只在启动时加载。`-tls-dir /run/fma/tls` 改为从只读挂载目录读取 `tls.crt` 和 `tls.key`，替代 S3 证书对象。
 
 全局结构化 logger 使用 **`LOG_LEVEL`**，不带 `FMA_` 前缀，在加载邮件配置前读取。支持 `debug`、`info`、`warn`、`error`，默认 `info`。启动时先检查完整配置，关键配置缺失直接退出，然后才连接 S3 和监听端口；关闭外发等可运行的情况输出 warning。`--version` 不需要 S3 配置，`--queue` 只需要 S3。
 
@@ -140,7 +140,7 @@ S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节�
 
 ## 外发与部署
 
-默认关闭外发。设置 `FMA_OUTBOUND_MODE=direct` 使用 MX 直投，或设置为 `relay` 使用 SMTP 中继。
+默认关闭外发。设置 `FMA_OUTBOUND_MODE=direct` 使用 MX 直投，或设置为 `relay` 使用 SMTP 中继。中继就是另一台 SMTP 服务器：fma 把外发邮件交给它，由它负责投递到收件人的邮件服务，需要配置中继地址和凭证。这只影响外部投递，不影响收信或读取本地邮箱。
 
 ```sh
 bash deploy/gen.sh
@@ -183,6 +183,65 @@ bash deploy/gen.sh --non-interactive
 
 将生成的 `renew-hook.sh` 安装为 root 执行的 Certbot deploy hook，使用服务用户的 S3 配置上传续期证书并重启用户服务。该集成需要 Bash、AWS CLI、Nginx、`runuser` 和 systemd；生成器本身只需要 Bash 和常规 Unix 工具。Nginx 配置和 root hook 需单独安装。
 
+## Docker 与 Docker Compose
+
+[Dockerfile](Dockerfile) 使用 Go 构建阶段和 Alpine 3.23 运行阶段，包含 CA 证书。运行身份为 UID/GID 65532，无需数据卷；账户、TLS 密钥、邮件和队列仍在已有 S3 桶中。构建方式参考 [Docker 多阶段构建文档](https://docs.docker.com/build/building/multi-stage/)。
+
+```sh
+cp .env.example .env
+# 编辑 .env，填写域名、S3 端点、桶和凭证。
+# 提前向桶上传 cert.pem、key.pem 和账户对象。
+docker compose up -d --build
+docker compose logs -f fma
+docker compose down
+```
+
+Compose 发布标准邮件 TCP 端口，HTTP 存活检查仅映射到宿主机回环地址的 8080 端口。容器内监听 `0.0.0.0`；S3 地址里的 localhost 指的是容器自身，应使用容器可访问的外部 S3 地址。`.env` 已被 Git 忽略。不创建 S3 容器、本地数据库或数据卷，容器根文件系统只读。容器直接运行 fma，不使用 systemd 或安装脚本。
+
+自行构建镜像并注入 commit：
+
+```sh
+docker build --build-arg COMMIT="$(git rev-parse HEAD)" -t fma:local .
+```
+
+可另外指定 `VERSION`、`RELEASE_TIME` 构建参数；未指定时使用 `dev-{datetime}` 和 UTC 构建时间。构建上下文仅包含 Go 源码、模块文件和 Dockerfile，不包含环境文件或生成的凭证。
+
+复用 Compose 配置运行发布的镜像：
+
+```sh
+FMA_IMAGE=ghcr.io/jabberwocky238/fma:latest docker compose up -d --no-build --pull always
+```
+
+## Kubernetes
+
+[deploy/kubernetes/](deploy/kubernetes/) 提供 Kustomize 配置，包括两个副本的 Deployment、ConfigMap、TCP LoadBalancer Service 和 PodDisruptionBudget。Pod 使用非 root 身份，不挂载本地数据卷或 Kubernetes API 凭证，共享同一个 S3 桶。Service 暴露七个邮件端口，HTTP 健康检查仅供集群内部使用。集群需要支持 LoadBalancer，或按现有 TCP 接入设施修改 Service 类型。
+
+编辑 `configmap.yaml` 中的域名、S3 端点和桶。证书直接使用 Kubernetes 的 `fma-tls` TLS Secret，以只读方式挂载到 `/run/fma/tls`，不再从 S3 读取。已有 cert-manager 证书时，在 `deployment.yaml` 修改 `secretName` 指向对应 Secret，或提前创建：
+
+```sh
+kubectl create namespace fma --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n fma create secret tls fma-tls --cert=fullchain.pem --key=privkey.pem
+```
+
+该部署无需向 S3 上传证书对象。证书仅在启动时加载，Secret 续期后需要滚动重启 Pod，或使用集群已有的 Secret 重载控制器；fma 不写入或管理挂载文件。
+
+在 `kustomization.yaml` 指定已发布的 GHCR 版本或自行推送的镜像。在 `fma` 命名空间创建凭证 Secret：
+
+```sh
+kubectl -n fma create secret generic fma-s3 \
+  --from-literal=FMA_S3_ACCESS_KEY_ID="$FMA_S3_ACCESS_KEY_ID" \
+  --from-literal=FMA_S3_SECRET_ACCESS_KEY="$FMA_S3_SECRET_ACCESS_KEY" \
+  --from-literal=FMA_S3_SESSION_TOKEN="${FMA_S3_SESSION_TOKEN:-}" \
+  --dry-run=client -o yaml | kubectl -n fma apply -f -
+kubectl apply -k deploy/kubernetes
+kubectl -n fma rollout status deployment/fma
+kubectl -n fma get service fma
+```
+
+私有镜像包需要在 Deployment 配置拉取凭证。固定版本标签可使部署结果可复现；`latest` 在 Pod 启动时拉取，发布新镜像不会自动重启已有 Pod。修改环境配置或更新 `latest` 后，执行 `kubectl -n fma rollout restart deployment/fma`。按实际负载配置资源 requests/limits。退出宽限期为 120 秒。
+
+启动、就绪和存活探针使用 HTTP `/`，检查进程是否运行，不持续检查 S3 可用性。参考 [Kubernetes 探针文档](https://kubernetes.io/docs/concepts/workloads/pods/probes/)。
+
 ## 测试与构建
 
 ```sh
@@ -205,6 +264,14 @@ git push origin v0.1.0
 ```
 
 GoReleaser 无 CGO 构建 Linux、macOS、Windows 的 amd64/arm64 二进制，注入 tag 版本、完整 commit 和 UTC 发行构建时间。该时间发生在 GitHub Release 实际发布之前。快照版本为 `dev-{datetime}`。发行包包含二进制、两种语言的 README、MIT 许可证、部署模板及 SHA-256 校验文件；Windows 为 ZIP，其他平台为 tar.gz。带预发布后缀的 tag 生成预发布版本。发布使用工作流自带、拥有 `contents: write` 权限的 `GITHUB_TOKEN`，无需个人 token 或 Docker。
+
+镜像发布独立且**仅支持手动触发**：在 Actions → Publish GHCR image → Run workflow 执行，或运行：
+
+```sh
+gh workflow run ghcr.yml
+```
+
+工作流读取最新稳定 GitHub Release 的 tag，检出该 tag 对应的 commit，只构建 **Linux amd64/arm64**，推送到 `ghcr.io/jabberwocky238/fma:<release-tag>` 和 `:latest`。构建元信息使用发行版本、源码 commit 和 Release 发布时间，`latest` 随之提升到该发行版镜像。该 Release 必须包含 Dockerfile；工作流不构建 main 上尚未发布的改动，不提供 macOS/Windows 容器镜像。使用 `GITHUB_TOKEN` 的 `packages: write` 权限认证。二进制 Release 仍覆盖三个操作系统和两种架构。
 
 本地验证打包：
 

@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -57,7 +58,7 @@ import (
 
 // Config is loaded once before startup; serving code only reads this snapshot.
 type Config struct {
-	Domain, CertFile, KeyFile                              string
+	Domain, CertFile, KeyFile, TLSDir                      string
 	SMTPAddr, SubmissionAddr, SMTPSAddr                    string
 	POP3Addr, POP3SAddr, IMAPAddr, IMAPSAddr, HTTPAddr     string
 	OutboundMode                                           string
@@ -142,6 +143,7 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	f.StringVar(&c.S3.Region, "s3-region", getenv("S3_REGION", "us-east-1"), "S3 region")
 	f.StringVar(&c.CertFile, "cert", "cert.pem", "TLS certificate chain object key in the S3 bucket")
 	f.StringVar(&c.KeyFile, "key", "key.pem", "TLS private key object key in the S3 bucket")
+	f.StringVar(&c.TLSDir, "tls-dir", "", "read tls.crt and tls.key from a mounted TLS Secret directory instead of S3")
 	f.StringVar(&c.SMTPAddr, "smtp", "127.0.0.1:2525", "inbound SMTP")
 	f.StringVar(&c.SubmissionAddr, "submission", "127.0.0.1:1587", "submission STARTTLS")
 	f.StringVar(&c.SMTPSAddr, "smtps", "127.0.0.1:1465", "submission TLS")
@@ -195,7 +197,7 @@ func checkConfig(c Config) error {
 			return fmt.Errorf("invalid mail domain")
 		}
 	}
-	if strings.TrimSpace(c.CertFile) == "" || strings.TrimSpace(c.KeyFile) == "" {
+	if c.TLSDir == "" && (strings.TrimSpace(c.CertFile) == "" || strings.TrimSpace(c.KeyFile) == "") {
 		return fmt.Errorf("cert and key S3 object keys are required")
 	}
 	seen := map[string]bool{}
@@ -293,18 +295,11 @@ func run() error {
 	if err := loadRelayObjects(&config); err != nil {
 		return err
 	}
-	certPEM, err := objects.Get(config.CertFile)
-	if err != nil {
-		return fmt.Errorf("read TLS certificate from S3: %w", err)
-	}
-	keyPEM, err := objects.Get(config.KeyFile)
-	if err != nil {
-		return fmt.Errorf("read TLS key from S3: %w", err)
-	}
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	cert, err := loadTLSCertificate(config)
 	if err != nil {
 		return err
 	}
+
 	cfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	var listeners []net.Listener
 	var closers []io.Closer
@@ -374,6 +369,26 @@ func run() error {
 	shutdown()
 	wg.Wait()
 	return err
+}
+
+// Mounted TLS Secrets are read-only input; mail state remains exclusively in S3.
+func loadTLSCertificate(c Config) (tls.Certificate, error) {
+	if c.TLSDir != "" {
+		cert, err := tls.LoadX509KeyPair(filepath.Join(c.TLSDir, "tls.crt"), filepath.Join(c.TLSDir, "tls.key"))
+		if err != nil {
+			return tls.Certificate{}, fmt.Errorf("read mounted TLS Secret: %w", err)
+		}
+		return cert, nil
+	}
+	certPEM, err := objects.Get(c.CertFile)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("read TLS certificate from S3: %w", err)
+	}
+	keyPEM, err := objects.Get(c.KeyFile)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("read TLS key from S3: %w", err)
+	}
+	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
 // S3 is the only persistent store. Credentials come from the startup snapshot;

@@ -1,0 +1,7 @@
+# Only source files required by the build enter the context.
+**
+!Dockerfile
+!.dockerignore
+!go.mod
+!go.sum
+!main.go

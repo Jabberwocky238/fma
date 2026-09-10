@@ -16,7 +16,8 @@ It supports SMTP, POP3 and IMAP, with a single S3 bucket holding all durable sta
 Availability depends on S3 and routing clients to healthy nodes. Existing connections
 must reconnect after a node fails.
 
-Accounts, certificates, messages, folders, outbound jobs, and leases live in S3.
+Accounts, messages, folders, outbound jobs and leases live in S3. TLS certificates
+come from S3 by default, or a read-only mounted TLS Secret in Kubernetes.
 The mail binary has no registration API, user management commands, CSV import,
 local database, disk cache, or temporary file management. HTTP provides only a
 liveness endpoint. DEBUG/INFO/WARN logs go to stdout; ERROR/FATAL go to stderr.
@@ -29,14 +30,16 @@ Install the latest release directly:
 curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh | bash
 ```
 
-The installer downloads the latest stable GitHub Release for Linux or macOS
+The installer downloads the latest stable GitHub Release for Linux, macOS or Windows
 (amd64 or arm64), checks its SHA-256 digest and reported version, and installs
 `~/.local/bin/fma` for ordinary users or `/usr/local/bin/fma` for root. Check the installed version with `fma --version`.
 An existing current or newer version is left untouched. An older or unrecognized
 version prompts `Update? [y/N]`; only `y` proceeds. Download or verification failures
 preserve the existing binary. Add `~/.local/bin` to your PATH if needed.
 `FMA_INSTALL_DIR` overrides the installation directory; `FMA_REPO` selects a fork.
-Windows binaries are available as ZIP archives on the Releases page.
+Windows installation uses Git Bash/MSYS/Cygwin with Bash, curl and unzip; the installer
+detects Windows and installs `fma.exe` from the matching ZIP. Linux/macOS use tar.gz.
+`--systemd` is Linux-only. Architecture is detected using `uname -m`.
 
 To install the binary and a **systemd service** on Linux, use:
 
@@ -159,7 +162,8 @@ is unavailable. Listeners bind to loopback by default; see `./fma -h` for ports.
 Upload a TLS certificate chain and private key as `cert.pem` and `key.pem` before
 starting. The `-cert` and `-key` flags specify object keys, not filesystem paths.
 `FMA_RELAY_PASSWORD_FILE` and `FMA_RELAY_CA_FILE` also name objects in the same bucket.
-Certificates and relay configuration are loaded once at startup.
+Certificates and relay configuration are loaded once at startup. `-tls-dir /run/fma/tls`
+reads `tls.crt` and `tls.key` from a read-only mounted Secret instead of S3.
 
 Logging uses the global structured logger. Set `LOG_LEVEL=debug|info|warn|error`
 (default `info`). DEBUG/INFO/WARN use stdout and ERROR/FATAL use stderr; this variable has no `FMA_` prefix and is read before configuration.
@@ -222,7 +226,10 @@ binary has no import path.
 ## Outbound mail and deployment
 
 Outbound delivery is disabled by default. Set `FMA_OUTBOUND_MODE=direct` to use MX
-delivery, or `relay` to use an SMTP relay.
+delivery, or `relay` to use an SMTP relay. A relay is another SMTP server that
+accepts outbound mail from fma and delivers it to the recipient's mail provider;
+configure its address and credentials. These modes affect external delivery only,
+not receiving mail or reading local mailboxes.
 
 Generate deployment configuration interactively:
 
@@ -293,6 +300,91 @@ user's mail service. The target needs Bash, AWS CLI, Nginx, `runuser`, and syste
 the generator itself only needs Bash and standard Unix utilities. Nginx configuration
 and root-owned Certbot hooks are installed separately from `make install`.
 
+## Docker and Docker Compose
+
+The [Dockerfile](Dockerfile) uses a Go build stage and an Alpine 3.23 runtime with
+CA certificates. The runtime runs as UID/GID 65532 and needs no data volumes;
+accounts, TLS keys, messages and queues remain in your existing S3 bucket.
+See [Docker's multi-stage build documentation](https://docs.docker.com/build/building/multi-stage/).
+
+```sh
+cp .env.example .env
+# Edit .env: set your domain, S3 endpoint/bucket and credentials.
+# Upload cert.pem, key.pem and account objects to that bucket first.
+docker compose up -d --build
+docker compose logs -f fma
+docker compose down
+```
+
+The Compose configuration publishes standard SMTP/submission/POP3/IMAP TCP ports.
+HTTP health is published only on host loopback port 8080. Listeners inside the
+container bind `0.0.0.0`; `localhost` in an S3 endpoint refers to that container,
+so use a reachable external S3 address. `.env` is ignored by Git. No S3 container,
+local database or Docker volume is created. The container root filesystem is read-only.
+Containers run fma directly rather than invoking systemd or `install.sh`.
+
+Build an image yourself, optionally injecting version metadata:
+
+```sh
+docker build --build-arg COMMIT="$(git rev-parse HEAD)" -t fma:local .
+```
+
+`VERSION` and `RELEASE_TIME` are optional build arguments; without them the image uses
+`dev-{datetime}` and the UTC build time. The build context only includes the Go source,
+module files and Dockerfile; environment files and generated credentials are excluded.
+To use a published image with the same Compose settings:
+
+```sh
+FMA_IMAGE=ghcr.io/jabberwocky238/fma:latest docker compose up -d --no-build --pull always
+```
+
+## Kubernetes
+
+[deploy/kubernetes/](deploy/kubernetes/) provides a Kustomize deployment: two replicas,
+a configuration ConfigMap, a TCP LoadBalancer Service and a PodDisruptionBudget.
+The pods run without root privileges, local data volumes or Kubernetes API credentials.
+They share the same S3 bucket. The Service exposes the seven mail ports and keeps
+HTTP health internal. Your cluster must support LoadBalancer services, or you can
+adapt its type to your existing TCP entry point.
+
+Edit `deploy/kubernetes/configmap.yaml` for your domain and S3 endpoint/bucket.
+TLS comes directly from the Kubernetes `fma-tls` Secret (`kubernetes.io/tls`), mounted
+read-only at `/run/fma/tls`. Use an existing cert-manager Secret by changing
+`secretName` in `deployment.yaml`, or create one before applying the deployment:
+
+```sh
+kubectl create namespace fma --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n fma create secret tls fma-tls --cert=fullchain.pem --key=privkey.pem
+```
+
+No certificate objects are required in S3 for this deployment. Certificates are loaded
+at startup; after Secret renewal, restart the pods (or use your cluster's Secret
+reload controller). The process does not write or manage mounted certificate files.
+
+Set the image and tag in `kustomization.yaml` to a published
+GHCR version or your own pushed image. Create the credentials Secret in the same
+namespace as the deployment (`fma`):
+
+```sh
+kubectl -n fma create secret generic fma-s3 \
+  --from-literal=FMA_S3_ACCESS_KEY_ID="$FMA_S3_ACCESS_KEY_ID" \
+  --from-literal=FMA_S3_SECRET_ACCESS_KEY="$FMA_S3_SECRET_ACCESS_KEY" \
+  --from-literal=FMA_S3_SESSION_TOKEN="${FMA_S3_SESSION_TOKEN:-}" \
+  --dry-run=client -o yaml | kubectl -n fma apply -f -
+kubectl apply -k deploy/kubernetes
+kubectl -n fma rollout status deployment/fma
+kubectl -n fma get service fma
+```
+
+For a private registry package, configure an image pull Secret on the deployment.
+Pin an image version for reproducible rollouts; `latest` is pulled when a pod starts,
+but publishing it does not restart existing pods. Use `kubectl -n fma rollout restart deployment/fma`
+after changing environment settings or to refresh `latest`. Set resource requests/limits
+based on your workloads. Graceful shutdown allows 120 seconds for in-flight work.
+Startup, readiness and liveness probes use HTTP `/`, which checks the running process;
+it does not continuously verify S3 availability. See the
+[Kubernetes probe documentation](https://kubernetes.io/docs/concepts/workloads/pods/probes/).
+
 ## Test
 
 ```sh
@@ -333,6 +425,21 @@ the GitHub Release publication. Releases include tar.gz archives (ZIP on Windows
 deployment examples, and SHA-256 checksums. Version tags with prerelease suffixes
 produce prereleases. Publishing uses the workflow's built-in `GITHUB_TOKEN` with
 `contents: write`; no personal token or Docker daemon is required.
+
+Container publication is separate and **manual only**: open **Actions → Publish GHCR
+image → Run workflow**, or run:
+
+```sh
+gh workflow run ghcr.yml
+```
+
+The workflow resolves the latest stable GitHub Release, checks out that tag's commit,
+and publishes **Linux amd64/arm64 only** to `ghcr.io/jabberwocky238/fma:<release-tag>`
+and `:latest`. It uses the release version, source commit and release publication time
+for build metadata. `latest` moves to that release's image. The release must include
+the Dockerfile; this workflow does not build arbitrary main-branch changes or publish
+macOS/Windows images. It authenticates with `GITHUB_TOKEN` and `packages: write`.
+Binary releases remain available for all three operating systems and both architectures.
 
 For a local packaging check with GoReleaser v2:
 

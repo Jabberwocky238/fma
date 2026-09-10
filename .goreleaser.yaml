@@ -40,6 +40,14 @@ archives:
       - README.zh-CN.md
       - deploy/gen.sh
       - deploy/template/*
+      - deploy/kubernetes/*
+      - Dockerfile
+      - .dockerignore
+      - compose.yaml
+      - .env.example
+      - go.mod
+      - go.sum
+      - main.go
 
 checksum:
   name_template: checksums.txt

@@ -1173,3 +1173,32 @@ func TestLogOutputStreams(t *testing.T) {
 		t.Fatal("incorrect stderr routing", diagnostics.String())
 	}
 }
+
+func TestMountedTLSSecret(t *testing.T) {
+	old := objects
+	objects = nil // Mounted credentials must not require a certificate read from S3.
+	t.Cleanup(func() { objects = old })
+	server := httptest.NewTLSServer(nil)
+	cert := server.TLS.Certificates[0]
+	server.Close()
+	dir := t.TempDir()
+	private, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	checkError(t, err)
+	checkError(t, os.WriteFile(dir+"/tls.crt", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0400))
+	checkError(t, os.WriteFile(dir+"/tls.key", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: private}), 0400))
+	loaded, err := loadTLSCertificate(Config{TLSDir: dir})
+	checkError(t, err)
+	if !bytes.Equal(loaded.Certificate[0], cert.Certificate[0]) {
+		t.Fatal("mounted certificate changed")
+	}
+	checkError(t, os.Remove(dir+"/tls.key"))
+	if _, err := loadTLSCertificate(Config{TLSDir: dir}); err == nil {
+		t.Fatal("missing mounted key accepted")
+	}
+	c := defaultConfig()
+	c.S3 = S3Config{Bucket: "test", Region: "us-east-1", AccessKey: "key", SecretKey: "secret"}
+	c.TLSDir = dir
+	c.CertFile = ""
+	c.KeyFile = ""
+	checkError(t, checkConfig(c))
+}

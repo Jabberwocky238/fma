@@ -1,0 +1,69 @@
+services:
+  fma:
+    image: ${FMA_IMAGE:-fma:local}
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-}
+        COMMIT: ${COMMIT:-unknown}
+        RELEASE_TIME: ${RELEASE_TIME:-}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 120s
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      FMA_S3_ENDPOINT: ${FMA_S3_ENDPOINT:-}
+      FMA_S3_BUCKET: ${FMA_S3_BUCKET:?Set FMA_S3_BUCKET in .env}
+      FMA_S3_REGION: ${FMA_S3_REGION:-us-east-1}
+      FMA_S3_ACCESS_KEY_ID: ${FMA_S3_ACCESS_KEY_ID:?Set FMA_S3_ACCESS_KEY_ID in .env}
+      FMA_S3_SECRET_ACCESS_KEY: ${FMA_S3_SECRET_ACCESS_KEY:?Set FMA_S3_SECRET_ACCESS_KEY in .env}
+      FMA_S3_SESSION_TOKEN: ${FMA_S3_SESSION_TOKEN:-}
+      FMA_OUTBOUND_MODE: ${FMA_OUTBOUND_MODE:-disabled}
+      FMA_RELAY_ADDR: ${FMA_RELAY_ADDR:-}
+      FMA_RELAY_USER: ${FMA_RELAY_USER:-}
+      FMA_RELAY_PASSWORD: ${FMA_RELAY_PASSWORD:-}
+      FMA_RELAY_PASSWORD_FILE: ${FMA_RELAY_PASSWORD_FILE:-}
+      FMA_RELAY_TLS: ${FMA_RELAY_TLS:-starttls}
+      FMA_RELAY_CA_FILE: ${FMA_RELAY_CA_FILE:-}
+    command:
+      - -domain
+      - ${FMA_DOMAIN:?Set FMA_DOMAIN in .env}
+      - -cert
+      - ${FMA_CERT_KEY:-cert.pem}
+      - -key
+      - ${FMA_KEY_KEY:-key.pem}
+      - -queue-retry
+      - ${FMA_QUEUE_RETRY:-1m}
+      - -smtp
+      - 0.0.0.0:2525
+      - -submission
+      - 0.0.0.0:1587
+      - -smtps
+      - 0.0.0.0:1465
+      - -pop3
+      - 0.0.0.0:1110
+      - -pop3s
+      - 0.0.0.0:1995
+      - -imap
+      - 0.0.0.0:1143
+      - -imaps
+      - 0.0.0.0:1993
+      - -http
+      - 0.0.0.0:8080
+    ports:
+      - "25:2525"
+      - "587:1587"
+      - "465:1465"
+      - "110:1110"
+      - "995:1995"
+      - "143:1143"
+      - "993:1993"
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://127.0.0.1:8080/]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s

@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: fma
+  name: fma
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fma
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: fma
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: fma
+      volumes:
+        - name: tls
+          secret:
+            secretName: fma-tls
+            defaultMode: 0440
+      containers:
+        - name: fma
+          image: fma
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: tls
+              mountPath: /run/fma/tls
+              readOnly: true
+          envFrom:
+            - configMapRef:
+                name: fma-config
+            - secretRef:
+                name: fma-s3
+          args:
+            - -domain
+            - $(FMA_DOMAIN)
+            - -tls-dir
+            - /run/fma/tls
+            - -queue-retry
+            - $(FMA_QUEUE_RETRY)
+            - -smtp
+            - 0.0.0.0:2525
+            - -submission
+            - 0.0.0.0:1587
+            - -smtps
+            - 0.0.0.0:1465
+            - -pop3
+            - 0.0.0.0:1110
+            - -pop3s
+            - 0.0.0.0:1995
+            - -imap
+            - 0.0.0.0:1143
+            - -imaps
+            - 0.0.0.0:1993
+            - -http
+            - 0.0.0.0:8080
+          ports:
+            - {name: smtp, containerPort: 2525}
+            - {name: submission, containerPort: 1587}
+            - {name: smtps, containerPort: 1465}
+            - {name: pop3, containerPort: 1110}
+            - {name: pop3s, containerPort: 1995}
+            - {name: imap, containerPort: 1143}
+            - {name: imaps, containerPort: 1993}
+            - {name: health, containerPort: 8080}
+          startupProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: {path: /, port: health}
+            periodSeconds: 5

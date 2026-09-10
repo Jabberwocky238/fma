@@ -32,12 +32,18 @@ else
     ctl+=(--user)
 fi
 printf 'WARNING: %s mode (UID %s); binary: %s; config: %s; systemd: %s\n' "$mode" "$(id -u)" "$default_bin" "$default_config" "$default_units"
+case "$(uname -s)" in
+    Linux) platform=linux; binary_name=fma; archive_ext=tar.gz; extractor=tar ;;
+    Darwin) platform=darwin; binary_name=fma; archive_ext=tar.gz; extractor=tar ;;
+    MINGW*|MSYS*|CYGWIN*|Windows_NT) platform=windows; binary_name=fma.exe; archive_ext=zip; extractor=unzip ;;
+    *) printf 'Unsupported operating system.\n' >&2; exit 1 ;;
+esac
 install_dir=${FMA_INSTALL_DIR:-$default_bin}
 service_config=$default_config
 service_units=$default_units
 deploy_dir=${FMA_DEPLOY_DIR:-$default_config/deploy}
 manifest=$default_config/install.paths
-valid_path() { [[ "$1" =~ ^/[a-zA-Z0-9_./-]+$ && "$1/" != *'/../'* && "$1" != / ]]; }
+valid_path() { [[ "$1" == /* && "$1/" != *'/../'* && "$1" != / && "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
 if [[ "$uninstall" == true ]]; then
     [[ "$systemd" == false && -z "$generated" ]] || { printf '--uninstall cannot be combined with install options.\n' >&2; exit 1; }
     if [[ -f "$manifest" && ! -L "$manifest" ]]; then
@@ -46,16 +52,16 @@ if [[ "$uninstall" == true ]]; then
     for value in "$install_dir" "$service_config" "$service_units" "$deploy_dir"; do
         valid_path "$value" || { printf 'Invalid uninstall path.\n' >&2; exit 1; }
     done
-    printf 'Removing %s/fma, %s/fma.service and fma configuration from %s\n' "$install_dir" "$service_units" "$service_config"
+    printf 'Removing %s/%s, %s/fma.service and fma configuration from %s\n' "$install_dir" "$binary_name" "$service_units" "$service_config"
     if [[ -e "$service_units/fma.service" || -L "$service_units/fma.service" ]]; then
         "${ctl[@]}" disable --now fma.service
         rm -f -- "$service_units/fma.service"
         "${ctl[@]}" daemon-reload
     fi
-    if [[ "$mode" == root && -L /bin/fma && "$(readlink /bin/fma)" == "$install_dir/fma" ]]; then
+    if [[ "$mode" == root && -L /bin/fma && "$(readlink /bin/fma)" == "$install_dir/$binary_name" ]]; then
         rm -f -- /bin/fma
     fi
-    rm -f -- "$install_dir/fma" "$service_config/s3.env" "$service_config/outbound.env" "$manifest"
+    rm -f -- "$install_dir/$binary_name" "$service_config/s3.env" "$service_config/outbound.env" "$manifest"
     # Remove only fma's generated artifacts, preserving unrelated files.
     for name in install.mk fma.service s3.env outbound.env nginx-http.conf nginx-https.conf nginx-stream.conf renew-hook.sh; do
         rm -f -- "$deploy_dir/generated/$name" "$deploy_dir/template/$name.tmpl"
@@ -65,15 +71,10 @@ if [[ "$uninstall" == true ]]; then
     printf 'Uninstalled fma in %s mode. S3 data is preserved.\n' "$mode"
     exit 0
 fi
-binary=$install_dir/fma
-for tool in curl tar mktemp; do
+binary=$install_dir/$binary_name
+for tool in curl "$extractor" mktemp; do
     command -v "$tool" >/dev/null || { printf 'Required command not found: %s\n' "$tool" >&2; exit 1; }
 done
-case "$(uname -s)" in
-    Linux) platform=linux ;;
-    Darwin) platform=darwin ;;
-    *) printf 'This installer supports Linux and macOS. Download Windows ZIPs from Releases.\n' >&2; exit 1 ;;
-esac
 if [[ "$systemd" == true ]]; then
     [[ "$platform" == linux ]] || { printf '--systemd requires Linux.\n' >&2; exit 1; }
     command -v systemctl >/dev/null || { printf 'systemctl is required.\n' >&2; exit 1; }
@@ -112,7 +113,7 @@ trap 'rm -rf -- "$work"; [[ -z "$staged" ]] || rm -f -- "$staged"' EXIT
 downloaded=false
 fetch_release() {
     [[ "$downloaded" == false ]] || return 0
-archive=fma_${latest}_${platform}_${arch}.tar.gz
+archive=fma_${latest}_${platform}_${arch}.${archive_ext}
 base=https://github.com/$repo/releases/download/$tag
 for asset in "$archive" checksums.txt; do
     curl --proto '=https' --proto-redir '=https' --fail --silent --show-error --location --retry 3 \
@@ -172,7 +173,7 @@ if [[ "$systemd" == true ]]; then
     for value in "$install_dir" "$service_config" "$service_units"; do
         [[ "$value" =~ ^/[a-zA-Z0-9_./-]+$ && "$value" != *'/../'* ]] || { printf 'Invalid generated installation path.\n' >&2; exit 1; }
     done
-    binary=$install_dir/fma
+    binary=$install_dir/$binary_name
 fi
 
 install_link() {
@@ -215,14 +216,18 @@ fi
 
 fetch_release
 # Extract only the binary, not paths supplied by other archive entries.
-tar -xzf "$work/$archive" -C "$work" fma
-[[ -f "$work/fma" && ! -L "$work/fma" ]] || { printf 'Archive has no regular fma binary.\n' >&2; exit 1; }
-chmod 755 "$work/fma"
-reported=$("$work/fma" --version)
+if [[ "$platform" == windows ]]; then
+    unzip -q "$work/$archive" "$binary_name" -d "$work"
+else
+    tar -xzf "$work/$archive" -C "$work" "$binary_name"
+fi
+[[ -f "$work/$binary_name" && ! -L "$work/$binary_name" ]] || { printf 'Archive has no regular fma binary.\n' >&2; exit 1; }
+chmod 755 "$work/$binary_name"
+reported=$("$work/$binary_name" --version)
 [[ "${reported%%$'\n'*}" == "fma $latest" ]] || { printf 'Binary version does not match the release.\n' >&2; exit 1; }
 mkdir -p "$install_dir"
 staged=$(mktemp "$install_dir/.fma-install.XXXXXX")
-cp "$work/fma" "$staged"
+cp "$work/$binary_name" "$staged"
 chmod 755 "$staged"
 mv -f "$staged" "$binary"
 staged=
