@@ -67,6 +67,13 @@ else:
         self.assertEqual(version, 'fma 1.2.0\n')
         self.assertEqual((self.bin / 'fma').stat().st_mode & 0o777, 0o755)
 
+    def test_metadata_does_not_trigger_reinstall(self):
+        previous = self.existing('1.2.0\\ncommit: abc123\\nrelease-time: 2026-09-10T12:00:00Z')
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.bin / 'fma').read_bytes(), previous)
+        self.assertNotIn('/download/', (self.root / 'requests').read_text())
+
     def test_default_no_preserves_old_version(self):
         previous = self.existing('1.1.0')
         result = self.run_installer('\n')

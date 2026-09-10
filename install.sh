@@ -43,6 +43,7 @@ up_to_date() {
 
 if [[ -e "$binary" || -L "$binary" ]]; then
     current=$({ "$binary" --version || true; } 2>/dev/null)
+    current=${current%%$'\n'*}
     current=${current#fma }
     if up_to_date "$current" "$latest"; then
         printf 'fma %s is already installed at %s; no update needed.\n' "$current" "$binary"
@@ -80,7 +81,8 @@ fi
 tar -xzf "$work/$archive" -C "$work" fma
 [[ -f "$work/fma" && ! -L "$work/fma" ]] || { printf 'Archive has no regular fma binary.\n' >&2; exit 1; }
 chmod 755 "$work/fma"
-[[ "$("$work/fma" --version)" == "fma $latest" ]] || { printf 'Binary version does not match the release.\n' >&2; exit 1; }
+reported=$("$work/fma" --version)
+[[ "${reported%%$'\n'*}" == "fma $latest" ]] || { printf 'Binary version does not match the release.\n' >&2; exit 1; }
 mkdir -p "$install_dir"
 staged=$(mktemp "$install_dir/.fma-install.XXXXXX")
 cp "$work/fma" "$staged"

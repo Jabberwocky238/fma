@@ -17,7 +17,10 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - -s -w -X main.version={{ .Version }}
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .FullCommit }} -X main.releaseTime={{ .Date }}
+
+snapshot:
+  version_template: 'dev-{{ .Now.Format "20060102T150405Z" }}'
 
 archives:
   - id: fma

@@ -1,4 +1,10 @@
 APP := fma
+BUILD_DATETIME := $(shell date -u +%Y%m%dT%H%M%SZ)
+VERSION ?= dev-$(BUILD_DATETIME)
+COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+RELEASE_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.releaseTime=$(RELEASE_TIME)
+export FMA_BUILD_LDFLAGS := $(LDFLAGS)
 PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
 SYSTEMD_USER_DIR := $(HOME)/.config/systemd/user
@@ -9,7 +15,7 @@ SERVICE := $(SYSTEMD_USER_DIR)/$(APP).service
 
 .PHONY: build check test install install-config uninstall
 build: check
-	go build -trimpath -o $(APP) .
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(APP) .
 
 check:
 	@test -z "$$(gofmt -l *.go)" || { echo 'Run gofmt -w *.go'; exit 1; }
@@ -17,7 +23,7 @@ check:
 	go vet ./...
 
 test: check
-	go test -race ./...
+	go test -race -ldflags "$(LDFLAGS)" ./...
 	python3 scripts/verify.py
 	python3 scripts/test_deploy.py
 	python3 scripts/test_install.py

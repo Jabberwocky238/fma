@@ -192,6 +192,13 @@ allocation, listing over 1000 objects, outbound retries, folders, and process re
 The mail test process runs in an empty, read-only working directory. Tests do not use
 Docker. Set `FALS3Y_BIN` to override the default `~/.local/bin/fals3y` executable.
 
+Build metadata is injected at link time into three separate variables: `version`,
+`commit`, and `releaseTime`. `make build` and `make test` default to a UTC version
+such as `dev-20260910T120000Z`, the full Git commit, and an RFC3339 UTC build time.
+Override these with `VERSION`, `COMMIT`, and `RELEASE_TIME` when needed. Use Make
+instead of bare `go build` to populate this metadata. `fma --version` prints the
+version on its first line, followed by commit and release time.
+
 ## CI and releases
 
 GitHub Actions runs formatting, vet, race, native Fals3y integration tests, and a
@@ -206,7 +213,9 @@ git push origin v0.1.0
 ```
 
 GoReleaser builds Linux, macOS, and Windows binaries for amd64 and arm64 without
-CGO. Releases include tar.gz archives (ZIP on Windows), the README, MIT license,
+CGO. GoReleaser injects the tag version, full commit and UTC release-build time;
+snapshot builds use `dev-{datetime}`. This time identifies the build, which precedes
+the GitHub Release publication. Releases include tar.gz archives (ZIP on Windows), the README, MIT license,
 deployment examples, and SHA-256 checksums. Version tags with prerelease suffixes
 produce prereleases. Publishing uses the workflow's built-in `GITHUB_TOKEN` with
 `contents: write`; no personal token or Docker daemon is required.

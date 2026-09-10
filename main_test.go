@@ -51,11 +51,15 @@ func newFakeRelay(t *testing.T, implicit bool) *fakeRelay {
 	}
 	relay := new(fakeRelay)
 	relay.code.Store(250)
-	config.Relay = RelayConfig{Addr: listener.Addr().String(), User: "relay-user", Password: "relay-password", TLS: "starttls", CAFile: ca, RootCAs: x509.NewCertPool()}
+	config.RelayAddr = listener.Addr().String()
+	config.RelayUser, config.RelayPassword = "relay-user", "relay-password"
+	config.RelayPasswordFile = ""
+	config.RelayTLS, config.RelayCAFile = "starttls", ca
+	config.RelayRootCAs = x509.NewCertPool()
 	if implicit {
-		config.Relay.TLS = "implicit"
+		config.RelayTLS = "implicit"
 	}
-	config.Relay.RootCAs.AddCert(certServer.Certificate())
+	config.RelayRootCAs.AddCert(certServer.Certificate())
 	server := smtp.NewServer(relay)
 	server.Domain, server.TLSConfig = "test-relay", cfg
 	server.ReadTimeout, server.WriteTimeout = 5*time.Second, 5*time.Second
@@ -214,7 +218,7 @@ func TestExternalRecipientRequiresAuthentication(t *testing.T) {
 func TestOutboundRejectsUntrustedTLS(t *testing.T) {
 	outboundTestDir(t)
 	newFakeRelay(t, true)
-	config.Relay.RootCAs = nil
+	config.RelayRootCAs = nil
 	err := sendRemote(context.Background(), &outboundJob{From: "jw238@t12e.cc"}, "recipient@example.net")
 	if err == nil {
 		t.Fatal("untrusted TLS was accepted")
@@ -225,8 +229,8 @@ func TestOutboundCancellation(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	checkError(t, err)
 	defer listener.Close()
-	config.Relay.Addr = listener.Addr().String()
-	config.Relay.TLS = "starttls"
+	config.RelayAddr = listener.Addr().String()
+	config.RelayTLS = "starttls"
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -340,18 +344,18 @@ func TestConfigRelaySnapshot(t *testing.T) {
 	passwordPath := "password"
 	checkError(t, objects.Put(passwordPath, []byte("relay-password\r\n")))
 	env := map[string]string{
-		"FMA_OUTBOUND_MODE": "relay", "FMA_RELAY_ADDR": config.Relay.Addr,
+		"FMA_OUTBOUND_MODE": "relay", "FMA_RELAY_ADDR": config.RelayAddr,
 		"FMA_RELAY_USER": "relay-user", "FMA_RELAY_PASSWORD": "overridden-password",
-		"FMA_RELAY_PASSWORD_FILE": "password", "FMA_RELAY_CA_FILE": config.Relay.CAFile, "FMA_RELAY_TLS": "implicit",
+		"FMA_RELAY_PASSWORD_FILE": "password", "FMA_RELAY_CA_FILE": config.RelayCAFile, "FMA_RELAY_TLS": "implicit",
 	}
 	loaded, err := loadConfig(nil, func(key string) string { return env[key] })
 	checkError(t, err)
 	checkError(t, loadRelayObjects(&loaded))
-	if loaded.Relay.Password != "relay-password" || loaded.Relay.RootCAs == nil {
+	if loaded.RelayPassword != "relay-password" || loaded.RelayRootCAs == nil {
 		t.Fatal("secret file or CA not loaded")
 	}
 	checkError(t, objects.Delete(passwordPath))
-	checkError(t, objects.Delete(config.Relay.CAFile))
+	checkError(t, objects.Delete(config.RelayCAFile))
 	for key := range env {
 		t.Setenv(key, "invalid-after-startup")
 	}
@@ -420,7 +424,7 @@ func TestConfigValidationAndQueue(t *testing.T) {
 	}
 
 	c, err := loadConfig(nil, func(key string) string { return base[key] })
-	if err != nil || c.Relay.TLS != "starttls" {
+	if err != nil || c.RelayTLS != "starttls" {
 		t.Fatal("default relay TLS changed", err)
 	}
 }

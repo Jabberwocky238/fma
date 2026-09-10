@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Protocol integration checks. Default: isolated local server. --host: deployed server."""
 import argparse
+import base64
+from email.message import EmailMessage
+from email.parser import BytesParser
+from email import policy
 import concurrent.futures
 import imaplib
 import os
 from pathlib import Path
 import poplib
+from contextlib import closing
 import signal
 import smtplib
 import socket
@@ -196,12 +201,71 @@ def verify(host, ports, context, user='jw238', password='123123', isolated=False
         print('PASS user isolation / concurrent delivery')
 
 
+def attachment_message():
+    msg = EmailMessage(policy=policy.SMTP)
+    msg['From'] = 'jw238@t12e.cc'
+    msg['To'] = 'mime-to@t12e.cc, mime-header-only@t12e.cc'
+    msg['Cc'] = 'mime-cc@t12e.cc'
+    msg['Bcc'] = 'mime-bcc@t12e.cc'
+    msg['Subject'] = 'MIME attachments and envelope recipients'
+    msg.set_content('中文正文\n.dot stuffed\n', cte='quoted-printable')
+    msg.add_alternative('<html><body>中文<img src="cid:logo"></body></html>', subtype='html')
+    msg.get_payload()[1].add_related(b'\x89PNG\r\n\x00\xff', maintype='image', subtype='png', cid='<logo>', filename='logo.png', disposition='inline')
+    msg.add_attachment(bytes(range(256)) * 4096, maintype='application', subtype='octet-stream', filename='报告-完整数据.bin')
+    msg.add_attachment(b'', maintype='application', subtype='octet-stream', filename='empty.bin')
+    return msg
+
+
+def verify_attachment_mailboxes(host, ports, context, expected):
+    for user in ['mime-to', 'mime-cc', 'mime-bcc']:
+        with imaplib.IMAP4_SSL(host, ports[4], ssl_context=context, timeout=15) as c:
+            c.login(user, 'mime-password')
+            c.select('INBOX', readonly=True)
+            ids = c.uid('search', None, 'ALL')[1][0].split()
+            require(len(ids) == 1, 'To/Cc/Bcc recipient missing or duplicate delivery: ' + user)
+            status, data = c.uid('fetch', ids[0], '(RFC822.SIZE BODYSTRUCTURE BODY.PEEK[])')
+            raw = next(item[1] for item in data if isinstance(item, tuple))
+            require(status == 'OK' and raw == expected, 'IMAP changed MIME message: ' + user)
+            structure = b' '.join(item[0] if isinstance(item, tuple) else item for item in data if item)
+            require(b'ATTACHMENT' in structure.upper() and b'BASE64' in structure.upper(), 'IMAP attachment BODYSTRUCTURE missing')
+            parsed = BytesParser(policy=policy.default).parsebytes(raw)
+            require(parsed['Cc'] == 'mime-cc@t12e.cc' and parsed['Bcc'] is None, 'Cc/Bcc header privacy broken')
+            parts = {part.get_filename(): part for part in parsed.walk() if part.get_filename()}
+            require(set(parts) == {'报告-完整数据.bin', 'empty.bin', 'logo.png'}, 'attachment filenames changed')
+            require(parts['报告-完整数据.bin'].get_payload(decode=True) == bytes(range(256)) * 4096, 'binary attachment corrupted')
+            require(parts['empty.bin'].get_payload(decode=True) == b'', 'empty attachment corrupted')
+            require(parts['logo.png']['Content-ID'] == '<logo>' and parts['logo.png'].get_payload(decode=True) == b'\x89PNG\r\n\x00\xff', 'inline image corrupted')
+            status, section = c.uid('fetch', ids[0], '(BODY.PEEK[2])')
+            encoded = next(item[1] for item in section if isinstance(item, tuple))
+            require(status == 'OK' and base64.b64decode(encoded) == bytes(range(256)) * 4096, 'IMAP attachment section corrupted')
+            status, partial = c.uid('fetch', ids[0], '(BODY.PEEK[2]<0.64>)')
+            require(status == 'OK' and next(item[1] for item in partial if isinstance(item, tuple)) == encoded[:64], 'partial attachment fetch corrupted')
+        with closing(poplib.POP3_SSL(host, ports[3], context=context, timeout=15)) as p:
+            p.user(user)
+            p.pass_('mime-password')
+            require(p.stat()[0] == 1, 'POP recipient count mismatch')
+            raw = b'\r\n'.join(p.retr(1)[1]) + b'\r\n'
+            require(raw == expected and p.stat()[1] == len(raw), 'POP attachment bytes/size mismatch')
+    with imaplib.IMAP4_SSL(host, ports[4], ssl_context=context, timeout=15) as c:
+        c.login('mime-header-only', 'mime-password')
+        c.select('INBOX', readonly=True)
+        require(c.uid('search', None, 'ALL')[1][0] == b'', 'header-only recipient received mail without RCPT TO')
+    with imaplib.IMAP4_SSL(host, ports[4], ssl_context=context, timeout=15) as c:
+        c.login('jw238', '123123')
+        c.select('Sent', readonly=True)
+        ids = c.uid('search', None, 'SUBJECT', '"MIME attachments and envelope recipients"')[1][0].split()
+        require(len(ids) == 1, 'MIME Sent archive missing')
+        data = c.uid('fetch', ids[0], '(BODY.PEEK[])')[1]
+        require(next(item[1] for item in data if isinstance(item, tuple)) == expected, 'Sent attachment changed')
+    print('PASS attachments / Unicode filenames / empty file / inline image / MIME sections / To-Cc-Bcc / envelope-only delivery')
+
+
 def local():
     root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix='fma-mail-test-') as tmp:
         tmp = Path(tmp)
         binary = tmp / 'fma'
-        subprocess.run(['go', 'build', '-race', '-o', str(binary), '.'], cwd=root, check=True)
+        subprocess.run(['go', 'build', '-race', '-ldflags', os.environ.get('FMA_BUILD_LDFLAGS', ''), '-o', str(binary), '.'], cwd=root, check=True)
         # The S3 service owns its filesystem; the mail process gets an empty,
         # read-only working directory and only a bucket connection.
         s3_socket = socket.socket()
@@ -242,7 +306,7 @@ def local():
                    'FMA_S3_ACCESS_KEY_ID':'test', 'FMA_S3_SECRET_ACCESS_KEY':'test', 'FMA_OUTBOUND_MODE':'disabled'}
             work = tmp/'empty-workdir'
             work.mkdir(mode=0o500)
-            for user,password in [('jw238','123123'),('jw238x','different-password')]:
+            for user,password in [('jw238','123123'),('jw238x','different-password')] + [(u, 'mime-password') for u in ['mime-to', 'mime-cc', 'mime-bcc', 'mime-header-only']]:
                 s3_request(f'/{bucket}/{user}/.password', 'PUT', password.encode())
             sockets = [socket.socket() for _ in range(8)]
             for sock in sockets:
@@ -272,6 +336,15 @@ def local():
             try:
                 verify('127.0.0.1', ports, context, isolated=True)
                 verify_folders('127.0.0.1', ports[4], context)
+                mime = attachment_message()
+                # Freeze boundaries, then let the submitting client remove Bcc from DATA.
+                mime.as_bytes()
+                with smtplib.SMTP_SSL('127.0.0.1', ports[2], context=context) as sender:
+                    sender.login('jw238', '123123')
+                    sender.send_message(mime, to_addrs=['mime-to@t12e.cc', 'mime-cc@t12e.cc', 'mime-bcc@t12e.cc', 'mime-cc@t12e.cc'])
+                del mime['Bcc']
+                expected_mime = mime.as_bytes()
+                verify_attachment_mailboxes('127.0.0.1', ports, context, expected_mime)
                 proc.send_signal(signal.SIGTERM)
                 require(proc.wait(timeout=15) == 0, 'unclean shutdown')
                 proc = start()
@@ -281,6 +354,7 @@ def local():
                 ids = c.uid('search',None,'ALL')[1][0].split()
                 require(len(ids)==12 and min(map(int,ids))>=4, 'restart lost mail or reused UID')
                 c.logout()
+                verify_attachment_mailboxes('127.0.0.1', ports, context, expected_mime)
                 require(list(work.iterdir())==[], 'mail process wrote local files')
                 s3_request(f'/{bucket}/jw238/.password')
                 s3_request(f'/{bucket}/jw238/folders')

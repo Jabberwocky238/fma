@@ -55,23 +55,22 @@ import (
 
 // Config is loaded once before startup; serving code only reads this snapshot.
 type Config struct {
-	Domain, CertFile, KeyFile                          string
-	SMTPAddr, SubmissionAddr, SMTPSAddr                string
-	POP3Addr, POP3SAddr, IMAPAddr, IMAPSAddr, HTTPAddr string
-	OutboundMode                                       string
-	ShowQueue, ShowVersion                             bool
-	QueueRetry                                         time.Duration
-	Relay                                              RelayConfig
-	S3                                                 S3Config
-}
-
-type RelayConfig struct {
-	Addr, User, Password, PasswordFile, TLS, CAFile string
-	RootCAs                                         *x509.CertPool
+	Domain, CertFile, KeyFile                              string
+	SMTPAddr, SubmissionAddr, SMTPSAddr                    string
+	POP3Addr, POP3SAddr, IMAPAddr, IMAPSAddr, HTTPAddr     string
+	OutboundMode                                           string
+	ShowQueue, ShowVersion                                 bool
+	QueueRetry                                             time.Duration
+	RelayAddr, RelayUser, RelayPassword, RelayPasswordFile string
+	RelayTLS, RelayCAFile                                  string
+	RelayRootCAs                                           *x509.CertPool
+	S3                                                     S3Config
 }
 
 var config Config
-var version = "dev"
+
+// Injected by Make or GoReleaser with -ldflags -X.
+var version, commit, releaseTime string
 
 func defaultConfig() Config {
 	return Config{
@@ -97,11 +96,12 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	c.S3.SecretKey = getenv("S3_SECRET_ACCESS_KEY")
 	c.S3.SessionToken = getenv("S3_SESSION_TOKEN")
 	c.OutboundMode = getenv("OUTBOUND_MODE")
-	c.Relay = RelayConfig{
-		Addr: getenv("RELAY_ADDR"), User: getenv("RELAY_USER"),
-		Password: getenv("RELAY_PASSWORD"), PasswordFile: getenv("RELAY_PASSWORD_FILE"),
-		TLS: getenv("RELAY_TLS"), CAFile: getenv("RELAY_CA_FILE"),
-	}
+	c.RelayAddr = getenv("RELAY_ADDR")
+	c.RelayUser = getenv("RELAY_USER")
+	c.RelayPassword = getenv("RELAY_PASSWORD")
+	c.RelayPasswordFile = getenv("RELAY_PASSWORD_FILE")
+	c.RelayTLS = getenv("RELAY_TLS")
+	c.RelayCAFile = getenv("RELAY_CA_FILE")
 	f := flag.NewFlagSet("fma", flag.ContinueOnError)
 	f.StringVar(&c.Domain, "domain", c.Domain, "local email domain")
 	f.StringVar(&c.S3.Endpoint, "s3-endpoint", c.S3.Endpoint, "S3 endpoint URL; empty for AWS")
@@ -134,19 +134,19 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	switch c.OutboundMode {
 	case "", "disabled", "direct":
 	case "relay":
-		if _, _, err := net.SplitHostPort(c.Relay.Addr); err != nil {
+		if _, _, err := net.SplitHostPort(c.RelayAddr); err != nil {
 			return Config{}, fmt.Errorf("FMA_RELAY_ADDR must be host:port: %w", err)
 		}
-		if c.Relay.User == "" {
+		if c.RelayUser == "" {
 			return Config{}, fmt.Errorf("FMA_RELAY_USER is required")
 		}
-		if c.Relay.TLS == "" {
-			c.Relay.TLS = "starttls"
+		if c.RelayTLS == "" {
+			c.RelayTLS = "starttls"
 		}
-		if c.Relay.TLS != "starttls" && c.Relay.TLS != "implicit" {
+		if c.RelayTLS != "starttls" && c.RelayTLS != "implicit" {
 			return Config{}, fmt.Errorf("FMA_RELAY_TLS must be starttls or implicit")
 		}
-		if c.Relay.Password == "" && c.Relay.PasswordFile == "" {
+		if c.RelayPassword == "" && c.RelayPasswordFile == "" {
 			return Config{}, fmt.Errorf("relay password is required")
 		}
 	default:
@@ -171,7 +171,7 @@ func main() {
 
 func run() error {
 	if config.ShowVersion {
-		fmt.Printf("fma %s\n", version)
+		fmt.Printf("fma %s\ncommit: %s\nrelease-time: %s\n", version, commit, releaseTime)
 		return nil
 	}
 	bucket, err := connectBucket(config.S3)
@@ -651,23 +651,23 @@ func loadRelayObjects(c *Config) error {
 	if c.OutboundMode != "relay" {
 		return nil
 	}
-	if c.Relay.PasswordFile != "" {
-		data, err := objects.Get(c.Relay.PasswordFile)
+	if c.RelayPasswordFile != "" {
+		data, err := objects.Get(c.RelayPasswordFile)
 		if err != nil {
 			return fmt.Errorf("read relay password object: %w", err)
 		}
-		c.Relay.Password = strings.TrimRight(string(data), "\r\n")
+		c.RelayPassword = strings.TrimRight(string(data), "\r\n")
 	}
-	if c.Relay.Password == "" {
+	if c.RelayPassword == "" {
 		return fmt.Errorf("relay password is required")
 	}
-	if c.Relay.CAFile != "" {
-		data, err := objects.Get(c.Relay.CAFile)
+	if c.RelayCAFile != "" {
+		data, err := objects.Get(c.RelayCAFile)
 		if err != nil {
 			return fmt.Errorf("read relay CA object: %w", err)
 		}
-		c.Relay.RootCAs = x509.NewCertPool()
-		if !c.Relay.RootCAs.AppendCertsFromPEM(data) {
+		c.RelayRootCAs = x509.NewCertPool()
+		if !c.RelayRootCAs.AppendCertsFromPEM(data) {
 			return fmt.Errorf("invalid relay CA object")
 		}
 	}
@@ -2110,7 +2110,7 @@ func sendRemote(ctx context.Context, job *outboundJob, recipient string) error {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	if config.OutboundMode == "relay" {
-		return sendSMTP(ctx, config.Relay.Addr, job, recipient, true)
+		return sendSMTP(ctx, config.RelayAddr, job, recipient, true)
 	}
 	domain := recipient[strings.LastIndex(recipient, "@")+1:]
 	records, err := net.DefaultResolver.LookupMX(ctx, domain)
@@ -2146,7 +2146,7 @@ func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient s
 	}
 	cfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
 	if relay {
-		cfg.RootCAs = config.Relay.RootCAs
+		cfg.RootCAs = config.RelayRootCAs
 	}
 	conn, err := (&net.Dialer{Timeout: 8 * time.Second}).DialContext(ctx, "tcp", address)
 	if err != nil {
@@ -2159,7 +2159,7 @@ func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient s
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(deadline)
 	}
-	implicit := relay && config.Relay.TLS == "implicit"
+	implicit := relay && config.RelayTLS == "implicit"
 	if implicit {
 		encrypted := tls.Client(conn, cfg)
 		if err = encrypted.HandshakeContext(ctx); err != nil {
@@ -2181,7 +2181,7 @@ func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient s
 		}
 	}
 	if relay {
-		if err = client.Auth(stdsmtp.PlainAuth("", config.Relay.User, config.Relay.Password, host)); err != nil {
+		if err = client.Auth(stdsmtp.PlainAuth("", config.RelayUser, config.RelayPassword, host)); err != nil {
 			return fmt.Errorf("relay authentication failed: %w", err)
 		}
 	}
