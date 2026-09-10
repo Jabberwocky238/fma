@@ -748,6 +748,8 @@ SMTP uses a pinned performance fork through `go.mod replace` ([PR #312](https://
 
 POP3 v0.1.6 adds bounded ARM64 vector scanning with a portable fallback. The isolated 2 GiB writer benchmark gains another 2.04x throughput; complete-download gains remain unproven. CPU, RSS, input-shape comparisons and reproduction commands are recorded in [PERFORMANCE.md](PERFORMANCE.md).
 
+S3 upload buffers use 1 MiB blocks, grouped into 8 MiB multipart requests without concatenation. Up to four parts are active per upload, with a global 1 GiB active-buffer limit allocated on demand. Cross-account object copies use S3 CopyObject or UploadPartCopy. JMAP MIME parsing uses the pinned [streaming fork](https://github.com/Jabberwocky238/naust-jmap/commit/86f12015507c) to reuse buffers and decode blocks without a metadata or body cache.
+
 See [PERFORMANCE.md](PERFORMANCE.md) for measured throughput and the remaining limits.
 
 The throughput benchmark defaults to a 2 GiB attachment and reports both wire-byte and

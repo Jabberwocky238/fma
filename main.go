@@ -4024,12 +4024,121 @@ func (w jmapPartWriter) Commit() (jmap.Id, error) {
 func decodeMIME(r io.Reader, h textproto.MIMEHeader) io.Reader {
 	switch strings.ToLower(h.Get("Content-Transfer-Encoding")) {
 	case "base64":
-		return base64.NewDecoder(base64.StdEncoding, r)
+		return &mimeBase64Reader{source: r}
 	case "quoted-printable":
 		return quotedprintable.NewReader(r)
 	}
 	return r
 }
+
+// Base64 MIME input is compacted in a reusable buffer. Decode writes directly
+// into a sufficiently large caller buffer; small callers use the input buffer
+// in place, retaining at most one block and a three-byte quartet tail.
+var mimeBase64Buffers = sync.Pool{New: func() any { b := make([]byte, 32<<10); return &b }}
+
+type mimeBase64Reader struct {
+	source       io.Reader
+	buffer       *[]byte
+	pending      []byte
+	tail         [3]byte
+	ntail        int
+	readErr, err error
+}
+
+func (r *mimeBase64Reader) release() {
+	if r.buffer != nil {
+		mimeBase64Buffers.Put(r.buffer)
+		r.buffer = nil
+	}
+}
+
+func compactMIMENewlines(p []byte) int {
+	written := 0
+	for pos := 0; pos < len(p); {
+		i := bytes.IndexByte(p[pos:], '\r')
+		j := bytes.IndexByte(p[pos:], '\n')
+		if i < 0 || j >= 0 && j < i {
+			i = j
+		}
+		if i < 0 {
+			i = len(p) - pos
+		}
+		if written != pos {
+			copy(p[written:], p[pos:pos+i])
+		}
+		written += i
+		pos += i
+		if pos < len(p) {
+			pos++
+		}
+	}
+	return written
+}
+
+func (r *mimeBase64Reader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(r.pending) != 0 {
+		n := copy(p, r.pending)
+		r.pending = r.pending[n:]
+		return n, nil
+	}
+	if r.err != nil {
+		r.release()
+		return 0, r.err
+	}
+	if r.buffer == nil {
+		r.buffer = mimeBase64Buffers.Get().(*[]byte)
+	}
+	buf := *r.buffer
+	nbuf := copy(buf, r.tail[:r.ntail])
+	r.ntail = 0
+	for empty := 0; nbuf < 4 && r.readErr == nil; {
+		limit := min(max(len(p)/3*4, 4), len(buf))
+		n, err := r.source.Read(buf[nbuf:limit])
+		r.readErr = err
+		nbuf += compactMIMENewlines(buf[nbuf : nbuf+n])
+		if n == 0 && err == nil {
+			empty++
+			if empty == 100 {
+				r.readErr = io.ErrNoProgress
+			}
+		} else {
+			empty = 0
+		}
+	}
+	if nbuf < 4 {
+		r.err = r.readErr
+		if r.err == io.EOF && nbuf > 0 {
+			r.err = io.ErrUnexpectedEOF
+		}
+		r.release()
+		return 0, r.err
+	}
+	nr := nbuf / 4 * 4
+	r.ntail = copy(r.tail[:], buf[nr:nbuf])
+	if len(p) >= nr/4*3 {
+		n, err := base64.StdEncoding.Decode(p, buf[:nr])
+		r.err = err
+		if err != nil {
+			r.release()
+		}
+		return n, err
+	}
+	// Decoding contracts the data; unread encoded bytes stay ahead of writes.
+	n, err := base64.StdEncoding.Decode(buf, buf[:nr])
+	r.err = err
+	r.pending = buf[:n]
+	n = copy(p, r.pending)
+	r.pending = r.pending[n:]
+	if len(r.pending) == 0 && err != nil {
+		r.release()
+		return n, err
+	}
+	return n, nil
+}
+
 func (s jmapBlobs) openPart(ctx context.Context, acct jmap.Id, part jmapPartManifest) (io.ReadCloser, error) {
 	key, err := s.key(acct, part.Source)
 	if err != nil {
@@ -4206,9 +4315,11 @@ func jmapReferencedBlobs(value any, ids map[jmap.Id]bool) {
 }
 
 // Streaming object IO is separate from small, conditional metadata operations.
-// Multipart uploads keep at most one 8 MiB part in memory and use S3, never disk,
-// for staging while the content-addressed blob ID is still being calculated.
+// Uploads assemble legal 8 MiB S3 parts from reusable 1 MiB blocks without
+// concatenating them. The global pool admits at most 1 GiB of active blocks.
 const s3PartSize = 8 << 20
+const s3BlockSize = 1 << 20
+const s3BufferLimit = 1 << 30
 const gzipThreshold = 10 << 20
 const (
 	maxAttachmentSize = 4 << 30
@@ -4398,21 +4509,17 @@ func (b *s3Bucket) CopyStream(ctx context.Context, src, dst string) error {
 			}
 		}
 		target := dstRoot + strings.TrimPrefix(ref.Key, srcRoot)
-		// Stream the stored bytes (including gzip) without decode/re-encode.
-		// This also works with S3-compatible services without UploadPartCopy.
-		source, err := b.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &b.bucket, Key: &ref.Key})
-		if err != nil {
-			return objectError(ref.Key, err)
-		}
-		defer source.Body.Close()
+		// Reserve the destination, then let S3 copy the stored bytes. The
+		// application never downloads or re-uploads the object body.
 		upload, err := b.NewUpload(ctx, target)
 		if err != nil {
 			return err
 		}
 		defer upload.Abort()
-		if _, err = copyStream(ctx, upload, source.Body); err != nil {
+		if err = b.copyStream(ctx, ref.Key, target, ref.Metadata); err != nil {
 			return err
 		}
+		upload.(*s3StreamUpload).physicalComplete = true
 		return upload.Commit(dst, ref.Metadata)
 	}
 	return b.putObjectReference(ctx, dst, ref, false)
@@ -4486,6 +4593,67 @@ func (b *s3Bucket) NewUpload(ctx context.Context, key string) (objectUpload, err
 	return &s3StreamUpload{bucket: b, ctx: ctx, cancel: cancel, key: key, reservation: reserved.ETag}, nil
 }
 
+// An S3 request body owns these blocks until the request (including retries)
+// finishes. Seek permits SDK retries without joining the blocks or rereading S3.
+type s3PartBuffer struct {
+	blocks [s3PartSize / s3BlockSize][]byte
+	size   int
+	offset int64
+}
+
+func (p *s3PartBuffer) Len() int { return p.size }
+func (p *s3PartBuffer) Write(data []byte) (int, error) {
+	if len(data) > s3PartSize-p.size {
+		return 0, io.ErrShortWrite
+	}
+	written := 0
+	for len(data) > 0 {
+		i, off := p.size/s3BlockSize, p.size%s3BlockSize
+		if p.blocks[i] == nil {
+			p.blocks[i] = make([]byte, s3BlockSize)
+		}
+		n := copy(p.blocks[i][off:], data)
+		data = data[n:]
+		p.size += n
+		written += n
+	}
+	return written, nil
+}
+func (p *s3PartBuffer) Read(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if p.offset >= int64(p.size) {
+		return 0, io.EOF
+	}
+	n := min(len(data), p.size-int(p.offset))
+	read := 0
+	for read < n {
+		i, off := int(p.offset)/s3BlockSize, int(p.offset)%s3BlockSize
+		k := copy(data[read:n], p.blocks[i][off:])
+		read += k
+		p.offset += int64(k)
+	}
+	return n, nil
+}
+func (p *s3PartBuffer) Seek(offset int64, whence int) (int64, error) {
+	next := offset
+	switch whence {
+	case io.SeekStart:
+	case io.SeekCurrent:
+		next += p.offset
+	case io.SeekEnd:
+		next += int64(p.size)
+	default:
+		return 0, fmt.Errorf("invalid S3 seek origin")
+	}
+	if next < 0 {
+		return 0, fmt.Errorf("negative S3 seek offset")
+	}
+	p.offset = next
+	return next, nil
+}
+
 type s3StreamUpload struct {
 	reservation      *string
 	physicalComplete bool
@@ -4498,7 +4666,8 @@ type s3StreamUpload struct {
 	key              string
 	uploadID         *string
 	parts            []s3types.CompletedPart
-	buffer           *bytes.Buffer
+	buffer           *s3PartBuffer
+	slots            chan struct{}
 	finished         bool
 }
 
@@ -4512,9 +4681,18 @@ func (w *s3StreamUpload) Write(data []byte) (int, error) {
 			return written, err
 		}
 		if w.buffer == nil {
+			if w.slots == nil {
+				w.slots = make(chan struct{}, 4)
+			}
+			select {
+			case w.slots <- struct{}{}:
+			case <-w.ctx.Done():
+				return written, w.ctx.Err()
+			}
 			var err error
 			w.buffer, err = s3BufferPool.Get(w.ctx)
 			if err != nil {
+				<-w.slots
 				return written, err
 			}
 		}
@@ -4530,6 +4708,12 @@ func (w *s3StreamUpload) Write(data []byte) (int, error) {
 	}
 	return written, nil
 }
+
+func (w *s3StreamUpload) releaseBuffer(buffer *s3PartBuffer) {
+	s3BufferPool.Put(buffer)
+	<-w.slots
+}
+
 func (w *s3StreamUpload) flush() error {
 	b := w.bucket
 	if w.uploadID == nil {
@@ -4548,9 +4732,9 @@ func (w *s3StreamUpload) flush() error {
 	w.workers.Add(1)
 	go func() {
 		defer w.workers.Done()
-		defer s3BufferPool.Put(buffer)
+		defer w.releaseBuffer(buffer)
 		number := int32(index + 1)
-		result, err := b.client.UploadPart(w.ctx, &s3.UploadPartInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, PartNumber: &number, Body: bytes.NewReader(buffer.Bytes()), ContentLength: aws.Int64(int64(buffer.Len()))})
+		result, err := b.client.UploadPart(w.ctx, &s3.UploadPartInput{Bucket: &b.bucket, Key: &w.key, UploadId: w.uploadID, PartNumber: &number, Body: buffer, ContentLength: aws.Int64(int64(buffer.Len()))})
 		w.partMu.Lock()
 		defer w.partMu.Unlock()
 		if err != nil {
@@ -4575,11 +4759,12 @@ func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
 	completeStart := time.Now()
 	if !w.physicalComplete {
 		if w.uploadID == nil {
-			var data []byte
+			var body io.ReadSeeker = bytes.NewReader(nil)
 			if w.buffer != nil {
-				data = w.buffer.Bytes()
+				body = w.buffer
+				w.buffer.Seek(0, io.SeekStart)
 			}
-			_, err := b.client.PutObject(w.ctx, &s3.PutObjectInput{Bucket: &b.bucket, Key: &w.key, Body: bytes.NewReader(data), IfMatch: w.reservation, Metadata: metadata})
+			_, err := b.client.PutObject(w.ctx, &s3.PutObjectInput{Bucket: &b.bucket, Key: &w.key, Body: body, IfMatch: w.reservation, Metadata: metadata})
 			if err != nil {
 				return objectError(w.key, err)
 			}
@@ -4610,7 +4795,7 @@ func (w *s3StreamUpload) Commit(key string, metadata map[string]string) error {
 	w.cancel()
 	w.workers.Wait()
 	if w.buffer != nil {
-		s3BufferPool.Put(w.buffer)
+		w.releaseBuffer(w.buffer)
 		w.buffer = nil
 	}
 	return nil
@@ -4624,7 +4809,7 @@ func (w *s3StreamUpload) Abort() error {
 	w.cancel()
 	w.workers.Wait()
 	if w.buffer != nil {
-		s3BufferPool.Put(w.buffer)
+		w.releaseBuffer(w.buffer)
 		w.buffer = nil
 	}
 	// Once completed, an index PUT may have succeeded despite a lost response.
@@ -4998,7 +5183,7 @@ func newBufferPool(count, size int) *WaitPool[*bytes.Buffer] {
 
 var (
 	mailProbePool  = newBufferPool(4, gzipThreshold)
-	s3BufferPool   = newBufferPool(4, s3PartSize)
+	s3BufferPool   = newWaitPool(s3BufferLimit/s3PartSize, func() *s3PartBuffer { return new(s3PartBuffer) }, func(p *s3PartBuffer) { p.size, p.offset = 0, 0 })
 	copyBufferPool = newBufferPool(32, 128<<10)
 	gzipWriters    = newWaitPool(4, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
 )

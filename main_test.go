@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path"
@@ -1985,5 +1987,234 @@ func TestJMAPDownloadWriterFailure(t *testing.T) {
 		if copyBufferPool.outstanding() != before {
 			t.Fatal("writer failure leaked pooled buffer")
 		}
+	}
+}
+
+type mimeChunkReader struct {
+	io.Reader
+	limit int
+}
+
+func (r mimeChunkReader) Read(p []byte) (int, error) { return r.Reader.Read(p[:min(len(p), r.limit)]) }
+
+func TestMIMEBase64Reader(t *testing.T) {
+	for _, size := range []int{0, 1, 2, 3, 4095, 32767, 65537} {
+		raw := bytes.Repeat([]byte("a\x00\xff"), (size+2)/3)[:size]
+		encoded := base64.StdEncoding.EncodeToString(raw)
+		var folded strings.Builder
+		for len(encoded) > 0 {
+			n := min(76, len(encoded))
+			folded.WriteString(encoded[:n])
+			folded.WriteString("\r\n")
+			encoded = encoded[n:]
+		}
+		for _, input := range []int{1, 3, 77, 1024, 4096, 32768} {
+			for _, output := range []int{1, 7, 128 << 10} {
+				reader := &mimeBase64Reader{source: mimeChunkReader{strings.NewReader(folded.String()), input}}
+				var got bytes.Buffer
+				_, err := io.CopyBuffer(struct{ io.Writer }{&got}, reader, make([]byte, output))
+				checkError(t, err)
+				if !bytes.Equal(got.Bytes(), raw) {
+					t.Fatalf("content mismatch size=%d input=%d output=%d", size, input, output)
+				}
+				if reader.buffer != nil {
+					t.Fatal("EOF retained pooled buffer")
+				}
+			}
+		}
+	}
+}
+
+func TestMIMEBase64ReaderErrors(t *testing.T) {
+	for _, raw := range []string{"Y", "YQ=", "YWJj#", "YWJj\t", "YQ==x"} {
+		for _, chunk := range []int{1, 4, 1024, 32768} {
+			reader := &mimeBase64Reader{source: mimeChunkReader{strings.NewReader(raw), chunk}}
+			_, err := io.ReadAll(reader)
+			if err == nil {
+				t.Fatalf("accepted corrupt input %q chunk=%d", raw, chunk)
+			}
+			if reader.buffer != nil {
+				t.Fatal("error retained pooled buffer")
+			}
+		}
+	}
+	for _, raw := range []string{"YQ==", "YQ==\r\n", "YWJj\r\n", "Y\rW\nJj"} {
+		got, err := io.ReadAll(&mimeBase64Reader{source: strings.NewReader(raw)})
+		checkError(t, err)
+		want, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, strings.NewReader(raw)))
+		checkError(t, err)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("newline handling: %q", raw)
+		}
+	}
+	terminal := errors.New("source interrupted")
+	reader := &mimeBase64Reader{source: jmapReadFunc(func(p []byte) (int, error) { return copy(p, "YWJj"), terminal })}
+	got, err := io.ReadAll(reader)
+	if string(got) != "abc" || err != terminal || reader.buffer != nil {
+		t.Fatalf("source error: %q %v", got, err)
+	}
+	reader = &mimeBase64Reader{source: jmapReadFunc(func([]byte) (int, error) { return 0, nil })}
+	_, err = io.ReadAll(reader)
+	if err != io.ErrNoProgress || reader.buffer != nil {
+		t.Fatalf("empty reader: %v", err)
+	}
+}
+
+func BenchmarkMIMEBase64(b *testing.B) {
+	raw := bytes.Repeat([]byte("stream\x00\xff"), (1<<20)/8)
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	var folded strings.Builder
+	for len(encoded) > 0 {
+		n := min(76, len(encoded))
+		folded.WriteString(encoded[:n])
+		folded.WriteString("\r\n")
+		encoded = encoded[n:]
+	}
+	data := folded.String()
+	expected := sha256.Sum256(raw)
+	for _, variant := range []string{"standard", "block"} {
+		b.Run(variant, func(b *testing.B) {
+			buf := make([]byte, 128<<10)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(raw)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var reader io.Reader
+				if variant == "block" {
+					reader = &mimeBase64Reader{source: strings.NewReader(data)}
+				} else {
+					reader = base64.NewDecoder(base64.StdEncoding, strings.NewReader(data))
+				}
+				digest := sha256.New()
+				_, err := io.CopyBuffer(digest, reader, buf)
+				if err != nil || !bytes.Equal(digest.Sum(nil), expected[:]) {
+					b.Fatalf("decoded digest: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestS3PartBufferBlocksAndRetry(t *testing.T) {
+	p, err := s3BufferPool.Get(context.Background())
+	checkError(t, err)
+	defer s3BufferPool.Put(p)
+	payload := bytes.Repeat([]byte("block\x00\xff"), (2*s3BlockSize)/7+1)
+	n, err := p.Write(payload)
+	checkError(t, err)
+	if n != len(payload) || p.Len() != len(payload) {
+		t.Fatal("partial block write")
+	}
+	for _, block := range p.blocks {
+		if block != nil && (len(block) != s3BlockSize || cap(block) != s3BlockSize) {
+			t.Fatal("block exceeds 1 MiB")
+		}
+	}
+	for _, offset := range []int64{0, s3BlockSize - 3, s3BlockSize, 2*s3BlockSize - 1, int64(len(payload)), int64(len(payload) + 1)} {
+		_, err = p.Seek(offset, io.SeekStart)
+		checkError(t, err)
+		got, err := io.ReadAll(p)
+		checkError(t, err)
+		if !bytes.Equal(got, payload[min(int(offset), len(payload)):]) {
+			t.Fatalf("seek/read mismatch at %d", offset)
+		}
+	}
+	_, err = p.Seek(-5, io.SeekEnd)
+	checkError(t, err)
+	got, err := io.ReadAll(p)
+	checkError(t, err)
+	if !bytes.Equal(got, payload[len(payload)-5:]) {
+		t.Fatal("retry tail changed")
+	}
+	if _, err = p.Seek(-1, io.SeekStart); err == nil {
+		t.Fatal("negative seek accepted")
+	}
+	if _, err = p.Seek(0, 99); err == nil {
+		t.Fatal("invalid seek accepted")
+	}
+	if _, err = p.Write(make([]byte, s3PartSize)); err != io.ErrShortWrite {
+		t.Fatal("part overflow accepted")
+	}
+	if s3BufferPool.max*s3PartSize != s3BufferLimit || s3BufferLimit != 1<<30 {
+		t.Fatal("incorrect global buffer bound")
+	}
+}
+
+func TestS3CopyStreamStaysOnServer(t *testing.T) {
+	for _, physicalSize := range []int64{16 << 20, 6 << 30} {
+		t.Run(fmt.Sprint(physicalSize), func(t *testing.T) {
+			source := "alice/.jmap/blobs/G" + strings.Repeat("a", 43)
+			destination := "bob/.jmap/blobs/G" + strings.Repeat("a", 43)
+			physical := "alice/mail/topic_123/message.eml"
+			ref := namedObjectReference{Key: physical, Metadata: map[string]string{"fma-encoding": "gzip", "fma-size": "2147483648"}}
+			data, err := json.Marshal(ref)
+			checkError(t, err)
+			var copies, bodyReads atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+				switch {
+				case r.Method == "HEAD" && r.URL.Path == "/bucket":
+					w.WriteHeader(200)
+				case r.Method == "HEAD" && key == source:
+					w.Header().Set("X-Amz-Meta-Fma-Reference", "1")
+					w.Header().Set("Content-Length", fmt.Sprint(len(data)))
+					w.WriteHeader(200)
+				case r.Method == "GET" && key == source:
+					w.Write(data)
+				case r.Method == "HEAD" && key == destination:
+					w.WriteHeader(404)
+				case r.Method == "HEAD" && key == physical:
+					w.Header().Set("Content-Length", fmt.Sprint(physicalSize))
+					w.Header().Set("ETag", `"original"`)
+					w.WriteHeader(200)
+				case r.Method == "GET" && key == physical:
+					bodyReads.Add(1)
+					http.Error(w, "application must not read object body", 500)
+				case r.Method == "POST" && r.URL.Query().Has("uploads"):
+					if r.Header.Get("X-Amz-Meta-Fma-Encoding") != "gzip" {
+						t.Error("multipart copy lost metadata")
+					}
+					fmt.Fprint(w, `<InitiateMultipartUploadResult><UploadId>copy-upload</UploadId></InitiateMultipartUploadResult>`)
+				case r.Method == "POST" && r.URL.Query().Get("uploadId") == "copy-upload":
+					fmt.Fprint(w, `<CompleteMultipartUploadResult><ETag>"completed"</ETag></CompleteMultipartUploadResult>`)
+				case r.Method == "PUT" && r.Header.Get("X-Amz-Copy-Source") != "":
+					copies.Add(1)
+					if physicalSize <= 5<<30 && (r.Header.Get("X-Amz-Meta-Fma-Encoding") != "gzip" || r.Header.Get("X-Amz-Meta-Fma-Size") != "2147483648") {
+						t.Error("copy lost compression metadata")
+					}
+					w.Header().Set("Content-Type", "application/xml")
+					if r.URL.Query().Get("uploadId") == "copy-upload" {
+						if r.Header.Get("X-Amz-Copy-Source-Range") == "" {
+							t.Error("multipart copy missing range")
+						}
+						fmt.Fprint(w, `<CopyPartResult><ETag>"copied-part"</ETag></CopyPartResult>`)
+					} else {
+						fmt.Fprint(w, `<CopyObjectResult><ETag>"copied"</ETag></CopyObjectResult>`)
+					}
+				case r.Method == "PUT":
+					if key == destination {
+						var copied namedObjectReference
+						if err := json.NewDecoder(r.Body).Decode(&copied); err != nil || copied.Key != "bob/mail/topic_123/message.eml" || copied.Metadata["fma-encoding"] != "gzip" {
+							t.Error("invalid destination reference", err)
+						}
+					}
+					w.Header().Set("ETag", `"reserved"`)
+					w.WriteHeader(200)
+				default:
+					http.Error(w, "unexpected S3 operation", 500)
+				}
+			}))
+			defer server.Close()
+			bucket, err := connectBucket(S3Config{Endpoint: server.URL, Bucket: "bucket", Region: "us-east-1", AccessKey: "test", SecretKey: "test"})
+			checkError(t, err)
+			checkError(t, bucket.CopyStream(context.Background(), source, destination))
+			expectedCopies := int32(1)
+			if physicalSize > 5<<30 {
+				expectedCopies = int32((physicalSize + (512 << 20) - 1) / (512 << 20))
+			}
+			if copies.Load() != expectedCopies || bodyReads.Load() != 0 {
+				t.Fatalf("copies=%d body reads=%d", copies.Load(), bodyReads.Load())
+			}
+		})
 	}
 }

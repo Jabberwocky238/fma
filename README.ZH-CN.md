@@ -505,6 +505,8 @@ SMTP 通过 `go.mod replace` 使用固定版本的性能修复 fork（[PR #312](
 
 POP3 v0.1.6 增加 ARM64 向量扫描，并保留通用实现。独立 2 GiB 编码测试的吞吐量再提升 2.04 倍，但完整下载尚未验证出稳定加速。CPU、RSS、不同输入类型的对照和复现命令见 [PERFORMANCE.md](PERFORMANCE.md)。
 
+S3 上传缓冲按 1 MiB 分块，直接组合成 8 MiB 上传分片，不进行拼接复制。每次上传最多四片在途或正在填充，全局在用分片缓冲上限 1 GiB，按需分配。跨账户对象复制使用 S3 CopyObject 或 UploadPartCopy。JMAP MIME 解析使用固定版本的[流式优化 fork](https://github.com/Jabberwocky238/naust-jmap/commit/86f12015507c)，通过缓冲区复用和分块解码提速，不缓存元数据或正文。
+
 实测吞吐量和当前瓶颈见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 吞吐量测试默认使用 2 GiB 附件，同时报告传输字节和原始附件字节的 MiB/s。
