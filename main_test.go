@@ -1765,7 +1765,7 @@ func TestNamedBlobKeyEscapesSegments(t *testing.T) {
 
 func TestObjectReferenceAccountBoundary(t *testing.T) {
 	for _, target := range []string{"bob/mail/topic/file", "alice/mail/../../bob/file", "alice/.jmap/blobs/Gother", "/alice/mail/topic/file"} {
-		data := []byte(fmt.Sprintf(`{"key":%q}`, target))
+		data := fmt.Appendf(nil, `{"key":%q}`, target)
 		if _, err := decodeObjectReference("alice/.jmap/blobs/Gid", data); err == nil {
 			t.Fatalf("accepted %q", target)
 		}

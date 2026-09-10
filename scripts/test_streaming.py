@@ -80,7 +80,7 @@ class Measurement:
                 'rss_sample_interval_seconds': .05}
 
 
-def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_transfer, repeat_jmap=False):
+def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_transfer, repeat_jmap=False, jmap_first=False):
     """Real MIME attachment IO, with no full-message client buffers."""
     import imaplib
     import smtplib
@@ -145,6 +145,33 @@ def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_
             reply = client.getreply()
             assert reply[0] == 250, reply
     phase('smtp_bdat_mime_upload' if smtp_transfer == 'bdat' else 'smtp_mime_upload', smtp_upload)
+    def measure_jmap():
+        def jmap(method, arguments):
+            request = {'using': ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
+                       'methodCalls': [[method, {'accountId': account, **arguments}, 'b']]}
+            conn.request('POST', '/api', json.dumps(request), {**auth, 'Content-Type': 'application/json'})
+            response = conn.getresponse(); body = json.load(response)
+            assert response.status == 200, body
+            invocation = body['methodResponses'][0]; assert invocation[0] == method, invocation
+            return invocation[1]
+        query = jmap('Email/query', {})
+        def attachment_metadata():
+            data = jmap('Email/get', {'ids': query['ids'][:1], 'properties': ['id', 'attachments']})
+            attachment = data['list'][0]['attachments'][0]
+            assert attachment['size'] == size, attachment
+            return attachment['blobId']
+        blob_id = phase('jmap_attachment_metadata', attachment_metadata)
+        def attachment_download():
+            conn.request('GET', f'/download/{account}/{blob_id}/large.bin', headers=auth)
+            response = conn.getresponse(); assert response.status == 200, response.read(1000) if response.status != 200 else ''
+            copy_exact(response, size, attachment_hash.hexdigest())
+            assert response.read(1) == b''
+        phase('jmap_attachment_download', attachment_download)
+        if repeat_jmap:
+            assert phase('jmap_repeat_metadata', attachment_metadata) == blob_id
+            phase('jmap_repeat_download', attachment_download)
+    if jmap_first:
+        measure_jmap()
     context = ssl._create_unverified_context()
     with imaplib.IMAP4_SSL('127.0.0.1', ports['imaps'], ssl_context=context, timeout=600) as client:
         client.login('alice', 'password')
@@ -179,30 +206,8 @@ def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_
             assert client.file.readline() == b'.\r\n'
         phase('pop3_mime_download', retr)
         client.quit()
-    def jmap(method, arguments):
-        request = {'using': ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
-                   'methodCalls': [[method, {'accountId': account, **arguments}, 'b']]}
-        conn.request('POST', '/api', json.dumps(request), {**auth, 'Content-Type': 'application/json'})
-        response = conn.getresponse(); body = json.load(response)
-        assert response.status == 200, body
-        invocation = body['methodResponses'][0]; assert invocation[0] == method, invocation
-        return invocation[1]
-    query = jmap('Email/query', {})
-    def attachment_metadata():
-        data = jmap('Email/get', {'ids': query['ids'][:1], 'properties': ['id', 'attachments']})
-        attachment = data['list'][0]['attachments'][0]
-        assert attachment['size'] == size, attachment
-        return attachment['blobId']
-    blob_id = phase('jmap_attachment_metadata', attachment_metadata)
-    def attachment_download():
-        conn.request('GET', f'/download/{account}/{blob_id}/large.bin', headers=auth)
-        response = conn.getresponse(); assert response.status == 200, response.read(1000) if response.status != 200 else ''
-        copy_exact(response, size, attachment_hash.hexdigest())
-        assert response.read(1) == b''
-    phase('jmap_attachment_download', attachment_download)
-    if repeat_jmap:
-        assert phase('jmap_repeat_metadata', attachment_metadata) == blob_id
-        phase('jmap_repeat_download', attachment_download)
+    if not jmap_first:
+        measure_jmap()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -214,6 +219,7 @@ def main():
     parser.add_argument('--smtp-transfer', choices=['data', 'bdat'], default='data', help='SMTP DATA or advertised CHUNKING/BDAT; reports them separately')
     parser.add_argument('--repeat-jmap', action='store_true', help='repeat metadata and attachment download to separate locator reuse from first-download work')
     parser.add_argument('--seed', type=int, help='reproducible random fixture seed for paired performance comparisons')
+    parser.add_argument('--jmap-first', action='store_true', help='measure the first JMAP attachment request immediately after SMTP, before IMAP/POP3 reads')
     args = parser.parse_args()
     # Repeat a random 1 MiB block: its period exceeds gzip's 32 KiB window.
     # Generate it outside the timed phase, keeping client memory bounded.
@@ -225,7 +231,7 @@ def main():
     with open(fals3y, 'rb') as executable:
         fals3y_sha256 = hashlib.file_digest(executable, 'sha256').hexdigest()
     fals3y_version = subprocess.run([fals3y, 'version'], capture_output=True, text=True, timeout=10)
-    results = {'fixture_seed': args.seed, 'repeat_jmap': args.repeat_jmap, 'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
+    results = {'jmap_first': args.jmap_first, 'fixture_seed': args.seed, 'repeat_jmap': args.repeat_jmap, 'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
                'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                'pop3_module': json.loads(subprocess.check_output(
                    ['go', 'list', '-m', '-json', 'github.com/Jabberwocky238/go-pop3'], cwd=ROOT, text=True)),
@@ -344,7 +350,7 @@ def main():
             results['phases']['download'] = measure.finish()
             assert received == size and digest.hexdigest() == results['sha256'], (received, digest.hexdigest())
             if args.mail:
-                mail_benchmark(proc, mail_ports, conn, auth, account, size, block, results, args.smtp_transfer, args.repeat_jmap)
+                mail_benchmark(proc, mail_ports, conn, auth, account, size, block, results, args.smtp_transfer, args.repeat_jmap, args.jmap_first)
             conn.close()
             assert list(work.iterdir()) == [], 'fma wrote local temporary data'
             assert max(phase['peak_rss_bytes'] for phase in results['phases'].values()) <= args.max_rss_mib << 20, results

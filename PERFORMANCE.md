@@ -1080,3 +1080,182 @@ race detection, JMAP exact binary/empty attachment downloads, account isolation,
 restart and cross-protocol checks, plus the existing 32 MiB streaming test.
 Validation output remains outside the document in
 `/tmp/fma-jmap-optimized-tests.log` and `/tmp/fma-jmap-optimized-build.log`.
+
+
+## Single-request MIME and S3 streaming optimization (2026-09-10)
+
+Implementation: fma `b62287c`; MIME parser fork
+[86f12015507c](https://github.com/Jabberwocky238/naust-jmap/commit/86f12015507c),
+based on naust-jmap mail v0.3.3 and pinned through `go.mod replace` as
+`github.com/Jabberwocky238/naust-jmap/datatypes/mail v0.3.4-0.20260910200323-86f12015507c`.
+This change adds no metadata cache, decoded-body cache or duplicate-object speedup.
+The MIME walker borrows consumed spans until drained; Base64 filtering compacts
+owned input in place, decoding writes into the caller's buffer, and temporary
+buffers return to a pool. The application's strict MIME decoder applies the same
+block-processing approach while preserving strict Base64 validation.
+
+The prior CPU profile's 90.28% under `io.copyBuffer` was cumulative, including
+filtering, decoding and hashing, not 90.28% spent copying bytes. Its directly
+sampled redundant newline scan was 28.74%; removing that second scan is the main
+parser gain. In the later profile SHA-256's relative share rose as other work
+shrank; it still uses ARM SHA2 instructions. S3 checksums cover stored objects or
+parts, not a decoded MIME attachment, so they cannot replace this attachment ID's
+SHA-256 without changing what is stored or adding MIME processing to storage.
+See [S3 checksum semantics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html).
+
+S3 write buffers now consist of reusable **1 MiB blocks**, with a global bound of
+**1 GiB of active part capacity**, allocated on demand. Eight blocks form one
+8 MiB request body with Read/Seek support for retries; they are not concatenated
+into another 8 MiB allocation. Each upload admits four parts including the part
+being filled. Global admission reserves complete part capacity before allocating
+individual blocks, avoiding deadlock among partially assembled parts. This is a
+buffer admission bound, not a whole-process RSS bound or a 1 GiB preallocation.
+[S3 requires non-final multipart parts of at least 5 MiB](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html).
+
+`Write` sends completed parts using UploadPart while bytes are still arriving;
+`Commit` sends any final partial part, waits for active uploads, completes the
+multipart object and publishes its small reference. Commit does not retain or
+upload the entire message at once. Cross-account CopyStream now uses CopyObject
+or UploadPartCopy after reserving the destination; only small references pass
+through fma. Tests reject any GET of the source body and cover both normal and
+6 GiB multipart-copy paths, with compression metadata and destination references
+checked. Same-account immutable references retain their existing behavior.
+
+The first two matched full-protocol runs used seed 20260910, 2,147,483,648 decoded
+attachment bytes and 2,938,662,361 MIME bytes. Each variant starts a fresh process
+and S3 fixture and requests JMAP metadata and attachment download only once.
+The full-protocol sequence reads through IMAP/POP3 before JMAP; these are first
+JMAP requests, not an assertion of cold OS page caches. Additional JMAP-first
+measurements below isolate the first client fetch after SMTP delivery.
+
+Matched controls use the original runtime from `9429b8d`, with the same AWS S3
+SDK v1.97.3, AWS core SDK v1.41.5, smithy v1.24.2 and x/text v0.39.0 as the new
+build; the mail parser is v0.3.3 in the control. Other protocol versions remain
+unchanged. This excludes unrelated dependency-version changes from the comparison.
+Fals3y remains 0.3.1-dev.b8e48bf; Go is 1.25.3, darwin/arm64, Apple M4.
+
+| Run | Metadata (s) | First download (s) | Combined (s) | Metadata CPU (s) | Download CPU (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| control-1 | 5.196 | 8.514 | 13.710 | 5.440 | 9.130 |
+| after-1 | 3.716 | 6.008 | 9.724 | 4.000 | 6.370 |
+| control-2 | 5.265 | 8.529 | 13.794 | 5.520 | 9.230 |
+| after-2 | 3.701 | 5.967 | 9.668 | 3.990 | 6.340 |
+
+Two-run means: metadata **5.2305 → 3.7085 s (29.1% less)**; first download
+**8.5215 → 5.9875 s (29.7% less)**; combined **13.7520 → 9.6960 s (29.5% less)**.
+The first-download locator still scans the MIME; this change makes each pass
+faster, rather than hiding it behind a cache. The 3-second attachment target is
+still unmet.
+
+### Additional first-request results and resources
+
+All times are seconds. The compressible and JMAP-first comparisons each contain one matched pair; they are supporting measurements, not statistically established averages. JMAP-first moves the requests ahead of IMAP/POP3 reads, but SMTP import and OS page caches still exist. No repeated JMAP requests or application cache are used.
+
+| Run | Metadata | First download | Combined | Metadata CPU | Download CPU |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| control-compressed | 5.580 | 9.361 | 14.941 | 5.570 | 9.450 |
+| after-compressed | 4.108 | 6.966 | 11.074 | 4.100 | 7.040 |
+| first-control | 5.093 | 8.352 | 13.445 | 5.380 | 9.000 |
+| first-after | 3.637 | 5.893 | 9.530 | 3.920 | 6.300 |
+
+JMAP-first metadata falls **28.6%**, download **29.4%**, and their combined time **13.445 → 9.530 s (29.1%)**. The compressible pair improves from **14.941 → 11.074 s (25.9%)** combined. For the two standard matched pairs, total JMAP CPU falls **14.660 → 10.350 CPU-seconds (29.4%)**. This reduces work rather than trading latency for higher CPU consumption.
+
+Resource figures measure the fma process only, excluding Fals3y and the benchmark client. CPU 100% means one logical core. RSS is sampled every 50 ms; peak RSS includes existing process memory, while growth is relative to that phase's initial RSS. MiB values below are rounded; they are not whole-system resource totals.
+
+| Run | Metadata CPU % | Download CPU % | Metadata peak / growth MiB | Download peak / growth MiB | Whole-run peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| control-1 | 104.70 | 107.23 | 170.06 / 0.05 | 170.27 / 0.20 | 170.27 |
+| after-1 | 107.65 | 106.03 | 169.47 / 0.09 | 169.50 / 0.03 | 169.50 |
+| control-2 | 104.84 | 108.22 | 171.81 / 0.06 | 172.03 / 0.22 | 172.03 |
+| after-2 | 107.81 | 106.26 | 168.70 / 0.08 | 168.70 / 0.00 | 168.70 |
+| control-compressed | 99.81 | 100.95 | 102.11 / 0.06 | 102.11 / 0.00 | 102.11 |
+| after-compressed | 99.80 | 101.06 | 97.97 / 0.12 | 98.09 / 0.12 | 98.09 |
+| first-control | 105.64 | 107.76 | 148.91 / 0.27 | 149.19 / 0.28 | 168.33 |
+| first-after | 107.79 | 106.92 | 148.75 / 0.84 | 151.31 / 2.56 | 176.59 |
+| before-1 | 102.29 | 107.76 | 181.83 / 0.06 | 181.83 / 0.00 | 181.83 |
+
+### Full protocol results and write-side evidence
+
+Each row retains the same run's other protocol measurements, in seconds. These operations have different wire sizes and processing requirements: raw and attachment downloads contain 2 GiB, while SMTP/IMAP/POP3 transfer the 2.737 GiB MIME message. The compressible fixture has the same logical sizes. The initial `before-1` pilot used older AWS dependencies and is **excluded from matched improvement calculations**.
+
+| Run | Raw upload | Raw download | SMTP DATA | IMAP download | IMAP APPEND | POP3 | JMAP metadata | JMAP attachment download |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| control-1 | 1.858 | 0.884 | 5.321 | 1.981 | 4.036 | 1.871 | 5.196 | 8.514 |
+| after-1 | 1.935 | 0.904 | 5.468 | 2.078 | 3.865 | 1.834 | 3.716 | 6.008 |
+| control-2 | 2.082 | 0.893 | 5.558 | 1.958 | 4.321 | 1.958 | 5.265 | 8.529 |
+| after-2 | 2.042 | 0.890 | 5.380 | 1.941 | 3.814 | 1.881 | 3.701 | 5.967 |
+| control-compressed | 1.470 | 0.855 | 7.111 | 2.135 | 4.936 | 2.293 | 5.580 | 9.361 |
+| after-compressed | 1.490 | 0.865 | 6.979 | 2.212 | 4.844 | 2.283 | 4.108 | 6.966 |
+| first-control | 1.817 | 0.852 | 5.447 | 1.946 | 3.923 | 1.748 | 5.093 | 8.352 |
+| first-after | 1.827 | 0.869 | 5.290 | 1.912 | 3.777 | 1.856 | 3.637 | 5.893 |
+| before-1 | 2.182 | 0.989 | 6.033 | 2.466 | 4.902 | 2.138 | 5.895 | 8.547 |
+
+In `first-after`, raw upload plus download takes **2.696 s**, meeting the 3-second raw round-trip goal in that run; this does not mean the JMAP goal is met. The raw gzip object contains 2,147,647,513 stored bytes and 257 parts. Its CompleteMultipartUpload takes **0.027985 s**, reference publication **0.000745 s**, and copy **0 s**. SMTP receives and writes the MIME stream in **4.265265 s**, final storage commit takes **0.014873 s**, and delivery/import takes **1.001266 s**, within **5.290 s** SMTP DATA overall. The current final commit is milliseconds; reception/processing and import remain the larger costs. These internal stages are diagnostic timings, not independently summed benchmarks across runs.
+
+### UTC provenance and reproducibility
+
+The following are recorded wall-clock timestamps converted to UTC, not inferred dates or local solar time. Each interval runs from metadata start to attachment-download completion. The run labels map to `/tmp/fma-cold-<run>.json` and `.log`; those local diagnostic files are not embedded in this document or committed and may be removed by temporary-directory cleanup. The tables retain the comparison results independently of those files.
+
+| Run | JMAP start UTC | JMAP end UTC |
+| --- | --- | --- |
+| control-1 | 2026-09-10T20:09:48.155209Z | 2026-09-10T20:10:01.867853Z |
+| after-1 | 2026-09-10T20:08:28.084693Z | 2026-09-10T20:08:37.811449Z |
+| control-2 | 2026-09-10T20:10:52.444833Z | 2026-09-10T20:11:06.242920Z |
+| after-2 | 2026-09-10T20:10:22.038938Z | 2026-09-10T20:10:31.709393Z |
+| control-compressed | 2026-09-10T20:11:29.259126Z | 2026-09-10T20:11:44.203208Z |
+| after-compressed | 2026-09-10T20:12:06.500435Z | 2026-09-10T20:12:17.578124Z |
+| first-control | 2026-09-10T20:13:31.499840Z | 2026-09-10T20:13:44.947270Z |
+| first-after | 2026-09-10T20:14:04.679916Z | 2026-09-10T20:14:14.211803Z |
+| before-1 | 2026-09-10T19:55:11.451426Z | 2026-09-10T19:55:25.896615Z |
+
+Control execution uses the `9429b8d` runtime through a Go source overlay, with the current dependencies except the unmodified mail parser v0.3.3. The JSON `commit` field records the checkout HEAD, so it alone does not identify an overlay build. The pilot instead uses AWS core v1.36.3, S3 v1.78.2, smithy v1.22.2 and x/text v0.34.0. Optimized execution uses runtime `b62287c` and parser `86f12015507c`.
+
+Shared libraries: [POP3 v0.1.6](https://github.com/Jabberwocky238/go-pop3/tree/v0.1.6), [SMTP b0673510e580](https://github.com/Jabberwocky238/go-smtp/commit/b0673510e580) (v0.25.1-0.20260910174640-b0673510e580), go-imap v1.2.1 / v2.0.0-beta.8, naust-jmap core v0.4.2 and klauspost/compress v1.20.0. The MIME changes are published on the fork's [perf/streaming-mime branch](https://github.com/Jabberwocky238/naust-jmap/tree/perf/streaming-mime); no upstream MIME PR has been opened in this round. Historical SMTP/POP3 PR links and results above remain unchanged.
+
+Fals3y executable SHA-256: `1298e405c1631fbded92892eadc7252d8e2e319dfdf42f48c188ae3fd82ffb4b`.
+
+| Build / run | fma executable SHA-256 |
+| --- | --- |
+| control-1, control-2, control-compressed, first-control | `77afba2a67ddfce0dd33a3a71baa0bbf2faf38332144440080d6717e8d04e511` |
+| after-1, after-2, after-compressed, first-after | `9f3b2185b108a10ffbeb872f5da4e01baefc3861fee8fb5d7d5494ebd32a1336` |
+| before-1 | `38d8ea1633a9833987c291a20d55a47b09117abc3384e22699b030a418c8530a` |
+
+Reproduce the optimized first-fetch order with `python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --report /tmp/fma-jmap-first.json`. Omit `--jmap-first` for the original full-protocol order; add `--data compressible` for the compressible fixture. The default transfer is 2 GiB. The fixed-seed incompressible attachment SHA-256 is `70ee1bb08fc817e52cdde811bfd8860d092fdefef4cd1a07038510a71da71acc`; MIME SHA-256 is `a3096ef28f2bb06b8fc473710cc19bbe046a14bcd2f94c6dd889fad10c866e59`. Raw fixture and MIME attachment hashes differ because mail framing uses a 57-byte-aligned fixture block; the initial raw upload therefore does not pre-create the requested MIME attachment.
+
+### Isolated decoder benchmarks and validation
+
+The parser benchmark is upstream `BenchmarkParseWithDigest_1MBAttachment`; each sample runs for 2 seconds on the same M4. Its throughput uses encoded MIME bytes, whereas the application decoder benchmark uses decoded bytes. Both include digest work. The table preserves all three samples per implementation; allocations are per operation, not peak live memory.
+
+| Parser variant | ns/op (three samples) | B/op (three samples) | allocs/op |
+| --- | --- | --- | ---: |
+| v0.3.3 | 2160872, 2163847, 2196584 | 163800, 163560, 163566 | 137 |
+| Direct block decoder | 1425069, 1446461, 1450894 | 158059, 157742, 157724 | 135 |
+| In-place filter | 1493504, 1499015, 1513043 | 145401, 144998, 144924 | 125 |
+| Borrowed segments | 1481256, 1468511, 1465247 | 99615, 99390, 99447 | 124 |
+| Final pooled buffers | 1433353, 1453578, 1456583 | 58954, 58641, 58709 | 124 |
+
+Parser median: **2.163847 → 1.453578 ms (32.8% less)**, allocated bytes **163,566 → 58,709 (64.1% less)**, allocations **137 → 124**. Intermediate in-place filtering alone did not outperform the first block-decoder variant; the final version combines reduced copies with buffer reuse.
+
+| Application decoder | ns/op (three samples) | B/op (three samples) | allocs/op |
+| --- | --- | --- | ---: |
+| Standard library | 1580079, 1593125, 1600782 | 2256, 2256, 2256 | 5 |
+| Pooled block decoder | 1049422, 1050793, 1049904 | 302, 288, 288 | 4 |
+
+The corrected application benchmark constructs only the decoder being measured.
+Median time falls **1.593125 → 1.049904 ms (34.1%)**, and median allocated bytes
+fall **2,256 → 288 (87.2%)**. An earlier exploratory benchmark constructed an
+unused standard decoder in the block case, inflating its allocation counts;
+those exploratory counts are not used here. The benchmark remains in
+`main_test.go` as `BenchmarkMIMEBase64`; the parser benchmark is in the linked
+mail fork. No standalone benchmark source or raw log is embedded in this report.
+
+Validation passed: `make test`, `make build`, the fork's `go test -race ./...`,
+and a 15-second differential fuzz run (10,158 executions). New regression checks
+cover Base64 boundaries, corruption and source errors, buffer reuse, S3 block
+boundaries and retry seeks, and server-side copy without source-body GETs.
+All reported end-to-end runs passed content SHA-256 checks, the 256 MiB fma RSS
+threshold, interruption handling and the no-local-spool assertion. The new
+`--jmap-first` execution order passed both 2 GiB control and optimized runs.
+Validation and profile evidence remains outside the repository under
+`/tmp/fma-cold-*` and `/tmp/fma-mime-parser-*`; all historical measurements above
+are retained.
