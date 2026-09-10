@@ -1,0 +1,49 @@
+version: 2
+project_name: fma
+
+builds:
+  - id: fma
+    main: .
+    binary: fma
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: fma
+    ids:
+      - fma
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - install.sh
+      - LICENSE
+      - README.md
+      - deploy/gen.sh
+      - deploy/template/*
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+
+release:
+  name_template: 'fma {{ .Tag }}'
+  prerelease: auto

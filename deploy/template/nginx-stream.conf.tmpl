@@ -1,0 +1,13 @@
+# Include this at the top level of nginx.conf, outside http {}.
+stream {
+    proxy_connect_timeout 10s;
+    proxy_timeout 30m;
+    # TLS passes through to Go; port 587 retains SMTP STARTTLS semantics.
+    server { listen 25; listen [::]:25; proxy_pass 127.0.0.1:@@SMTP_PORT@@; }
+    server { listen 465; listen [::]:465; proxy_pass 127.0.0.1:@@SMTPS_PORT@@; }
+    server { listen 587; listen [::]:587; proxy_pass 127.0.0.1:@@SUBMISSION_PORT@@; }
+    server { listen 110; listen [::]:110; proxy_pass 127.0.0.1:@@POP3_PORT@@; }
+    server { listen 143; listen [::]:143; proxy_pass 127.0.0.1:@@IMAP_PORT@@; }
+    server { listen 993; listen [::]:993; proxy_pass 127.0.0.1:@@IMAPS_PORT@@; }
+    server { listen 995; listen [::]:995; proxy_pass 127.0.0.1:@@POP3S_PORT@@; }
+}

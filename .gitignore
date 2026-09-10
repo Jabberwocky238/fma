@@ -1,0 +1,46 @@
+# Build and release output
+/fma
+/dist/
+*.test
+*.prof
+*.pprof
+*.coverprofile
+
+# Generated deployment configuration, including interrupted staging directories
+/deploy/generated/
+/deploy/.generated*/
+
+# Environment files and local credentials; keep distributable templates
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!*.env.example
+!*.env.tmpl
+*.pem
+*.key
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.cache/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.new
+*~
+
+# Editor settings and swap files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS and Windows metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini

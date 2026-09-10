@@ -1,0 +1,56 @@
+name: Go CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.23.x', stable]
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Install native Fals3y
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/fals3y"
+          cd "$RUNNER_TEMP/fals3y"
+          base=https://github.com/LukeOfEarth/fals3y/releases/download/v0.3.0
+          curl --fail --location --retry 3 "$base/fals3y_0.3.0_linux_amd64.tar.gz" -o fals3y_0.3.0_linux_amd64.tar.gz
+          curl --fail --location --retry 3 "$base/checksums.txt" -o checksums.txt
+          sha256sum --check --ignore-missing checksums.txt
+          tar -xzf fals3y_0.3.0_linux_amd64.tar.gz fals3y
+          echo "FALS3Y_BIN=$RUNNER_TEMP/fals3y/fals3y" >> "$GITHUB_ENV"
+      - name: Verify dependencies
+        run: go mod verify
+      - name: Format, vet, race, and S3 protocol tests
+        run: make test
+      - name: Build
+        run: make build
+
+  release-config:
+    name: GoReleaser configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: v2.18.1
+          args: check

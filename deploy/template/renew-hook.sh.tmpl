@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euo pipefail
+# Run as root from Certbot's deploy-hook directory after initial provisioning.
+lineage=${RENEWED_LINEAGE:-@@LINEAGE@@}
+[[ "$lineage" == '@@LINEAGE@@' ]] || exit 0
+upload() {
+    local object=$1
+    runuser -u '@@DEPLOY_USER@@' -- bash -c '
+        set -euo pipefail
+        set -a
+        source "@@CONFIG_DIR@@/s3.env"
+        set +a
+        export AWS_ACCESS_KEY_ID="$FMA_S3_ACCESS_KEY_ID"
+        export AWS_SECRET_ACCESS_KEY="$FMA_S3_SECRET_ACCESS_KEY"
+        export AWS_SESSION_TOKEN="$FMA_S3_SESSION_TOKEN"
+        endpoint=()
+        if [[ -n "$FMA_S3_ENDPOINT" ]]; then endpoint=(--endpoint-url "$FMA_S3_ENDPOINT"); fi
+        aws "${endpoint[@]}" --region "$FMA_S3_REGION" s3 cp - "s3://$FMA_S3_BUCKET/$1"
+    ' fma-upload "$object"
+}
+upload '@@CERT_KEY@@' < "$lineage/fullchain.pem"
+upload '@@KEY_KEY@@' < "$lineage/privkey.pem"
+nginx -t
+systemctl reload nginx
+runuser -u '@@DEPLOY_USER@@' -- env XDG_RUNTIME_DIR=/run/user/@@DEPLOY_UID@@ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@@DEPLOY_UID@@/bus systemctl --user restart fma.service

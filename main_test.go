@@ -1,0 +1,1020 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"github.com/emersion/go-imap"
+	"io"
+	"io/fs"
+	"net"
+	"net/http/httptest"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/emersion/go-sasl"
+	smtp "github.com/emersion/go-smtp"
+)
+
+// Outbound Test
+
+// The fake relay requires authentication, rejects temporarily/permanently on
+// demand, and only counts a delivery after receiving the complete DATA body.
+type fakeRelay struct {
+	code     atomic.Int32
+	received atomic.Int32
+	workers  sync.WaitGroup
+}
+
+func newFakeRelay(t *testing.T, implicit bool) *fakeRelay {
+	t.Helper()
+	certServer := httptest.NewTLSServer(nil)
+	cfg := certServer.TLS.Clone()
+	certServer.Close()
+	ca := "relay-ca.pem"
+	checkError(t, objects.Put(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cfg.Certificates[0].Certificate[0]})))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	checkError(t, err)
+	if implicit {
+		listener = tls.NewListener(listener, cfg)
+	}
+	relay := new(fakeRelay)
+	relay.code.Store(250)
+	config.Relay = RelayConfig{Addr: listener.Addr().String(), User: "relay-user", Password: "relay-password", TLS: "starttls", CAFile: ca, RootCAs: x509.NewCertPool()}
+	if implicit {
+		config.Relay.TLS = "implicit"
+	}
+	config.Relay.RootCAs.AddCert(certServer.Certificate())
+	server := smtp.NewServer(relay)
+	server.Domain, server.TLSConfig = "test-relay", cfg
+	server.ReadTimeout, server.WriteTimeout = 5*time.Second, 5*time.Second
+	relay.workers.Add(1)
+	go func() { defer relay.workers.Done(); server.Serve(listener) }()
+	t.Cleanup(func() { server.Close(); relay.workers.Wait() })
+	return relay
+}
+func (r *fakeRelay) NewSession(*smtp.Conn) (smtp.Session, error) {
+	return &relaySession{relay: r}, nil
+}
+
+type relaySession struct {
+	relay         *fakeRelay
+	authenticated bool
+}
+
+func (*relaySession) AuthMechanisms() []string { return []string{sasl.Plain} }
+func (s *relaySession) Auth(mechanism string) (sasl.Server, error) {
+	if mechanism != sasl.Plain {
+		return nil, smtp.ErrAuthUnsupported
+	}
+	return sasl.NewPlainServer(func(identity, user, password string) error {
+		if identity != "" || user != "relay-user" || password != "relay-password" {
+			return smtp.ErrAuthFailed
+		}
+		s.authenticated = true
+		return nil
+	}), nil
+}
+func (s *relaySession) Mail(string, *smtp.MailOptions) error {
+	if !s.authenticated {
+		return smtp.ErrAuthRequired
+	}
+	return nil
+}
+func (s *relaySession) Rcpt(string, *smtp.RcptOptions) error {
+	if code := int(s.relay.code.Load()); code != 250 {
+		return &smtp.SMTPError{Code: code, Message: "recipient status"}
+	}
+	return nil
+}
+func (s *relaySession) Data(r io.Reader) error {
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return err
+	}
+	s.relay.received.Add(1)
+	return nil
+}
+func (*relaySession) Reset()        {}
+func (*relaySession) Logout() error { return nil }
+func outboundTestDir(t *testing.T) {
+	t.Helper()
+	oldConfig, oldObjects := config, objects
+	config = defaultConfig()
+	config.OutboundMode = "relay"
+	config.QueueRetry = time.Millisecond
+	objects = &memoryObjects{data: make(map[string][]byte)}
+	if endpoint := os.Getenv("TEST_S3_ENDPOINT"); endpoint != "" {
+		c := S3Config{Endpoint: endpoint, Bucket: os.Getenv("TEST_S3_BUCKET"), Region: "us-east-1", AccessKey: "test", SecretKey: "test"}
+		bucket, err := connectBucket(c)
+		checkError(t, err)
+		isolated := &prefixedObjects{base: bucket, prefix: fmt.Sprintf("test-%d/", time.Now().UnixNano())}
+		objects = isolated
+		t.Cleanup(func() {
+			keys, err := isolated.List("")
+			checkError(t, err)
+			for _, key := range keys {
+				checkError(t, isolated.Delete(key))
+			}
+		})
+	}
+	t.Cleanup(func() { config = oldConfig; objects = oldObjects })
+}
+func queuedJob(t *testing.T) (string, *outboundJob) {
+	t.Helper()
+	paths, err := objects.List(outbox + "/")
+	var jobs []string
+	for _, key := range paths {
+		if strings.HasSuffix(key, ".json") {
+			jobs = append(jobs, key)
+		}
+	}
+	paths = jobs
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("queue: %v %v", paths, err)
+	}
+	job, err := readJSON[*outboundJob](paths[0])
+	checkError(t, err)
+	return paths[0], job
+}
+func TestOutboundRetryAndRestart(t *testing.T) {
+	outboundTestDir(t)
+	relay := newFakeRelay(t, true)
+	body := []byte("From: jw238@t12e.cc\r\nTo: recipient@example.net\r\nSubject: retry\r\n\r\nbody\r\n")
+	checkError(t, queueMail("jw238", "jw238@t12e.cc", nil, []string{"recipient@example.net"}, body))
+	path, job := queuedJob(t)
+	if string(job.Body) != string(body) {
+		t.Fatal("body was not preserved")
+	}
+	relay.code.Store(451)
+	claimAndProcess(t, path)
+	_, job = queuedJob(t) // Reload disk state as a restarted worker would.
+	if job.Recipients[0].State != "pending" || job.Recipients[0].Attempts != 1 || job.Recipients[0].Error == "" {
+		t.Fatalf("temporary failure lost: %+v", job.Recipients)
+	}
+	job.Recipients[0].Next = time.Time{}
+	checkError(t, writeJSON(path, job))
+	relay.code.Store(250)
+	claimAndProcess(t, path)
+	if _, err := objects.Get(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal("completed task/preclaim remained", err)
+	}
+	if relay.received.Load() != 1 {
+		t.Fatal("retry delivery missing")
+	}
+
+}
+func TestOutboundPermanentFailureNotifiesSender(t *testing.T) {
+	outboundTestDir(t)
+	relay := newFakeRelay(t, true)
+	relay.code.Store(550)
+	checkError(t, queueMail("jw238", "jw238@t12e.cc", nil, []string{"missing@example.net"}, []byte("Subject: test\r\n\r\nbody\r\n")))
+	path, _ := queuedJob(t)
+	claimAndProcess(t, path)
+	if _, err := objects.Get(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal("failed terminal task/preclaim remained", err)
+	}
+	notices, err := messages("jw238")
+	if err != nil || len(notices) != 1 || !strings.Contains(string(notices[0].Body), "missing@example.net") {
+		t.Fatal("expected one local failure notice", err)
+	}
+}
+func TestExternalRecipientRequiresAuthentication(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, objects.Put("jw238/.password", []byte("123123")))
+	session := &smtpSession{}
+	if session.Rcpt("recipient@example.net", nil) == nil {
+		t.Fatal("open relay")
+	}
+	session.user = "jw238"
+	checkError(t, session.Mail("jw238@t12e.cc", nil))
+	checkError(t, session.Rcpt("recipient@example.net", nil))
+	if err := session.Rcpt("unknown@t12e.cc", nil); err == nil {
+		t.Fatal("unknown local recipient sent externally")
+	}
+	session.Reset()
+	if len(session.remote) != 0 || session.from != "" || session.user != "jw238" {
+		t.Fatal("RSET leaked envelope or cleared authentication")
+	}
+	config.OutboundMode = "disabled"
+	if err := session.Rcpt("recipient@example.net", nil); err == nil {
+		t.Fatal("unconfigured transport accepted mail")
+	}
+}
+func TestOutboundRejectsUntrustedTLS(t *testing.T) {
+	outboundTestDir(t)
+	newFakeRelay(t, true)
+	config.Relay.RootCAs = nil
+	err := sendRemote(context.Background(), &outboundJob{From: "jw238@t12e.cc"}, "recipient@example.net")
+	if err == nil {
+		t.Fatal("untrusted TLS was accepted")
+	}
+}
+func TestOutboundCancellation(t *testing.T) {
+	outboundTestDir(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	checkError(t, err)
+	defer listener.Close()
+	config.Relay.Addr = listener.Addr().String()
+	config.Relay.TLS = "starttls"
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		io.Copy(io.Discard, bufio.NewReader(c))
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = sendRemote(ctx, &outboundJob{From: "jw238@t12e.cc"}, "recipient@example.net")
+	if err == nil || time.Since(start) > time.Second {
+		t.Fatal(fmt.Sprint("shutdown failed: ", err))
+	}
+	<-done
+}
+
+func TestOutboundRelaySTARTTLS(t *testing.T) {
+	outboundTestDir(t)
+	relay := newFakeRelay(t, false)
+	job := &outboundJob{From: "jw238@t12e.cc", Body: []byte("Subject: STARTTLS\r\n\r\nbody\r\n")}
+	checkError(t, sendRemote(context.Background(), job, "recipient@example.net"))
+	if relay.received.Load() != 1 {
+		t.Fatal("STARTTLS delivery missing")
+	}
+}
+
+func TestSentArchiveDoesNotResurrectDeletedMail(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, queueMail("jw238", "jw238@t12e.cc", nil, []string{"recipient@example.net"}, []byte("Subject: saved\r\n\r\nbody\r\n")))
+	saved, err := messages(testFolderKey(t, "jw238", "Sent"))
+	if err != nil || len(saved) != 1 {
+		t.Fatal("Sent missing", err)
+	}
+	checkError(t, deleteMessages(testFolderKey(t, "jw238", "Sent"), []uint32{saved[0].Uid}))
+	_, job := queuedJob(t)
+	if !job.Archived {
+		t.Fatal("Sent archive status not saved in task")
+	}
+	saved, err = messages(testFolderKey(t, "jw238", "Sent"))
+	if err != nil || len(saved) != 0 {
+		t.Fatal("deleted Sent message resurrected", err)
+	}
+}
+
+// Auth Login Test
+
+func TestLoginExchange(t *testing.T) {
+	for _, initial := range []bool{false, true} {
+		for _, password := range []string{"valid", "wrong", ""} {
+			calls := 0
+			denied := errors.New("denied")
+			s := &loginServer{authenticate: func(u, p string) error {
+				calls++
+				if u != "user@example.org" || p != "valid" {
+					return denied
+				}
+				return nil
+			}}
+			if !initial {
+				challenge, done, err := s.Next(nil)
+				if string(challenge) != "Username:" || done || err != nil {
+					t.Fatalf("unexpected username challenge: %q %t %v", challenge, done, err)
+				}
+			}
+			challenge, done, err := s.Next([]byte("user@example.org"))
+			if string(challenge) != "Password:" || done || err != nil || calls != 0 {
+				t.Fatalf("unexpected password challenge: %q %t %v", challenge, done, err)
+			}
+			_, done, err = s.Next([]byte(password))
+			if !done || calls != 1 || (err == nil) != (password == "valid") {
+				t.Fatalf("unexpected authentication result: %t %v calls=%d", done, err, calls)
+			}
+			if _, _, err = s.Next([]byte("valid")); err == nil || calls != 1 {
+				t.Fatal("completed exchange was reused")
+			}
+		}
+	}
+}
+
+// Configuration is assembled before serving and is not reloaded per message.
+func TestConfigDefaultsAndFlagPrecedence(t *testing.T) {
+	calls := map[string]int{}
+	c, err := loadConfig([]string{"-domain", "example.org", "-outbound", "direct", "-queue-retry", "2s", "-smtps", "127.0.0.1:2465"}, func(key string) string {
+		calls[key]++
+		if key == "FMA_OUTBOUND_MODE" {
+			return "relay"
+		}
+		return ""
+	})
+	checkError(t, err)
+	if c.Domain != "example.org" || c.OutboundMode != "direct" || c.QueueRetry != 2*time.Second || c.SMTPSAddr != "127.0.0.1:2465" || c.POP3SAddr != "127.0.0.1:1995" {
+		t.Fatal("configuration defaults or flag precedence changed")
+	}
+	if len(calls) != 13 {
+		t.Fatalf("expected 13 environment inputs, got %d", len(calls))
+	}
+	for key, count := range calls {
+		if count != 1 {
+			t.Fatalf("%s read %d times", key, count)
+		}
+	}
+}
+
+func TestConfigRelaySnapshot(t *testing.T) {
+	outboundTestDir(t)
+	relay := newFakeRelay(t, true)
+	passwordPath := "password"
+	checkError(t, objects.Put(passwordPath, []byte("relay-password\r\n")))
+	env := map[string]string{
+		"FMA_OUTBOUND_MODE": "relay", "FMA_RELAY_ADDR": config.Relay.Addr,
+		"FMA_RELAY_USER": "relay-user", "FMA_RELAY_PASSWORD": "overridden-password",
+		"FMA_RELAY_PASSWORD_FILE": "password", "FMA_RELAY_CA_FILE": config.Relay.CAFile, "FMA_RELAY_TLS": "implicit",
+	}
+	loaded, err := loadConfig(nil, func(key string) string { return env[key] })
+	checkError(t, err)
+	checkError(t, loadRelayObjects(&loaded))
+	if loaded.Relay.Password != "relay-password" || loaded.Relay.RootCAs == nil {
+		t.Fatal("secret file or CA not loaded")
+	}
+	checkError(t, objects.Delete(passwordPath))
+	checkError(t, objects.Delete(config.Relay.CAFile))
+	for key := range env {
+		t.Setenv(key, "invalid-after-startup")
+	}
+	config = loaded
+	checkError(t, sendRemote(context.Background(), &outboundJob{From: "jw238@t12e.cc", Body: []byte("Subject: snapshot\r\n\r\nbody\r\n")}, "recipient@example.net"))
+	if relay.received.Load() != 1 {
+		t.Fatal("snapshot did not deliver")
+	}
+}
+
+func TestConfigValidationAndQueue(t *testing.T) {
+	outboundTestDir(t)
+	base := map[string]string{"FMA_OUTBOUND_MODE": "relay", "FMA_RELAY_ADDR": "smtp.example.org:587", "FMA_RELAY_USER": "user", "FMA_RELAY_PASSWORD": "secret"}
+	for _, tc := range []struct{ key, value string }{
+		{"FMA_OUTBOUND_MODE", "invalid"}, {"FMA_RELAY_ADDR", "invalid"},
+		{"FMA_RELAY_USER", ""}, {"FMA_RELAY_PASSWORD", ""},
+		{"FMA_RELAY_TLS", "plaintext"}, {"FMA_RELAY_PASSWORD_FILE", "missing-secret"}, {"FMA_RELAY_CA_FILE", "missing-ca"},
+	} {
+		_, err := loadConfig(nil, func(key string) string {
+			if key == tc.key {
+				return tc.value
+			}
+			return base[key]
+		})
+		if err == nil {
+			loaded, e := loadConfig(nil, func(key string) string {
+				if key == tc.key {
+					return tc.value
+				}
+				return base[key]
+			})
+			if e == nil {
+				err = loadRelayObjects(&loaded)
+			} else {
+				err = e
+			}
+		}
+		if err == nil {
+			t.Fatalf("invalid %s accepted", tc.key)
+		}
+	}
+	checkError(t, objects.Put("bad-ca", []byte("not a certificate")))
+	loaded, err := loadConfig(nil, func(key string) string {
+		if key == "FMA_RELAY_CA_FILE" {
+			return "bad-ca"
+		}
+		return base[key]
+	})
+	checkError(t, err)
+	if loadRelayObjects(&loaded) == nil {
+		t.Fatal("invalid CA accepted")
+	}
+
+	for _, retry := range []string{"0s", "-1s"} {
+		if _, err := loadConfig([]string{"-queue-retry", retry}, func(string) string { return "" }); err == nil {
+			t.Fatal("nonpositive retry accepted")
+		}
+	}
+	if _, err := loadConfig([]string{"-queue"}, func(key string) string {
+		if key == "FMA_OUTBOUND_MODE" {
+			return "relay"
+		}
+		return ""
+	}); err != nil {
+		t.Fatal("queue inspection required relay config", err)
+	}
+
+	c, err := loadConfig(nil, func(key string) string { return base[key] })
+	if err != nil || c.Relay.TLS != "starttls" {
+		t.Fatal("default relay TLS changed", err)
+	}
+}
+
+func TestSharedLocalAndQueuedAcceptance(t *testing.T) {
+	outboundTestDir(t)
+	local := []byte("Subject: local\r\n\r\nlocal body\r\n")
+	remote := []byte("Subject: remote\r\n\r\nremote body\r\n")
+	checkError(t, queueMail("jw238", "jw238@t12e.cc", []string{"jw238"}, nil, local))
+	checkError(t, queueMail("jw238", "jw238@t12e.cc", []string{"jw238"}, []string{"recipient@example.net"}, remote))
+	for _, key := range []string{"jw238", testFolderKey(t, "jw238", "Sent")} {
+		mail, err := messages(key)
+		if err != nil || len(mail) != 2 || string(mail[0].Body) != string(local) || string(mail[1].Body) != string(remote) {
+			t.Fatalf("shared storage %s: count=%d err=%v", key, len(mail), err)
+		}
+	}
+	_, job := queuedJob(t)
+	if len(job.Recipients) != 1 || job.Recipients[0].State != "pending" || string(job.Body) != string(remote) {
+		t.Fatal("queue lost recipient state or original body")
+	}
+	checkError(t, saveSent("jw238", remote))
+	sent, err := messages(testFolderKey(t, "jw238", "Sent"))
+	if err != nil || len(sent) != 2 {
+		t.Fatal("Sent deduplication failed", err)
+	}
+}
+
+func checkError(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The in-memory store exists only in tests; production always connects to S3.
+type memoryObjects struct {
+	mu   sync.Mutex
+	data map[string][]byte
+}
+
+func (m *memoryObjects) Get(k string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.data[k]
+	if !ok {
+		return nil, fs.ErrNotExist
+	}
+	return bytes.Clone(b), nil
+}
+func (m *memoryObjects) Put(k string, b []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data[k] = bytes.Clone(b)
+	return nil
+}
+func (m *memoryObjects) Create(k string, b []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.data[k]; ok {
+		return fs.ErrExist
+	}
+	m.data[k] = bytes.Clone(b)
+	return nil
+}
+func (m *memoryObjects) Delete(k string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, k)
+	return nil
+}
+func (m *memoryObjects) List(prefix string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var keys []string
+	for k := range m.data {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+type prefixedObjects struct {
+	base   objectStore
+	prefix string
+}
+
+func (p *prefixedObjects) Get(k string) ([]byte, error)    { return p.base.Get(p.prefix + k) }
+func (p *prefixedObjects) Put(k string, b []byte) error    { return p.base.Put(p.prefix+k, b) }
+func (p *prefixedObjects) Create(k string, b []byte) error { return p.base.Create(p.prefix+k, b) }
+func (p *prefixedObjects) Delete(k string) error           { return p.base.Delete(p.prefix + k) }
+func (p *prefixedObjects) List(prefix string) ([]string, error) {
+	keys, err := p.base.List(p.prefix + prefix)
+	for i := range keys {
+		keys[i] = strings.TrimPrefix(keys[i], p.prefix)
+	}
+	return keys, err
+}
+func testFolderKey(t *testing.T, user, name string) string {
+	t.Helper()
+	meta, err := getFolder(user, name)
+	checkError(t, err)
+	return meta.Key
+}
+
+func TestBucketLockExcludesConcurrentWriters(t *testing.T) {
+	outboundTestDir(t)
+	store := objects
+	var wg sync.WaitGroup
+	var winners atomic.Int32
+	start := make(chan struct{})
+	releases := make(chan *bucketLease, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			release, err := lockBucket(store, time.Now())
+			if err == nil {
+				winners.Add(1)
+				releases <- release
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(releases)
+	if winners.Load() != 1 {
+		t.Fatalf("expected one writer, got %d", winners.Load())
+	}
+	for release := range releases {
+		release.release(time.Now())
+	}
+	release, err := lockBucket(store, time.Now())
+	checkError(t, err)
+	release.release(time.Now())
+}
+func TestFoldersRenameAndRecreate(t *testing.T) {
+	outboundTestDir(t)
+	user := &imapUser{name: "alice"}
+	checkError(t, user.CreateMailbox("Work"))
+	box, err := user.GetMailbox("Work")
+	checkError(t, err)
+	b := box.(*inbox)
+	body := []byte("Subject: test\r\n\r\nhello\r\n")
+	checkError(t, b.CreateMessage(nil, time.Time{}, bytes.NewReader(body)))
+	checkError(t, b.Poll())
+	oldKey, oldUID := b.key(), b.meta.Validity
+	checkError(t, user.RenameMailbox("Work", "Projects"))
+	checkError(t, b.Poll())
+	if b.Name() != "Projects" || len(b.Messages) != 1 || b.key() != oldKey {
+		t.Fatal("rename lost selected folder identity")
+	}
+	reloaded, err := user.GetMailbox("Projects")
+	checkError(t, err)
+	if reloaded.(*inbox).meta.Validity != oldUID {
+		t.Fatal("rename changed UIDVALIDITY")
+	}
+	checkError(t, user.DeleteMailbox("Projects"))
+	checkError(t, user.CreateMailbox("Projects"))
+	reloaded, err = user.GetMailbox("Projects")
+	checkError(t, err)
+	if reloaded.(*inbox).key() == oldKey || len(reloaded.(*inbox).Messages) != 0 {
+		t.Fatal("deleted data resurrected")
+	}
+	if b.CreateMessage(nil, time.Time{}, bytes.NewReader(body)) == nil {
+		t.Fatal("stale handle wrote deleted mailbox")
+	}
+}
+func TestS3StorageReloadAndPagination(t *testing.T) {
+	outboundTestDir(t)
+	if authenticate("alice", "secret") {
+		t.Fatal("missing account accepted")
+	}
+	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	if !authenticate("alice", "secret") {
+		t.Fatal("external account was not discovered")
+	}
+
+	checkError(t, deliver([]string{"alice"}, []byte("Subject: inbox\r\n\r\nbody")))
+	checkError(t, saveSent("alice", []byte("Subject: sent\r\n\r\nbody")))
+	inboxMessages, err := messages("alice")
+	checkError(t, err)
+	if len(inboxMessages) != 1 {
+		t.Fatal("recursive listing included folder or metadata objects")
+	}
+	// Exercise real continuation tokens when TEST_S3_ENDPOINT is configured.
+	for i := 0; i < 1005; i++ {
+		checkError(t, objects.Put(fmt.Sprintf("pages/%04d.json", i), []byte(`1`)))
+	}
+	count := 0
+	checkError(t, eachJSON("pages", func(_ string, n int, err error) error {
+		if n != 1 {
+			t.Errorf("invalid value %d", n)
+		}
+		count++
+		return err
+	}))
+	if count != 1005 {
+		t.Fatalf("pagination lost objects: %d", count)
+	}
+}
+func TestMissingOrUnavailableBucket(t *testing.T) {
+	if _, err := connectBucket(S3Config{}); err == nil {
+		t.Fatal("missing bucket accepted")
+	}
+	server := httptest.NewServer(nil)
+	server.Close()
+	if _, err := connectBucket(S3Config{Endpoint: server.URL, Bucket: "missing", AccessKey: "x", SecretKey: "y"}); err == nil {
+		t.Fatal("unavailable backend accepted")
+	}
+}
+func TestFolderFlagsPersist(t *testing.T) {
+	outboundTestDir(t)
+	user := &imapUser{name: "alice"}
+	checkError(t, user.CreateMailbox("Test"))
+	box, err := user.GetMailbox("Test")
+	checkError(t, err)
+	b := box.(*inbox)
+	checkError(t, b.CreateMessage(nil, time.Time{}, bytes.NewReader([]byte("Subject: flags\r\n\r\nbody"))))
+	checkError(t, b.Poll())
+	set := new(imap.SeqSet)
+	set.AddNum(1)
+	checkError(t, b.UpdateMessagesFlags(false, set, imap.AddFlags, []string{imap.SeenFlag}))
+	fresh, err := user.GetMailbox("Test")
+	checkError(t, err)
+	if len(fresh.(*inbox).Messages[0].Flags) != 1 {
+		t.Fatal("flags were not persisted")
+	}
+}
+
+type blockingObjects struct {
+	objectStore
+	entered chan struct{}
+	resume  chan struct{}
+}
+
+func (s *blockingObjects) Put(k string, data []byte) error {
+	close(s.entered)
+	<-s.resume
+	return s.objectStore.Put(k, data)
+}
+func TestStorageShutdownDrainsWrites(t *testing.T) {
+	outboundTestDir(t)
+	slow := &blockingObjects{objectStore: objects, entered: make(chan struct{}), resume: make(chan struct{})}
+	guard := &guardedStore{base: slow}
+	written := make(chan error, 1)
+	go func() { written <- guard.Put("pending", []byte("complete")) }()
+	<-slow.entered
+	closed := make(chan struct{})
+	go func() { guard.close(); close(closed) }()
+	select {
+	case <-closed:
+		t.Fatal("shutdown abandoned an active write")
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(slow.resume)
+	checkError(t, <-written)
+	<-closed
+	if !errors.Is(guard.Put("later", nil), net.ErrClosed) {
+		t.Fatal("write accepted after shutdown")
+	}
+	if _, err := objects.Get("later"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal("late object persisted")
+	}
+	data, err := objects.Get("pending")
+	checkError(t, err)
+	if string(data) != "complete" {
+		t.Fatal("pending write lost")
+	}
+}
+
+func (m *memoryObjects) GetVersion(k string) ([]byte, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.data[k]
+	if !ok {
+		return nil, "", fs.ErrNotExist
+	}
+	return bytes.Clone(data), fmt.Sprintf("\"%x\"", sha256.Sum256(data)), nil
+}
+func (m *memoryObjects) Swap(k string, data []byte, etag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.data[k]
+	if !ok || fmt.Sprintf("\"%x\"", sha256.Sum256(old)) != etag {
+		return fs.ErrExist
+	}
+	m.data[k] = bytes.Clone(data)
+	return nil
+}
+func (p *prefixedObjects) GetVersion(k string) ([]byte, string, error) {
+	return p.base.(versionedStore).GetVersion(p.prefix + k)
+}
+func (p *prefixedObjects) Swap(k string, b []byte, etag string) error {
+	return p.base.(versionedStore).Swap(p.prefix+k, b, etag)
+}
+
+func TestLeaseRenewalExpiryAndStaleRelease(t *testing.T) {
+	outboundTestDir(t)
+	now := time.Now().UTC()
+	first, err := lockBucket(objects, now)
+	checkError(t, err)
+	checkError(t, first.renew(now.Add(15*time.Second)))
+	record, _, err := readLock(objects.(versionedStore))
+	checkError(t, err)
+	if !record.StartedAt.Equal(now) || !record.RenewedAt.Equal(now.Add(15*time.Second)) || !record.ExpiresAt.Equal(now.Add(45*time.Second)) {
+		t.Fatal("incorrect lease timestamps")
+	}
+	if _, err := lockBucket(objects, now.Add(31*time.Second)); err == nil {
+		t.Fatal("renewed lease stolen")
+	}
+	second, err := lockBucket(objects, now.Add(46*time.Second))
+	checkError(t, err)
+	if first.renew(now.Add(47*time.Second)) == nil {
+		t.Fatal("expired owner renewed")
+	}
+	first.release(now.Add(47 * time.Second))
+	record, _, err = readLock(objects.(versionedStore))
+	checkError(t, err)
+	if record.Owner != second.record.Owner {
+		t.Fatal("stale release changed successor lock")
+	}
+	second.release(now.Add(47 * time.Second))
+	third, err := lockBucket(objects, now.Add(48*time.Second))
+	checkError(t, err)
+	third.release(now.Add(49 * time.Second))
+}
+func TestExpiredLeaseTakeoverRace(t *testing.T) {
+	outboundTestDir(t)
+	now := time.Now()
+	_, err := lockBucket(objects, now.Add(-time.Minute))
+	checkError(t, err)
+	var wg sync.WaitGroup
+	var winners atomic.Int32
+	start := make(chan struct{})
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := lockBucket(objects, now); err == nil {
+				winners.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if winners.Load() != 1 {
+		t.Fatalf("expired lease acquired by %d writers", winners.Load())
+	}
+}
+func TestLeaseLossStopsWriter(t *testing.T) {
+	outboundTestDir(t)
+	lease, err := lockBucket(objects, time.Now())
+	checkError(t, err)
+	guard := &guardedStore{base: objects, lease: lease}
+	lease.mu.Lock()
+	lease.record.ExpiresAt = time.Now().Add(-time.Second)
+	lease.mu.Unlock()
+	if guard.Put("after-expiry", []byte("bad")) == nil {
+		t.Fatal("expired writer accepted storage operation")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := lease.keepAlive(ctx, cancel)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expired lease did not stop server")
+	}
+	<-done
+	if lease.failure() == nil {
+		t.Fatal("lease loss not reported")
+	}
+}
+
+func TestExternalAccountsWithoutReload(t *testing.T) {
+	outboundTestDir(t)
+	if authenticate("alice", "secret") {
+		t.Fatal("missing account accepted")
+	}
+	checkError(t, objects.Put("alice/.password", []byte("secret\n")))
+	if !authenticate("alice@t12e.cc", "secret") || authenticate("alice", "wrong") {
+		t.Fatal("new account authentication failed")
+	}
+	session := &smtpSession{}
+	checkError(t, session.Rcpt("alice@t12e.cc", nil))
+	if session.Rcpt("alicex@t12e.cc", nil) == nil {
+		t.Fatal("prefix isolation failed")
+	}
+	checkError(t, objects.Put("alice/.password", []byte("changed")))
+	if authenticate("alice", "secret") || !authenticate("alice", "changed") {
+		t.Fatal("password change required reload")
+	}
+	checkError(t, objects.Delete("alice/.password"))
+	if authenticate("alice", "changed") || session.Rcpt("alice@t12e.cc", nil) == nil {
+		t.Fatal("deleted account still accepted")
+	}
+	checkError(t, objects.Put("alice/.password", nil))
+	if authenticate("alice", "") || session.Rcpt("alice@t12e.cc", nil) == nil {
+		t.Fatal("empty password accepted")
+	}
+}
+
+func claimAndProcess(t *testing.T, key string) {
+	t.Helper()
+	claim, err := preclaimTask(key, "test-worker", time.Now())
+	checkError(t, err)
+	if claim == nil {
+		t.Fatal("task not claimed")
+	}
+	checkError(t, claim.execute(context.Background()))
+}
+
+func TestPreclaimRaceTimeoutAndStaleCompletion(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, queueMail("alice", "alice@t12e.cc", nil, []string{"r@example.net"}, []byte("Subject: claim\r\n\r\nbody")))
+	key, _ := queuedJob(t)
+	var wg sync.WaitGroup
+	winners := make(chan *claimedTask, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := preclaimTask(key, "node", time.Now())
+			if err == nil && c != nil {
+				winners <- c
+			}
+		}()
+	}
+	wg.Wait()
+	close(winners)
+	if len(winners) != 1 {
+		t.Fatalf("%d claim winners", len(winners))
+	}
+	old := <-winners
+	if c, err := preclaimTask(key, "other", old.expires.Add(-time.Nanosecond)); err != nil || c != nil {
+		t.Fatal("live claim stolen", err)
+	}
+	current, err := preclaimTask(key, "other", old.expires)
+	checkError(t, err)
+	if current == nil || current.job.Preclaim.Owner != "other" {
+		t.Fatal("expired preclaim not recovered")
+	}
+	old.job.Complete = true
+	old.job.Preclaim = nil
+	if old.save(context.Background()) == nil {
+		t.Fatal("old worker overwrote successor")
+	}
+	stored, err := readJSON[*outboundJob](key)
+	checkError(t, err)
+	if stored.Complete || stored.Preclaim.Owner != "other" {
+		t.Fatal("successor lost")
+	}
+}
+
+type failTaskDelete struct {
+	objectStore
+	versionedStore
+	fail bool
+}
+
+func (s *failTaskDelete) Delete(k string) error {
+	if s.fail && strings.HasSuffix(k, ".json") {
+		return fmt.Errorf("injected delete failure")
+	}
+	return s.objectStore.Delete(k)
+}
+func TestCompletedTaskCleanupAfterCrash(t *testing.T) {
+	outboundTestDir(t)
+	relay := newFakeRelay(t, true)
+	checkError(t, queueMail("alice", "alice@t12e.cc", nil, []string{"r@example.net"}, []byte("Subject: cleanup\r\n\r\nbody")))
+	key, _ := queuedJob(t)
+	base := objects
+	fault := &failTaskDelete{objectStore: base, versionedStore: base.(versionedStore), fail: true}
+	objects = fault
+	c, err := preclaimTask(key, "node", time.Now())
+	checkError(t, err)
+	if c.execute(context.Background()) == nil {
+		t.Fatal("delete failure hidden")
+	}
+	job, err := readJSON[*outboundJob](key)
+	checkError(t, err)
+	if !job.Complete || job.Preclaim != nil {
+		t.Fatal("completion was not committed")
+	}
+	fault.fail = false
+	c, err = preclaimTask(key, "replacement", time.Now())
+	checkError(t, err)
+	if c != nil || relay.received.Load() != 1 {
+		t.Fatal("completed task resent")
+	}
+	if _, err := objects.Get(key); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatal("cleanup did not remove task", err)
+	}
+}
+
+func TestConcurrentS3MailboxAllocation(t *testing.T) {
+	outboundTestDir(t)
+	var wg sync.WaitGroup
+	failures := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := ensureFolders("alice"); err != nil {
+				failures <- err
+				return
+			}
+			failures <- appendMessage("alice", []byte(fmt.Sprintf("message %d", i)), nil, time.Now(), false)
+		}(i)
+	}
+	wg.Wait()
+	close(failures)
+	for err := range failures {
+		checkError(t, err)
+	}
+	mail, err := messages("alice")
+	checkError(t, err)
+	if len(mail) != 16 {
+		t.Fatalf("concurrent delivery lost messages: %d", len(mail))
+	}
+}
+
+func TestScannerYieldsAt1024WithoutDroppingClaims(t *testing.T) {
+	outboundTestDir(t)
+	// This capacity test needs no S3 latency; CAS correctness is exercised on
+	// both backends by the takeover tests above.
+	objects = &memoryObjects{data: make(map[string][]byte)}
+	for i := 0; i < maxClaimedTasks+1; i++ {
+		key := fmt.Sprintf("%s/%032x.json", outbox, i)
+		checkError(t, writeJSON(key, &outboundJob{ID: fmt.Sprintf("%032x", i), Archived: true, Recipients: []outboundRecipient{{Address: "a@example.net", State: "pending"}}}))
+	}
+	lease, err := lockBucket(objects, time.Now())
+	checkError(t, err)
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, maxClaimedTasks)
+	gate := make(chan struct{})
+	defer func() { close(gate); wg.Wait() }()
+	full, err := scanTasks(context.Background(), lease, slots, &wg, func(c *claimedTask) error { <-gate; return nil })
+	checkError(t, err)
+	if !full || len(slots) != maxClaimedTasks {
+		t.Fatalf("incorrect batch: full=%v active=%d", full, len(slots))
+	}
+	lease.release(time.Now())
+	next, err := lockBucket(objects, time.Now())
+	checkError(t, err)
+	defer next.release(time.Now())
+	key := fmt.Sprintf("%s/%032x.json", outbox, maxClaimedTasks)
+	last, err := preclaimTask(key, next.owner(), time.Now())
+	checkError(t, err)
+	if last == nil {
+		t.Fatal("next node could not claim remaining task")
+	}
+	first, err := preclaimTask(fmt.Sprintf("%s/%032x.json", outbox, 0), next.owner(), time.Now())
+	checkError(t, err)
+	if first != nil {
+		t.Fatal("releasing scanner lock released a live task")
+	}
+}
+
+func TestPreclaimExecutionCancellationPreservesTask(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, queueMail("alice", "alice@t12e.cc", nil, []string{"a@example.net"}, []byte("Subject: cancel\r\n\r\nbody")))
+	key, _ := queuedJob(t)
+	c, err := preclaimTask(key, "node", time.Now())
+	checkError(t, err)
+	if c.job.Preclaim.ExpiresAt.Sub(c.job.Preclaim.StartedAt) != 20*time.Second {
+		t.Fatal("incorrect timeout")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_ = c.execute(ctx)
+	job, err := readJSON[*outboundJob](key)
+	checkError(t, err)
+	if job.Complete || job.Preclaim == nil || job.Recipients[0].State != "pending" {
+		t.Fatal("cancelled task lost")
+	}
+}
+
+func TestConfigEnvironmentPrefixAndOfflineVersion(t *testing.T) {
+	loaded, err := loadConfig([]string{"--version"}, func(key string) string {
+		if !strings.HasPrefix(key, "FMA_") {
+			t.Fatalf("unprefixed environment lookup: %s", key)
+		}
+		if key == "FMA_OUTBOUND_MODE" {
+			return "invalid-but-offline"
+		}
+		return ""
+	})
+	checkError(t, err)
+	if !loaded.ShowVersion {
+		t.Fatal("version flag not set")
+	}
+}
