@@ -40,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -3149,6 +3150,7 @@ type jmapBlobWriter struct {
 	physicalKey    string
 	partID         jmap.Id
 	externalDigest bool
+	parallelDigest bool // A separate ordered consumer owns digest until receive completes.
 	ctx            context.Context
 	store          jmapBlobs
 	account        jmap.Id
@@ -3225,7 +3227,7 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 		n, err = w.gzip.Write(data)
 	}
 	w.writeErr = err
-	if !w.externalDigest {
+	if !w.externalDigest && !w.parallelDigest {
 		w.digest.Write(data[:n])
 	}
 	w.size += int64(n)
@@ -5215,26 +5217,38 @@ func (p *streamTaskPool) Close() {
 
 var streamTasks = newStreamTaskPool(defaultStreamWorkers)
 
-// Blocks move from the receiver to the parser and back only after consumption.
-// Three owned 1 MiB blocks allow CPU overlap without copying or unbounded queues.
+// Each immutable block is returned only after the parser and every writer finish.
+// All consumers share three 1 MiB allocations; no stream-sized copies are retained.
+type mimeStreamBlock struct {
+	data []byte
+	refs atomic.Int32
+	free chan []byte
+}
+
+func (b *mimeStreamBlock) release() {
+	if b.refs.Add(-1) == 0 {
+		b.free <- b.data[:cap(b.data)]
+	}
+}
+
 type mimeStreamBlocks struct {
 	ctx     context.Context
-	ready   chan []byte
+	ready   chan *mimeStreamBlock
 	free    chan []byte
 	current []byte
-	owned   []byte
+	owned   *mimeStreamBlock
 	err     error // written before ready closes, read after receiving the closed channel
 }
 
 func newMIMEStreamBlocks() *mimeStreamBlocks {
-	return &mimeStreamBlocks{ctx: context.Background(), ready: make(chan []byte, 3), free: make(chan []byte, 3)}
+	return &mimeStreamBlocks{ctx: context.Background(), ready: make(chan *mimeStreamBlock, 3), free: make(chan []byte, 3)}
 }
 func (s *mimeStreamBlocks) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 	for len(s.current) == 0 {
-		var block []byte
+		var block *mimeStreamBlock
 		var ok bool
 		select {
 		case block, ok = <-s.ready:
@@ -5247,21 +5261,58 @@ func (s *mimeStreamBlocks) Read(p []byte) (int, error) {
 			}
 			return 0, io.EOF
 		}
-		s.current = block
-		s.owned = block[:cap(block)]
+		s.current, s.owned = block.data, block
 	}
 	n := copy(p, s.current)
 	if n == len(s.current) {
-		s.free <- s.owned
-		s.current = nil
-		s.owned = nil
+		s.owned.release()
+		s.current, s.owned = nil, nil
 	} else {
 		s.current = s.current[n:]
 	}
 	return n, nil
 }
-func (s *mimeStreamBlocks) receive(ctx context.Context, r io.Reader, w io.Writer) (size int64, err error) {
-	defer func() { s.err = err; close(s.ready) }()
+func (s *mimeStreamBlocks) receive(ctx context.Context, r io.Reader, writers ...io.Writer) (size int64, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	queues := make([]chan *mimeStreamBlock, len(writers))
+	results := make(chan error, len(writers))
+	for i, w := range writers {
+		q := make(chan *mimeStreamBlock, 3)
+		queues[i] = q
+		go func() {
+			var failure error
+			for block := range q {
+				if failure == nil {
+					failure = ctx.Err()
+					if failure == nil {
+						n, e := w.Write(block.data)
+						failure = e
+						if failure == nil && n != len(block.data) {
+							failure = io.ErrShortWrite
+						}
+					}
+					if failure != nil {
+						cancel()
+					}
+				}
+				block.release()
+			}
+			results <- failure
+		}()
+	}
+	defer func() {
+		for _, q := range queues {
+			close(q)
+		}
+		for range writers {
+			if e := <-results; e != nil && (err == nil || errors.Is(err, context.Canceled)) {
+				err = e
+			}
+		}
+		s.err = err
+		close(s.ready)
+	}()
 	for range 3 {
 		s.free <- make([]byte, 1<<20)
 	}
@@ -5279,19 +5330,29 @@ func (s *mimeStreamBlocks) receive(ctx context.Context, r io.Reader, w io.Writer
 			if size+int64(n) > maxMailSize {
 				return size, &smtp.SMTPError{Code: 552, Message: "message too large"}
 			}
-			written, we := w.Write(b[:n])
-			size += int64(written)
-			if we != nil {
-				return size, we
+			block := &mimeStreamBlock{data: b[:n], free: s.free}
+			// The producer reference prevents reuse while dispatch is still in progress.
+			block.refs.Store(1)
+			for _, q := range queues {
+				block.refs.Add(1)
+				select {
+				case q <- block:
+				case <-ctx.Done():
+					block.release()
+					block.release()
+					return size, ctx.Err()
+				}
 			}
-			if written != n {
-				return size, io.ErrShortWrite
-			}
+			block.refs.Add(1)
 			select {
-			case s.ready <- b[:n]:
+			case s.ready <- block:
 			case <-ctx.Done():
+				block.release()
+				block.release()
 				return size, ctx.Err()
 			}
+			block.release()
+			size += int64(n)
 		} else {
 			s.free <- b
 			empty++
@@ -5353,14 +5414,18 @@ func storeMailStream(ctx context.Context, root string, r io.Reader) (*jmapBlobRe
 	ctx = context.WithValue(ctx, mimeParentContext{}, physical[:strings.LastIndex(physical, "/")])
 	store := jmapBlobs{store: objects}
 	account := jmapAccountID(root)
-	writer := &jmapBlobWriter{ctx: ctx, store: store, account: account, digest: sha256.New(), physicalKey: physical}
+	writer := &jmapBlobWriter{ctx: ctx, store: store, account: account, digest: sha256.New(), parallelDigest: true, physicalKey: physical}
 	defer writer.Abort()
 	pipeline := &mimePipelineStore{jmapBlobs: store}
 	stopPoolCancel := context.AfterFunc(streamTasks.ctx, cancel)
 	defer stopPoolCancel()
 	blocks := newMIMEStreamBlocks()
+	started := make(chan struct{})
+	received := make(chan struct{})
 	done, err := streamTasks.Submit(ctx, func(taskCtx context.Context) error {
 		blocks.ctx = taskCtx // Only the worker reads this field.
+		close(started)
+		defer func() { <-received }() // Hold admission until both auxiliary consumers exit.
 		err := jmail.IngestMessage(taskCtx, pipeline, account, "", blocks)
 		if err == nil {
 			_, err = io.Copy(io.Discard, blocks)
@@ -5373,7 +5438,17 @@ func storeMailStream(ctx context.Context, root string, r io.Reader) (*jmapBlobRe
 	if err != nil {
 		return nil, err
 	}
-	size, readErr := blocks.receive(ctx, input, writer)
+	// Helpers belong to an admitted ingestion, never to jobs waiting in the pool.
+	// They do not submit dependent tasks to the pool, so even one worker is safe.
+	select {
+	case <-started:
+	case <-ctx.Done():
+		close(received)
+		<-done
+		return nil, ctx.Err()
+	}
+	size, readErr := blocks.receive(ctx, input, writer, writer.digest)
+	close(received)
 	if readErr != nil {
 		cancel()
 	}

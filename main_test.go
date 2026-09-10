@@ -2329,6 +2329,87 @@ func TestMIMEStreamBlocksOwnershipAndCancellation(t *testing.T) {
 	}
 }
 
+type mimeConsumerFunc func([]byte) (int, error)
+
+func (f mimeConsumerFunc) Write(b []byte) (int, error) { return f(b) }
+
+func TestMIMEStreamParallelConsumers(t *testing.T) {
+	data := bytes.Repeat([]byte("ordered immutable input"), 200000)
+	blocks := newMIMEStreamBlocks()
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var outputs [2]bytes.Buffer
+	writers := make([]io.Writer, 2)
+	for i := range writers {
+		first := true
+		writers[i] = mimeConsumerFunc(func(b []byte) (int, error) {
+			if first {
+				first = false
+				entered <- struct{}{}
+				<-release
+			}
+			return outputs[i].Write(b)
+		})
+	}
+	received := make(chan error, 1)
+	parsed := make(chan error, 1)
+	go func() {
+		_, err := blocks.receive(context.Background(), bytes.NewReader(data), writers...)
+		received <- err
+	}()
+	var result bytes.Buffer
+	go func() { _, err := io.Copy(&result, blocks); parsed <- err }()
+	// Both writers must enter before either is allowed to complete its first write.
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("writers are serialized")
+		}
+	}
+	close(release)
+	checkError(t, <-received)
+	checkError(t, <-parsed)
+	for _, got := range [][]byte{result.Bytes(), outputs[0].Bytes(), outputs[1].Bytes()} {
+		if !bytes.Equal(got, data) {
+			t.Fatal("parallel consumer saw reordered or reused data")
+		}
+	}
+	for range 3 {
+		<-blocks.free
+	}
+}
+
+func TestMIMEStreamWriterFailure(t *testing.T) {
+	failure := errors.New("storage write failed")
+	for _, want := range []error{failure, io.ErrShortWrite} {
+		t.Run(want.Error(), func(t *testing.T) {
+			blocks := newMIMEStreamBlocks()
+			done := make(chan error, 1)
+			writer := mimeConsumerFunc(func(b []byte) (int, error) {
+				if want == io.ErrShortWrite {
+					return len(b) - 1, nil
+				}
+				return 0, failure
+			})
+			go func() {
+				_, err := blocks.receive(context.Background(), bytes.NewReader(make([]byte, 5<<20)), writer, io.Discard)
+				done <- err
+			}()
+			// No parser drains ready: cancellation must wake the blocked producer anyway.
+			select {
+			case err := <-done:
+				if !errors.Is(err, want) {
+					t.Fatalf("got %v, want %v", err, want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("failed consumer stranded producer")
+			}
+		})
+	}
+}
+
 func TestStreamWorkerConfiguration(t *testing.T) {
 	c, err := loadConfig(nil, func(string) string { return "" })
 	checkError(t, err)

@@ -1454,3 +1454,66 @@ Normal-run application SHA-256: `6dc9fa3776c7ee308703f543f51f57fb3ab7b3874ed21cb
 | workers4-timings-retry | `ff0ad55e167409df634bbf0d530d74a744fd98785c1823ddea3e26c7d38ec8b5` |
 
 **`make test` and `make build` passed** for the default-four change, including the configuration regression, task-pool race tests and native protocol suite. Records: `/tmp/fma-workers4-tests.log` and `/tmp/fma-workers4-build.log`. To reproduce the default configuration, run `python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --report /tmp/fma-workers4.json` without a worker override. **SMTP remains above the 3-second target.**
+
+
+## Parallel original-MIME digest and gzip consumers (2026-09-10)
+
+Previously, the receiver synchronously hashed original MIME for 1.030694 s and wrote gzip/downstream storage for 0.544498 s in the timing diagnostic above. `mimeStreamBlocks.receive` now fans each immutable block out to three ordered consumers: the MIME parser, a gzip/object writer, and a SHA-256 writer. The receiver only reads and dispatches. `jmapBlobWriter.parallelDigest` suppresses its inline hash; Commit waits for all consumers before deriving the raw blob ID and publishing metadata. Failed or short writes cancel reception and abort publication. S3 multipart requests already upload concurrently as full parts become available; gzip retains its ordered single-stream state.
+
+The three 1 MiB allocations are shared, not copied for each consumer. Atomic reference counts return a block only after every consumer has finished. The default remains four ingestion workers. Each admitted ingestion owns two auxiliary goroutines, started only after its parser actually begins; admission is held until both helpers exit. Helpers do not submit dependent jobs to the same pool, allowing `-stream-workers 1` without pool starvation. Queued jobs do not allocate the rotating blocks. The existing global 1 GiB active S3 part-capacity limit and separate raw/part compression pools remain in force.
+
+Two fresh ordinary 2 GiB runs measured SMTP **4.107 / 3.993 s**, mean **4.050 s**, versus the preceding default-four mean **4.328 s**: **6.4% less elapsed time / 6.9% higher throughput**. SMTP CPU rose from **11.785 to 12.860 CPU s**, **9.1% more CPU work**; average occupancy rose from approximately 272% to 318% (100% = one core). This is a latency/CPU tradeoff, not a reduction in total computation. SMTP alone and SMTP plus first attachment download still miss three seconds. First JMAP download remains direct persisted-part streaming, measured before IMAP/POP3; no repeated-read cache is introduced.
+
+### Complete transfer measurements
+
+All rows use 2,147,483,648 decoded attachment bytes and 2,938,662,361 MIME bytes, seed 20260910. The first three use four workers and incompressible data; the last uses compressible data and **one worker** to validate the minimum configuration. The profile row includes CPU-profiler start/stop overhead and is excluded from ordinary means. All four runs passed content hashes, the 256 MiB sampled RSS assertion, no-local-spool and interrupted-upload checks. RSS is sampled every 50 ms; CPU and RSS cover fma, excluding the client and Fals3y.
+
+| Run | Raw up s | Raw down s | SMTP s | IMAP down s | APPEND s | POP3 s | JMAP metadata s | First JMAP down s | Whole-run peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fanout-1 | 1.831 | 0.904 | 4.107 | 1.977 | 4.222 | 1.772 | 0.004 | 0.888 | 249.67188 |
+| fanout-2 | 1.800 | 0.884 | 3.993 | 1.984 | 4.143 | 1.848 | 0.004 | 0.902 | 243.82812 |
+| fanout-profile | 1.823 | 0.900 | 4.220 | 1.919 | 4.214 | 1.857 | 0.007 | 0.896 | 254.46875 |
+| fanout-compressed-one | 1.462 | 0.849 | 3.630 | 2.140 | 3.971 | 2.254 | 0.004 | 0.852 | 131.34375 |
+
+| Run | SMTP start UTC | SMTP end UTC | SMTP CPU s / average % | SMTP peak MiB |
+| --- | --- | --- | ---: | ---: |
+| fanout-1 | 2026-09-10T21:12:04.601121Z | 2026-09-10T21:12:08.707933Z | 12.920 / 314.60% | 190.95312 |
+| fanout-2 | 2026-09-10T21:12:32.404133Z | 2026-09-10T21:12:36.396915Z | 12.800 / 320.58% | 201.00000 |
+| fanout-profile | 2026-09-10T21:13:24.286090Z | 2026-09-10T21:13:28.506131Z | 12.930 / 306.40% | 214.14062 |
+| fanout-compressed-one | 2026-09-10T21:13:57.064567Z | 2026-09-10T21:14:00.694137Z | 9.010 / 248.24% | 96.51562 |
+
+### Remaining critical path
+
+The temporary profile/timing overlay measured the following overlapping branches during SMTP. Writer call time includes downstream waits and scheduling; it is not pure CPU time and must not be added to receiver/parser wall time.
+
+| Branch / interval | Elapsed s |
+| --- | ---: |
+| Receiver, including consumer completion | 3.982449 |
+| Protocol Read calls within receiver | 3.283252 |
+| Wait for a reusable block within receiver | 0.690395 |
+| Raw gzip/object Write calls in auxiliary consumer | 1.060034 |
+| Raw SHA-256 Write calls in auxiliary consumer | 1.198349 |
+| Parser | 4.008562 |
+| Parser input wait, included above | 0.145980 |
+| Final raw commit and metadata publication | 0.010369 |
+
+The parser still takes about four seconds while the receiver catches up with it. Removing receiver-side hashing does not subtract its old elapsed duration from the end-to-end critical path: consumers now compete for CPU and each shared block waits for its slowest reader. In this profile, protocol Read calls also take longer than before. More detailed scheduling traces would be needed to assign that increase to specific contention sources.
+
+CPU profiling sampled **11.93 CPU s** over **4.21 s**. Flat costs include `syscall.syscall` **2.43 CPU s**, `runtime.pthread_cond_signal` **2.42**, `runtime.pthread_cond_wait` **1.13**, SHA-256 `blockSHA2` **1.88**, SMTP `lineLimitReader.Read` **0.99** (2.41 cumulative), MIME `base64Filter.fill` **0.73** (1.05 cumulative), and Base64 Decode **0.40** (0.44 cumulative). The prior four-worker profile had signal/wait costs **1.62 / 0.82 CPU s**: more consumer wakeups are a material cost of this implementation. SHA-256 samples still include raw identity, decoded-part identity and AWS HTTP payload signing. No checksums or protocol line checks were disabled. The next optimization should reduce parser/framing work and wakeup overhead before increasing worker counts again.
+
+### Provenance and verification
+
+This is an application change on base commit `7b1471753883de288b52d01151a7aa873d262212` plus the working-tree patch recorded by each report. No dependency or upstream SMTP PR was modified. Versions remain Go 1.25.3 on Apple M4/macOS arm64; [MIME fork ea6016819f55](https://github.com/Jabberwocky238/naust-jmap/commit/ea6016819f557258bc1adf95488dca474c37e846), module `v0.3.4-0.20260910204519-ea6016819f55`; [SMTP fork b0673510e580](https://github.com/Jabberwocky238/go-smtp/commit/b0673510e580); [POP3 fork v0.1.6](https://github.com/Jabberwocky238/go-pop3/tree/v0.1.6); AWS core v1.41.5 / S3 v1.97.3; klauspost/compress v1.20.0; Fals3y 0.3.1-dev.b8e48bf (same executable SHA-256 as the preceding section). This application-only change has no new upstream PR.
+
+Production `main.go` SHA-256: `d453f5dd131d5ca4dad82c9da4b8180b88099b29ba4ff4f657489aea244d5348`.
+
+| Run | Executable SHA-256 |
+| --- | --- |
+| fanout-1 | `30e0eda55ced639b670e01746ed60ed90cc597185d7e981877e2f0d9cc33cdd4` |
+| fanout-2 | `30e0eda55ced639b670e01746ed60ed90cc597185d7e981877e2f0d9cc33cdd4` |
+| fanout-profile | `73a9b238de69bb3adcef21cc7711daf525d762c153fda75a790cc7e070090423` |
+| fanout-compressed-one | `30e0eda55ced639b670e01746ed60ed90cc597185d7e981877e2f0d9cc33cdd4` |
+
+Reports are `/tmp/fma-fanout-{1,2,profile}.json` and `/tmp/fma-fanout-compressed-one.json`; the temporary CPU profile is `/tmp/fma-fanout-smtp.cpu`. Probe code and logs are not committed. Reproduce normal runs with `python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --report /tmp/fma-fanout.json`; add `--data compressible --stream-workers 1` for the minimum-worker compression check. Tests cover genuinely overlapping writers, byte ordering/ownership across multiple blocks, cancellation, failed and short writes, and the existing first-read/restart/account-isolation checks.
+
+**`make test` and `make build` passed** for the final implementation, including race tests and native protocol integration. Validation records are `/tmp/fma-fanout-final-tests.log` and `/tmp/fma-fanout-build.log`.
