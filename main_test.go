@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/emersion/go-imap"
 	"io"
 	"io/fs"
@@ -1428,5 +1429,85 @@ func TestJMAPSharedMailbox(t *testing.T) {
 	checkError(t, err)
 	if len(jvalue[[]jmap.Id](result, "ids")) != 1 {
 		t.Fatal("POP/IMAP deletion not visible in JMAP")
+	}
+}
+
+// Boundary checks use the actual S3 object's metadata and gzip bytes, then read
+// through fma's adapter and verify the original size and hash.
+func TestS3BlobCompression(t *testing.T) {
+	endpoint := os.Getenv("TEST_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("requires native S3 fixture")
+	}
+	bucket, err := connectBucket(S3Config{Endpoint: endpoint, Bucket: os.Getenv("TEST_S3_BUCKET"), Region: "us-east-1", AccessKey: "test", SecretKey: "test"})
+	checkError(t, err)
+	root := fmt.Sprintf("compression%d", time.Now().UnixNano())
+	blobs := jmapBlobs{store: bucket}
+	acct := jmapAccountID(root)
+	t.Cleanup(func() {
+		keys, _ := bucket.List(root + "/")
+		for _, key := range keys {
+			bucket.Delete(key)
+		}
+	})
+	for _, size := range []int64{gzipThreshold - 1, gzipThreshold, gzipThreshold + 1, 17 << 20} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			ctx := context.Background()
+			w, err := blobs.Create(ctx, acct)
+			checkError(t, err)
+			defer w.Abort()
+			hash := sha256.New()
+			block := bytes.Repeat([]byte("binary\x00\xff"), 4096)
+			for left := size; left > 0; {
+				part := block[:min(left, int64(len(block)))]
+				_, err = w.Write(part)
+				checkError(t, err)
+				hash.Write(part)
+				left -= int64(len(part))
+			}
+			id, err := w.Commit()
+			checkError(t, err)
+			key, err := blobs.key(acct, id)
+			checkError(t, err)
+			stored, err := bucket.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket.bucket, Key: &key})
+			checkError(t, err)
+			compressed := stored.Metadata["fma-encoding"] == "gzip"
+			if compressed != (size > gzipThreshold) {
+				t.Fatalf("compression=%v size=%d", compressed, size)
+			}
+			if compressed {
+				prefix := make([]byte, 2)
+				_, err = io.ReadFull(stored.Body, prefix)
+				checkError(t, err)
+				if !bytes.Equal(prefix, []byte{0x1f, 0x8b}) {
+					t.Fatalf("not gzip: %x", prefix)
+				}
+				if *stored.ContentLength >= size {
+					t.Fatal("compressible input was not reduced")
+				}
+			}
+			stored.Body.Close()
+			r, length, err := blobs.Open(ctx, acct, id)
+			checkError(t, err)
+			defer r.Close()
+			got := sha256.New()
+			n, err := io.Copy(got, r)
+			checkError(t, err)
+			if length != size || n != size || !bytes.Equal(hash.Sum(nil), got.Sum(nil)) {
+				t.Fatalf("round trip size=%d/%d want=%d", length, n, size)
+			}
+			// Cross-account/server-side copy must preserve compression metadata.
+			copyKey := root + "/copy"
+			checkError(t, bucket.CopyStream(ctx, key, copyKey))
+			r2, length, err := bucket.OpenStream(ctx, copyKey)
+			checkError(t, err)
+			got.Reset()
+			n, err = io.Copy(got, r2)
+			r2.Close()
+			checkError(t, err)
+			if length != size || n != size || !bytes.Equal(hash.Sum(nil), got.Sum(nil)) {
+				t.Fatal("copy lost compression metadata")
+			}
+		})
 	}
 }

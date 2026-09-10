@@ -155,6 +155,15 @@ def main():
             expected_id = 'G' + base64.urlsafe_b64encode(digest.digest()).decode().rstrip('=')
             assert uploaded['blobId'] == expected_id and uploaded['size'] == size, uploaded
             results['sha256'] = digest.hexdigest()
+            object_key = f'/stream-test/alice/.jmap/blobs/{uploaded["blobId"]}'
+            with urllib.request.urlopen(urllib.request.Request(endpoint + object_key, method='HEAD')) as stored:
+                results['stored_bytes'] = int(stored.headers['Content-Length'])
+                results['storage_encoding'] = stored.headers.get('x-amz-meta-fma-encoding', 'identity')
+                assert (results['storage_encoding'] == 'gzip') == (size > (10 << 20)), dict(stored.headers)
+                if size > (10 << 20):
+                    assert int(stored.headers['x-amz-meta-fma-size']) == size
+                    assert results['stored_bytes'] < size, results
+
             print(json.dumps({'upload': results['phases']['upload']}), flush=True)
             print('Streaming S3 through JMAP download; client hashes chunks without retaining the file', flush=True)
             measure = Measurement(proc.pid)
