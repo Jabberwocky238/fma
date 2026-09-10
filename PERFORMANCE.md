@@ -1630,3 +1630,92 @@ This run used application `3ce6cb3` and a temporary modfile selecting the local 
 Measured executable SHA-256: `ccc1d2464dd8cdb0572008a86e0022c010b9d9e9e95b590595c3d1fa433f46e1`. Candidate `sinks.go` SHA-256: `9b1508a56f270e0f70d3caefe5a1beea7114ad1537b74eacbe35cd2f6baeea01`.
 
 The retained reports are `/tmp/fma-stress-single-partial.json` and `/tmp/fma-stress-single-partial.log`; `/tmp/fma-stress-single-server.log` records server messages before shutdown. Temporary fixture storage was cleaned up by the harness. No new benchmark, stress run or production code change was performed for this analysis.
+
+
+## Mail-owned state and memory-only indexes (2026-09-10)
+
+This change addresses the whole-account amplification recorded in the stopped
+single-account diagnostic above. Runtime metadata no longer uses the old
+whole-image adapter. That adapter remains solely for private, in-memory bootstrap
+and as a benchmark comparison. Bootstrap publishes the new owner format directly;
+its temporary indexes are never uploaded.
+
+`<account>/.jmap/state.json` now contains folders, identities, UID/state counters,
+the account lease, and the current transaction decision. Email, Thread,
+EmailSubmission, upload ownership and change history records live under `mail/`.
+Each mutation prepares only changed authoritative records and conditionally
+publishes the account decision. The previous decision is materialized before the
+next write; periodic and shutdown flushes also finish committed records. A failed
+head write does not publish its prepared records. Concurrent writers use the
+account ETag, and record materialization also uses conditional writes.
+
+Property, membership, blob-reference, account/worklist and collection-hint indexes
+are rebuilt in memory from records using the registered descriptors and the
+library's public sort codec. Get and MultiGet use the shared account cache; Scan
+uses a sorted key range rather than decoding and sorting every record on each
+call. Value-only updates retain the ordered keys. Index-only and unchanged batches
+do not write S3. Idle accounts with no pending materialization do not generate
+background version reads. Foreground reads check the account version at most once
+per second; writes force a version check.
+
+Blob identity/encoding descriptors and MIME metadata are stored beside the mail
+bytes. The blob ID lookup map is reconstructed from S3 object names, not persisted
+as an account index. Attachment parent lookups derive from the directory layout;
+new `.origin.json` and legacy `.part` indexes are not written. Legacy part locators
+are memory-only. Submission scheduling discovers account prefixes using delimiter
+listing on S3 and reconstructs its in-memory worklist after restart, without
+`.jmap-queue` markers. Old blobs and old metadata remain readable.
+
+### Adapter read microbenchmark
+
+Command, Apple M4 / darwin arm64, two 100 ms samples per case:
+
+```sh
+go test -run '^$' -bench BenchmarkJMAPMetadataGet -benchmem -benchtime=100ms -count=2
+```
+
+Each account contains the stated number of small Thread records. Both adapters
+use the same in-memory object store, so this isolates JSON/metadata adapter work:
+there is **no S3 network latency**. Setup, migration, cold recovery and periodic
+version checks are outside these short warm-read measurements. These figures are
+not SMTP throughput or production latency estimates.
+
+| Records | Old whole-image Get, ns/op (two runs) | Owner-cache Get, ns/op (two runs) | Old B/op, approximately | Owner B/op | Old allocations/op | Owner allocations/op |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 56,580 / 56,846 | 65.56 / 67.06 | 37,480 | 112 | 320 | 2 |
+| 1,000 | 595,880 / 593,091 | 66.08 / 64.97 | 473,450 | 128 | 3,032–3,033 | 2 |
+| 10,000 | 5,961,842 / 5,913,375 | 67.71 / 66.99 | 4,351,200 | 128 | 30,091 | 2 |
+
+The measured result is removal of per-Get whole-account parsing/allocation.
+Regression tests separately count storage operations: 100 warm MultiGet/Scan
+pairs perform no S3 reads or lists, an index-only batch performs no S3 writes,
+and a small owner update does not list unrelated records. Fault injection checks
+that a rejected account commit cannot reveal its prepared mail or user changes.
+Four independent node caches concurrently commit 80 counter/mail-record updates;
+a cold reader must observe both final values together. Cold-recovery tests compare
+property/reference index keys with the library's live writes and verify account
+and submission worklist reconstruction.
+
+### Remaining costs and compatibility
+
+Cold starts and externally changed account versions still list/read owner records
+and rebuild indexes. Same-account writes remain serialized; this change does not
+remove account-lease contention. Ordered-key membership changes merge in memory,
+so they still have a cost proportional to the key count. All accessed account and
+blob indexes remain resident; there is no eviction policy. Prepared transaction
+objects, deletion tombstones and unreferenced blobs are retained without automatic
+cleanup, so long-running S3 listing/recovery cost can grow. The current account
+file is proportional to folder/user state and the latest changed-record batch,
+rather than all stored emails and derived query indexes.
+
+Stop every old-version node before upgrading. The previous writer cannot read the
+new format; old-format account snapshots migrate on access. This change preserves
+single-file runtime/tests and introduces no database, local index or spool.
+
+Final verification: `make test`, `make build` and `git diff --check` passed.
+The full suite includes race tests, native S3, SMTP/IMAP/POP3/JMAP, queued
+submission recovery after restart, deployment/installer tests, and the 32 MiB
+streaming content/compression/RSS checks. Local logs are
+`/tmp/fma-owner-complete-tests.log`, `/tmp/fma-owner-build.log` and
+`/tmp/fma-owner-benchmark.log`. The four-node ownership regressions also passed
+three consecutive race-enabled runs.

@@ -372,12 +372,12 @@ func run() error {
 		closers = append(closers, l)
 	}
 	var wg sync.WaitGroup
-	errors := make(chan error, 9)
+	serveErrors := make(chan error, 10)
 	serveGroup := func(jobs ...func() error) {
 		defer wg.Done()
 		wg.Add(len(jobs))
 		for _, job := range jobs {
-			go func() { defer wg.Done(); errors <- job() }()
+			go func() { defer wg.Done(); serveErrors <- job() }()
 		}
 	}
 	var jobs []func() error
@@ -402,19 +402,21 @@ func run() error {
 	pop, pops := newPOPServer(cfg), newPOPServer(cfg)
 	closers = append(closers, im, web, pop, pops)
 	wg.Add(2)
-	jobs = append(jobs, func() error { return serveQueue(ctx) })
+	jobs = append(jobs, func() error { return serveQueue(ctx) }, func() error { return serveJMAPOwnerFlush(ctx) })
 	go serveGroup(jobs...)
 	go serveGroup(func() error { return pops.Serve(listeners[3]) }, func() error { return im.Serve(listeners[4]) }, func() error { return web.Serve(listeners[5]) }, func() error { return pop.Serve(listeners[6]) }, func() error { return im.Serve(listeners[7]) })
 	logger.Info("SMTP, submission, POP3/STLS, POP3S, IMAP/STARTTLS, IMAPS and HTTP backends ready")
 	select {
 	case <-ctx.Done():
 		err = nil
-	case err = <-errors:
+	case err = <-serveErrors:
 	}
 	cancel()
 	shutdown()
 	wg.Wait()
-	return err
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer flushCancel()
+	return errors.Join(err, flushJMAPOwners(flushCtx))
 }
 
 // Mounted TLS Secrets are read-only input; mail state remains exclusively in S3.
@@ -2649,17 +2651,801 @@ func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient s
 	return nil
 }
 
+// Owner records are authoritative; the account file holds only user data and
+// the current conditional-write decision. Query indexes exist only in memory.
+type jmapOwnerFile struct {
+	Format      int                `json:"format"`
+	User        map[string][]byte  `json:"user"`
+	Transaction string             `json:"transaction,omitempty"`
+	Pending     []jmapOwnerPending `json:"pending,omitempty"`
+}
+type jmapOwnerPending struct {
+	Key      string `json:"key"`
+	Prepared string `json:"prepared"`
+	Previous string `json:"previous,omitempty"`
+}
+type jmapOwnerRecord struct {
+	Format      int             `json:"format"`
+	Key         string          `json:"key"`
+	Transaction string          `json:"transaction"`
+	Record      json.RawMessage `json:"record,omitempty"`
+	Value       []byte          `json:"value,omitempty"`
+	Deleted     bool            `json:"deleted,omitempty"`
+}
+
+func (r jmapOwnerRecord) bytes() []byte {
+	if r.Record != nil {
+		return bytes.Clone(r.Record)
+	}
+	if r.Value == nil {
+		return []byte{}
+	}
+	return bytes.Clone(r.Value)
+}
+
+type jmapOwnerState struct {
+	mu        sync.Mutex
+	key       string
+	store     objectStore
+	loaded    bool
+	data      map[string][]byte
+	locations map[string]string
+	ordered   []string
+	head      jmapOwnerFile
+	etag      string
+	finalized string
+	checked   time.Time
+	rebuild   func(map[string][]byte) error
+}
+
+type jmapOwnerCacheKey struct {
+	store objectStore
+	key   string
+}
+
+var jmapOwnerStates = struct {
+	sync.Mutex
+	states map[jmapOwnerCacheKey]*jmapOwnerState
+}{states: map[jmapOwnerCacheKey]*jmapOwnerState{}}
+
+type jmapBackend struct {
+	key    string
+	store  objectStore
+	mu     sync.Mutex
+	closed bool
+	state  *jmapOwnerState
+}
+
+func (b *jmapBackend) owner() (*jmapOwnerState, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil, fs.ErrClosed
+	}
+	if b.state == nil {
+		k := jmapOwnerCacheKey{b.store, b.key}
+		jmapOwnerStates.Lock()
+		b.state = jmapOwnerStates.states[k]
+		if b.state == nil {
+			b.state = &jmapOwnerState{key: b.key, store: b.store}
+			jmapOwnerStates.states[k] = b.state
+		}
+		jmapOwnerStates.Unlock()
+	}
+	return b.state, nil
+}
+func jmapKeySegments(k []byte) []string {
+	var out []string
+	var part []byte
+	for i := 0; i < len(k); i++ {
+		if k[i] != 0 {
+			part = append(part, k[i])
+			continue
+		}
+		i++
+		if i == len(k) {
+			return nil
+		}
+		switch k[i] {
+		case 255:
+			part = append(part, 0)
+		case 1:
+			out = append(out, string(part))
+			part = nil
+		default:
+			return nil
+		}
+	}
+	if len(part) != 0 {
+		return nil
+	}
+	return out
+}
+
+// Encode the upstream backend's ordered, escaped key segments.
+func jmapIndexKey(parts ...string) []byte {
+	var key []byte
+	for _, part := range parts {
+		for i := 0; i < len(part); i++ {
+			key = append(key, part[i])
+			if part[i] == 0 {
+				key = append(key, 255)
+			}
+		}
+		key = append(key, 0, 1)
+	}
+	return key
+}
+
+// Rebuild derived rows using registered descriptors and the library's public
+// sort codec, keeping ordering identical to live objectdb writes.
+func jmapObjectIndexes(t *jdescriptor.Type, account, id jmap.Id, raw []byte) (*jbackend.Batch, error) {
+	if t == nil {
+		return nil, fmt.Errorf("unknown stored object type")
+	}
+	var obj jdb.Object
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, err
+	}
+	batch := &jbackend.Batch{}
+	for name, prop := range t.Properties {
+		value, exists := obj[name]
+		if !exists {
+			continue
+		}
+		if prop.Indexed {
+			v, err := jdb.SortKey(prop, value)
+			if err != nil {
+				return nil, err
+			}
+			parts := []string{string(account), "x", t.Name, name, string(v)}
+			for _, sibling := range prop.OrderBy {
+				var order []byte
+				if r, ok := obj[sibling]; ok {
+					order, err = jdb.SortKey(t.Properties[sibling], r)
+					if err != nil {
+						return nil, err
+					}
+				}
+				parts = append(parts, string(order))
+			}
+			batch.Set(jmapIndexKey(append(parts, string(id))...), nil)
+		}
+		if prop.SetIndexed {
+			var members []string
+			switch prop.Kind {
+			case jdescriptor.KindObject:
+				var set map[string]json.RawMessage
+				if err := json.Unmarshal(value, &set); err != nil {
+					return nil, err
+				}
+				for member := range set {
+					members = append(members, member)
+				}
+			case jdescriptor.KindArray:
+				if err := json.Unmarshal(value, &members); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, fmt.Errorf("invalid set index kind")
+			}
+			for _, member := range members {
+				batch.Set(jmapIndexKey(string(account), "x", t.Name, name, member, string(id)), nil)
+			}
+		}
+		if prop.BlobRef && string(value) != "null" {
+			var blob string
+			if err := json.Unmarshal(value, &blob); err != nil {
+				return nil, err
+			}
+			batch.Set(jmapIndexKey(string(account), "r", blob, t.Name, string(id)), nil)
+		}
+	}
+	return batch, nil
+}
+
+func jmapTransientKey(k []byte) bool {
+	parts := jmapKeySegments(k)
+	if len(parts) > 0 && parts[0] == "!tag" {
+		return true
+	}
+	return len(parts) > 1 && (parts[1] == "x" || parts[1] == "r" || parts[1] == "p")
+}
+func jmapOwnedKey(k []byte) bool {
+	p := jmapKeySegments(k)
+	return len(p) > 1 && (p[1] == "g" || p[1] == "u" || (p[1] == "o" && len(p) > 2 && (p[2] == "Email" || p[2] == "Thread" || p[2] == "EmailSubmission")))
+}
+func (s *jmapOwnerState) root() string { return strings.TrimSuffix(s.key, "/.jmap/state.json") }
+func (s *jmapOwnerState) recordPath(k string, v []byte, delta map[string]*[]byte) (string, error) {
+	if existing := s.locations[k]; existing != "" {
+		return existing, nil
+	}
+	raw, err := hex.DecodeString(k)
+	if err != nil {
+		return "", err
+	}
+	parts := jmapKeySegments(raw)
+	if len(parts) < 2 {
+		return "", fmt.Errorf("invalid owned record key")
+	}
+	root := s.root()
+	parentForBlob := func(id jmap.Id) (string, error) {
+		key, e := (jmapBlobs{store: s.store}).key(jmapAccountID(root), id)
+		if e != nil {
+			return "", e
+		}
+		if jmapBlobDescriptorID(key) != "" {
+			return path.Dir(key), nil
+		}
+		data, e := s.store.Get(key)
+		if e != nil {
+			return "", e
+		}
+		ref, e := decodeObjectReference(key, data)
+		if e != nil {
+			return root + "/mail/legacy-" + string(id), nil
+		}
+		return path.Dir(ref.Key), nil
+	}
+	if parts[1] == "o" && len(parts) == 4 && parts[2] == "Email" {
+		var obj jdb.Object
+		if err = json.Unmarshal(v, &obj); err != nil {
+			return "", err
+		}
+		parent, e := parentForBlob(jvalue[jmap.Id](obj, "blobId"))
+		if e != nil {
+			return "", e
+		}
+		return parent + "/.fma/email-" + parts[3] + ".fma.json", nil
+	}
+	if parts[1] == "u" && len(parts) == 3 {
+		parent, e := parentForBlob(jmap.Id(parts[2]))
+		if errors.Is(e, fs.ErrNotExist) {
+			// The library records an upload before publishing/copying its bytes.
+			parent, e = root+"/mail/.uploads/"+parts[2], nil
+		}
+		if e != nil {
+			return "", e
+		}
+		return parent + "/.fma/upload-" + parts[2] + ".fma.json", nil
+	}
+	if parts[1] == "g" {
+		// A single-email change belongs beside that email. Mixed/account changes
+		// remain account history, not a lookup index.
+		var emailKey string
+		var emailValue []byte
+		count := 0
+		for key, value := range delta {
+			decoded, _ := hex.DecodeString(key)
+			p := jmapKeySegments(decoded)
+			if len(p) == 4 && p[1] == "o" && p[2] == "Email" {
+				count++
+				emailKey = key
+				if value != nil {
+					emailValue = *value
+				} else {
+					emailValue = s.data[key]
+				}
+			}
+		}
+		if count == 1 {
+			owner, e := s.recordPath(emailKey, emailValue, nil)
+			if e != nil {
+				return "", e
+			}
+			return path.Dir(owner) + "/change-" + k + ".fma.json", nil
+		}
+		return root + "/mail/.history/" + k + ".fma.json", nil
+	}
+	if len(parts) == 4 && parts[1] == "o" {
+		return root + "/mail/.records/" + parts[2] + "/" + parts[3] + ".fma.json", nil
+	}
+	return "", fmt.Errorf("unhandled owned metadata key")
+}
+func (s *jmapOwnerState) applyRecord(data []byte, location string) error {
+	var r jmapOwnerRecord
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	raw, err := hex.DecodeString(r.Key)
+	if err != nil || r.Format != 1 || !jmapOwnedKey(raw) {
+		return fmt.Errorf("invalid owner record: %s", location)
+	}
+	s.locations[r.Key] = location
+	if r.Deleted {
+		delete(s.data, r.Key)
+	} else {
+		s.data[r.Key] = r.bytes()
+	}
+	return nil
+}
+func (s *jmapOwnerState) refresh(ctx context.Context, force bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.loaded && !force && time.Since(s.checked) < time.Second {
+		return nil
+	}
+	raw, etag, err := s.store.(versionedStore).GetVersion(s.key)
+	if errors.Is(err, fs.ErrNotExist) {
+		raw = nil
+		etag = ""
+	} else if err != nil {
+		return err
+	}
+	if s.loaded && etag == s.etag {
+		s.checked = time.Now()
+		return nil
+	}
+	var head jmapOwnerFile
+	if raw != nil {
+		if err = json.Unmarshal(raw, &head); err != nil {
+			return err
+		}
+	}
+	if head.Format != 1 {
+		// Legacy bootstrap and upgrade: read the old image once. Migration below
+		// writes owner records before replacing the account file conditionally.
+		state := map[string][]byte{}
+		if raw != nil {
+			if err = json.Unmarshal(raw, &state); err != nil {
+				return err
+			}
+		}
+		s.data = state
+		s.ordered = nil
+		s.locations = map[string]string{}
+		s.etag = etag
+		s.head = jmapOwnerFile{Format: 1, User: map[string][]byte{}}
+		s.loaded = true
+		delta := map[string]*[]byte{}
+		for k, v := range state {
+			key, _ := hex.DecodeString(k)
+			if jmapTransientKey(key) {
+				continue
+			}
+			copy := bytes.Clone(v)
+			delta[k] = &copy
+		}
+		if err = s.persist(ctx, delta); err != nil {
+			s.loaded = false
+			return err
+		}
+		s.checked = time.Now()
+		return nil
+	}
+	state := map[string][]byte{}
+	for k, v := range head.User {
+		key, e := hex.DecodeString(k)
+		if e != nil || jmapTransientKey(key) || jmapOwnedKey(key) {
+			return fmt.Errorf("invalid account user record")
+		}
+		state[k] = bytes.Clone(v)
+	}
+	oldData, oldLocations := s.data, s.locations
+	s.data = state
+	s.ordered = nil
+	s.locations = map[string]string{}
+	success := false
+	defer func() {
+		if !success {
+			s.data = oldData
+			s.locations = oldLocations
+		}
+	}()
+	keys, err := s.store.List(s.root() + "/")
+	if err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if id := jmapBlobDescriptorID(key); id != "" {
+			(jmapBlobs{store: s.store}).remember(s.root(), jmap.Id(id), key)
+		}
+		if !strings.HasSuffix(key, ".fma.json") {
+			continue
+		}
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		data, e := s.store.Get(key)
+		if e != nil {
+			return e
+		}
+		if e = s.applyRecord(data, key); e != nil {
+			return e
+		}
+	}
+	for _, pending := range head.Pending {
+		if !strings.HasPrefix(pending.Key, s.root()+"/") || pending.Prepared != pending.Key+".prepare."+head.Transaction {
+			return fmt.Errorf("invalid metadata commit owner")
+		}
+		data, e := s.store.Get(pending.Prepared)
+		if e != nil {
+			return e
+		}
+		if e = s.applyRecord(data, pending.Key); e != nil {
+			return e
+		}
+	}
+	// Do not combine records from different commits while rebuilding.
+	_, current, e := s.store.(versionedStore).GetVersion(s.key)
+	if e != nil {
+		return e
+	}
+	if current != etag {
+		return jbackend.ErrAssertFailed
+	}
+	if s.rebuild != nil {
+		if err = s.rebuild(s.data); err != nil {
+			return err
+		}
+	}
+	s.head = head
+	s.etag = etag
+	s.loaded = true
+	s.checked = time.Now()
+	success = true
+	return nil
+}
+func (s *jmapOwnerState) flush(ctx context.Context) error {
+	if s.finalized == s.head.Transaction {
+		return nil
+	}
+	for _, p := range s.head.Pending {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		data, err := s.store.Get(p.Prepared)
+		if err != nil {
+			return err
+		}
+		old, etag, err := s.store.(versionedStore).GetVersion(p.Key)
+		if err == nil {
+			var record jmapOwnerRecord
+			if json.Unmarshal(old, &record) == nil && record.Transaction == s.head.Transaction {
+				continue
+			}
+			if etag != p.Previous {
+				return fmt.Errorf("owner record changed before flush: %s: %w", p.Key, fs.ErrExist)
+			}
+			err = s.store.(versionedStore).Swap(p.Key, data, etag)
+		} else if errors.Is(err, fs.ErrNotExist) && p.Previous == "" {
+			err = s.store.Create(p.Key, data)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	s.finalized = s.head.Transaction
+	return nil
+}
+func (s *jmapOwnerState) persist(ctx context.Context, delta map[string]*[]byte) error {
+	durable := false
+	for key, value := range delta {
+		raw, err := hex.DecodeString(key)
+		if err != nil {
+			return err
+		}
+		old, exists := s.data[key]
+		if !jmapTransientKey(raw) && ((value == nil && exists) || (value != nil && (!exists || !bytes.Equal(old, *value)))) {
+			durable = true
+		}
+	}
+	if !durable && s.etag != "" && s.head.Transaction != "" {
+		for key, value := range delta {
+			_, exists := s.data[key]
+			if exists != (value != nil) {
+				s.ordered = nil
+			}
+			if value == nil {
+				delete(s.data, key)
+			} else {
+				s.data[key] = bytes.Clone(*value)
+			}
+		}
+		return nil
+	}
+	if err := s.flush(ctx); err != nil {
+		return err
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	tx := hex.EncodeToString(nonce[:])
+	next := jmapOwnerFile{Format: 1, User: maps.Clone(s.head.User), Transaction: tx}
+	if next.User == nil {
+		next.User = map[string][]byte{}
+	}
+	locations := map[string]string{}
+	for k, value := range delta {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		key, e := hex.DecodeString(k)
+		if e != nil {
+			return e
+		}
+		if jmapTransientKey(key) {
+			continue
+		}
+		if s.head.Transaction != "" {
+			old, exists := s.data[k]
+			if (value == nil && !exists) || (value != nil && exists && bytes.Equal(old, *value)) {
+				continue
+			}
+		}
+		if !jmapOwnedKey(key) {
+			if value == nil {
+				delete(next.User, k)
+			} else {
+				next.User[k] = bytes.Clone(*value)
+			}
+			continue
+		}
+		v := s.data[k]
+		if value != nil {
+			v = *value
+		}
+		location, e := s.recordPath(k, v, delta)
+		if e != nil {
+			return e
+		}
+		record := jmapOwnerRecord{Format: 1, Key: k, Transaction: tx, Deleted: value == nil}
+		if value != nil {
+			if json.Valid(*value) {
+				record.Record = bytes.Clone(*value)
+			} else {
+				record.Value = bytes.Clone(*value)
+			}
+		}
+		data, e := json.Marshal(record)
+		if e != nil {
+			return e
+		}
+		prepared := location + ".prepare." + tx
+		_, previous, e := s.store.(versionedStore).GetVersion(location)
+		if e != nil && !errors.Is(e, fs.ErrNotExist) {
+			return e
+		}
+		if e = s.store.Create(prepared, data); e != nil {
+			return e
+		}
+		next.Pending = append(next.Pending, jmapOwnerPending{Key: location, Prepared: prepared, Previous: previous})
+		locations[k] = location
+	}
+	data, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	if s.etag == "" {
+		err = s.store.Create(s.key, data)
+	} else {
+		err = s.store.(versionedStore).Swap(s.key, data, s.etag)
+	}
+	if err != nil {
+		return err
+	}
+	// Reading back is only for the ETag; a concurrent commit is detected on the
+	// next refresh rather than assigning its version to our local snapshot.
+	latest, etag, e := s.store.(versionedStore).GetVersion(s.key)
+	if e != nil || !bytes.Equal(latest, data) {
+		s.loaded = false
+	} else {
+		s.etag = etag
+	}
+	s.head = next
+	s.finalized = ""
+	s.checked = time.Now()
+	var added []string
+	removed := false
+	for k, v := range delta {
+		if _, exists := s.data[k]; !exists && v != nil {
+			added = append(added, k)
+		}
+		if v == nil {
+			if _, exists := s.data[k]; exists {
+				removed = true
+			}
+			delete(s.data, k)
+		} else {
+			s.data[k] = bytes.Clone(*v)
+		}
+	}
+	if s.ordered != nil && (len(added) > 0 || removed) {
+		sort.Strings(added)
+		merged := make([]string, 0, len(s.ordered)+len(added))
+		i := 0
+		for _, key := range s.ordered {
+			if _, exists := s.data[key]; !exists {
+				continue
+			}
+			for i < len(added) && added[i] < key {
+				merged = append(merged, added[i])
+				i++
+			}
+			merged = append(merged, key)
+		}
+		s.ordered = append(merged, added[i:]...)
+	}
+	for k, v := range locations {
+		s.locations[k] = v
+	}
+	return nil
+}
+func (b *jmapBackend) Get(ctx context.Context, key []byte) ([]byte, error) {
+	s, err := b.owner()
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err = s.refresh(ctx, false); err != nil {
+		return nil, err
+	}
+	value, ok := s.data[hex.EncodeToString(key)]
+	if !ok {
+		return nil, jbackend.ErrNotFound
+	}
+	return bytes.Clone(value), nil
+}
+func (b *jmapBackend) MultiGet(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	s, err := b.owner()
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err = s.refresh(ctx, false); err != nil {
+		return nil, err
+	}
+	out := make([][]byte, len(keys))
+	for i, k := range keys {
+		if v, ok := s.data[hex.EncodeToString(k)]; ok {
+			out[i] = append([]byte{}, v...)
+		}
+	}
+	return out, nil
+}
+func (b *jmapBackend) Scan(ctx context.Context, start, end []byte, reverse bool, visit func([]byte, []byte) bool) error {
+	s, err := b.owner()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if err = s.refresh(ctx, false); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	type item struct{ k, v []byte }
+	var values []item
+	if s.ordered == nil {
+		s.ordered = slices.Sorted(maps.Keys(s.data))
+	}
+	low, _ := slices.BinarySearch(s.ordered, hex.EncodeToString(start))
+	high := len(s.ordered)
+	if end != nil {
+		high, _ = slices.BinarySearch(s.ordered, hex.EncodeToString(end))
+	}
+	if high < low {
+		high = low
+	}
+	for _, encoded := range s.ordered[low:high] {
+		key, e := hex.DecodeString(encoded)
+		if e != nil {
+			s.mu.Unlock()
+			return e
+		}
+		values = append(values, item{key, bytes.Clone(s.data[encoded])})
+	}
+	s.mu.Unlock()
+	if reverse {
+		slices.Reverse(values)
+	}
+	for _, v := range values {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if !visit(v.k, v.v) {
+			break
+		}
+	}
+	return nil
+}
+func (b *jmapBackend) WriteBatch(ctx context.Context, batch *jbackend.Batch) error {
+	s, err := b.owner()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err = s.refresh(ctx, true); err != nil {
+		return err
+	}
+	for _, op := range batch.Ops {
+		if op.Kind != jbackend.OpAssert {
+			continue
+		}
+		v, ok := s.data[hex.EncodeToString(op.Key)]
+		if (op.Value == nil && ok) || (op.Value != nil && (!ok || !bytes.Equal(v, op.Value))) {
+			return jbackend.ErrAssertFailed
+		}
+	}
+	delta := map[string]*[]byte{}
+	for _, op := range batch.Ops {
+		k := hex.EncodeToString(op.Key)
+		switch op.Kind {
+		case jbackend.OpSet:
+			v := bytes.Clone(op.Value)
+			if bytes.Contains(op.Key, []byte("\x00\x01o\x00\x01Email\x00\x01")) {
+				var email jdb.Object
+				if json.Unmarshal(v, &email) == nil {
+					uids := jvalue[map[jmap.Id]uint32](email, "fmaUIDs")
+					boxes := jvalue[map[jmap.Id]bool](email, "mailboxIds")
+					changed := false
+					for box := range uids {
+						if !boxes[box] {
+							delete(uids, box)
+							changed = true
+						}
+					}
+					if changed {
+						email["fmaUIDs"] = jraw(uids)
+						v = jraw(email)
+					}
+				}
+			}
+			delta[k] = &v
+		case jbackend.OpDelete:
+			delta[k] = nil
+		case jbackend.OpAdd:
+			old := s.data[k]
+			if v, ok := delta[k]; ok {
+				old = nil
+				if v != nil {
+					old = *v
+				}
+			}
+			var n int64
+			if old != nil {
+				n, err = jbackend.DecodeInt64(old)
+				if err != nil {
+					return err
+				}
+			}
+			v := jbackend.EncodeInt64(n + op.Delta)
+			delta[k] = &v
+		case jbackend.OpAssert:
+		default:
+			return fmt.Errorf("invalid JMAP batch operation")
+		}
+	}
+	if len(delta) == 0 {
+		return nil
+	}
+	err = s.persist(ctx, delta)
+	if errors.Is(err, fs.ErrExist) {
+		s.loaded = false
+		return jbackend.ErrAssertFailed
+	}
+	if err == nil {
+		notifyIMAP()
+	}
+	return err
+}
+func (b *jmapBackend) Close() error { b.mu.Lock(); b.closed = true; b.mu.Unlock(); return nil }
+
 // JMAP's ordered key/value records for one account commit in one conditional
 // S3 write. Binary MIME blobs live separately, so transactions copy metadata only.
 // There is no local database and no process-owned lease or background maintainer.
-type jmapBackend struct {
+type jmapLegacyBackend struct {
 	key    string
 	store  objectStore
 	mu     sync.RWMutex
 	closed bool
 }
 
-func (b *jmapBackend) snapshot(ctx context.Context) (map[string][]byte, string, error) {
+func (b *jmapLegacyBackend) snapshot(ctx context.Context) (map[string][]byte, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
@@ -2679,7 +3465,7 @@ func (b *jmapBackend) snapshot(ctx context.Context) (map[string][]byte, string, 
 	}
 	return state, etag, nil
 }
-func (b *jmapBackend) Get(ctx context.Context, key []byte) ([]byte, error) {
+func (b *jmapLegacyBackend) Get(ctx context.Context, key []byte) ([]byte, error) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.closed {
@@ -2695,7 +3481,7 @@ func (b *jmapBackend) Get(ctx context.Context, key []byte) ([]byte, error) {
 	}
 	return value, nil
 }
-func (b *jmapBackend) Scan(ctx context.Context, start, end []byte, reverse bool, visit func([]byte, []byte) bool) error {
+func (b *jmapLegacyBackend) Scan(ctx context.Context, start, end []byte, reverse bool, visit func([]byte, []byte) bool) error {
 	b.mu.RLock()
 	if b.closed {
 		b.mu.RUnlock()
@@ -2730,21 +3516,11 @@ func (b *jmapBackend) Scan(ctx context.Context, start, end []byte, reverse bool,
 	}
 	return nil
 }
-func (b *jmapBackend) WriteBatch(ctx context.Context, batch *jbackend.Batch) error {
+func (b *jmapLegacyBackend) WriteBatch(ctx context.Context, batch *jbackend.Batch) error {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.closed {
 		return fs.ErrClosed
-	}
-	for _, op := range batch.Ops {
-		if op.Kind == jbackend.OpSet && bytes.Contains(op.Key, []byte("EmailSubmission\x00\x01")) {
-			root := strings.SplitN(b.key, "/", 2)[0]
-			err := b.store.Create(".jmap-queue/"+string(jmapAccountID(root)), []byte(root))
-			if err != nil && !errors.Is(err, fs.ErrExist) {
-				return err
-			}
-			break
-		}
 	}
 	for attempt := 0; attempt < 128; attempt++ {
 		state, etag, err := b.snapshot(ctx)
@@ -2823,7 +3599,12 @@ func (b *jmapBackend) WriteBatch(ctx context.Context, batch *jbackend.Batch) err
 	}
 	return fmt.Errorf("JMAP metadata contention: %s", b.key)
 }
-func (b *jmapBackend) Close() error { b.mu.Lock(); defer b.mu.Unlock(); b.closed = true; return nil }
+func (b *jmapLegacyBackend) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	return nil
+}
 
 type jmapBlobs struct{ store objectStore }
 
@@ -2841,6 +3622,51 @@ func jmapRoot(acct jmap.Id) (string, error) {
 	}
 	return root, nil
 }
+
+// Blob identity/encoding descriptors live beside their bytes. The reverse
+// lookup from content ID to descriptor is rebuilt from S3 names, never saved.
+type jmapBlobDirectory struct {
+	mu      sync.Mutex
+	paths   map[string]string
+	parts   map[jmap.Id]jmapPartManifest
+	checked time.Time
+}
+
+var jmapBlobDirectories sync.Map
+
+func jmapBaseStore(store objectStore) objectStore {
+	if staged, ok := store.(*jmapBootstrapStore); ok {
+		return staged.objectStore
+	}
+	return store
+}
+func (s jmapBlobs) directory(root string) *jmapBlobDirectory {
+	key := jmapOwnerCacheKey{jmapBaseStore(s.store), root}
+	value, _ := jmapBlobDirectories.LoadOrStore(key, &jmapBlobDirectory{paths: map[string]string{}, parts: map[jmap.Id]jmapPartManifest{}})
+	return value.(*jmapBlobDirectory)
+}
+func (s jmapBlobs) remember(root string, id jmap.Id, key string) {
+	d := s.directory(root)
+	d.mu.Lock()
+	d.paths[string(id)] = key
+	d.mu.Unlock()
+}
+func jmapBlobDescriptorID(key string) string {
+	name := path.Base(key)
+	at := strings.LastIndex(name, ".blob-")
+	if at < 0 {
+		return ""
+	}
+	id := name[at+len(".blob-"):]
+	if !strings.HasSuffix(id, ".json") {
+		return ""
+	}
+	id = strings.TrimSuffix(id, ".json")
+	if !jmapBlobIDRE.MatchString(id) {
+		return ""
+	}
+	return id
+}
 func (s jmapBlobs) key(acct, id jmap.Id) (string, error) {
 	root, err := jmapRoot(acct)
 	if err != nil {
@@ -2849,7 +3675,31 @@ func (s jmapBlobs) key(acct, id jmap.Id) (string, error) {
 	if !jmapBlobIDRE.MatchString(string(id)) {
 		return "", jblob.ErrNotFound
 	}
-	return root + "/.jmap/blobs/" + string(id), nil
+	d := s.directory(root)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if key := d.paths[string(id)]; key != "" {
+		return key, nil
+	}
+	if d.checked.IsZero() || time.Since(d.checked) >= time.Second {
+		keys, err := s.store.List(root + "/mail/")
+		if err != nil {
+			return "", err
+		}
+		for _, key := range keys {
+			if found := jmapBlobDescriptorID(key); found != "" {
+				// Stable selection for duplicate uploads after a cold start.
+				if d.paths[found] == "" {
+					d.paths[found] = key
+				}
+			}
+		}
+		d.checked = time.Now()
+	}
+	if key := d.paths[string(id)]; key != "" {
+		return key, nil
+	}
+	return root + "/.jmap/blobs/" + string(id), nil // Read-only legacy fallback.
 }
 func (s jmapBlobs) Put(ctx context.Context, acct, id jmap.Id, data []byte) error {
 	if err := ctx.Err(); err != nil {
@@ -2876,6 +3726,15 @@ func (s jmapBlobs) Open(ctx context.Context, acct, id jmap.Id) (io.ReadCloser, i
 	key, err := s.key(acct, id)
 	if err != nil {
 		return nil, 0, err
+	}
+	root, _ := jmapRoot(acct)
+	directory := s.directory(root)
+	directory.mu.Lock()
+	part, cached := directory.parts[id]
+	directory.mu.Unlock()
+	if cached {
+		r, err := s.openPart(ctx, acct, part)
+		return r, part.Size, err
 	}
 	r, size, err := openObject(ctx, s.store, key)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -2922,7 +3781,15 @@ func (s jmapBlobs) GetMessageMetadata(ctx context.Context, acct, source jmap.Id)
 	if err != nil {
 		return nil, err
 	}
-	data, err := s.store.Get(key + ".mime.json")
+	metadataKey := key + ".mime.json"
+	if jmapBlobDescriptorID(key) == "" {
+		root, _ := jmapRoot(acct)
+		metadataKey = root + "/mail/legacy-" + string(source) + "/message.mime.json"
+	}
+	data, err := s.store.Get(metadataKey)
+	if errors.Is(err, fs.ErrNotExist) && metadataKey != key+".mime.json" {
+		data, err = s.store.Get(key + ".mime.json")
+	}
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -2946,7 +3813,12 @@ func (s jmapBlobs) PutMessageMetadata(ctx context.Context, acct, source jmap.Id,
 	if total > maxAttachmentSize {
 		return fmt.Errorf("attachments exceed 4 GiB total")
 	}
-	err = s.store.Create(key+".mime.json", data)
+	metadataKey := key + ".mime.json"
+	if jmapBlobDescriptorID(key) == "" {
+		root, _ := jmapRoot(acct)
+		metadataKey = root + "/mail/legacy-" + string(source) + "/message.mime.json"
+	}
+	err = s.store.Create(metadataKey, data)
 	if errors.Is(err, fs.ErrExist) {
 		return nil
 	}
@@ -2999,22 +3871,7 @@ func (p *jmapIngestPart) Commit(id jmap.Id, size uint64) error {
 	if _, err := p.writer.Commit(); err != nil {
 		return err
 	}
-	if p.source == "" {
-		return nil
-	} // Pipeline publishes origins after the raw ID is known.
-	key, err := p.writer.store.key(p.writer.account, id)
-	if err != nil {
-		return err
-	}
-	data, err := json.Marshal(jmapPartOrigin{Source: p.source})
-	if err != nil {
-		return err
-	}
-	err = p.writer.store.store.Create(key+".origin.json", data)
-	if errors.Is(err, fs.ErrExist) {
-		return nil
-	}
-	return err
+	return nil
 }
 func (p *jmapIngestPart) Abort() error { return p.writer.Abort() }
 
@@ -3142,6 +3999,7 @@ func (w *jmapBlobWriter) startUpload(extra []byte) error {
 	if physicalKey == "" {
 		physicalKey = namedBlobKey(root, name, prefix)
 	}
+	w.physicalKey = physicalKey
 	w.writer, err = newObjectUpload(w.ctx, w.store.store, physicalKey)
 	return err
 }
@@ -3234,20 +4092,35 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 func (w *jmapBlobWriter) ID() jmap.Id {
-	if w.externalDigest {
-		return w.partID
+	id := w.partID
+	if !w.externalDigest {
+		id = jmap.Id("G" + base64.RawURLEncoding.EncodeToString(w.digest.Sum(nil)))
 	}
-	return jmap.Id("G" + base64.RawURLEncoding.EncodeToString(w.digest.Sum(nil)))
+	if w.physicalKey == "" {
+		root, _ := jmapRoot(w.account)
+		name, ok := w.ctx.Value(blobNameContext{}).(blobName)
+		if !ok {
+			name.MIME = true
+		}
+		var prefix []byte
+		if w.probe != nil {
+			prefix = w.probe.Bytes()
+		}
+		w.physicalKey = namedBlobKey(root, name, prefix)
+	}
+
+	return id
 }
+
 func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
 	if w.finished {
 		return "", fs.ErrClosed
 	}
 	id := w.ID()
-	key, err := w.store.key(w.account, id)
-	if err != nil {
-		return "", err
+	if !jmapBlobIDRE.MatchString(string(id)) {
+		return "", jblob.ErrNotFound
 	}
+	var err error
 	if w.writeErr != nil {
 		return "", w.writeErr
 	}
@@ -3270,9 +4143,13 @@ func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
 		w.writeErr = err
 		return "", err
 	}
+	// Publish the descriptor beside its immutable bytes, not in a user index.
+	key := w.physicalKey + ".blob-" + string(id) + ".json"
 	if err = w.writer.Commit(key, w.metadata); err != nil {
 		return "", err
 	}
+	root, _ := jmapRoot(w.account)
+	w.store.remember(root, id, key)
 	w.finished = true
 	return id, nil
 }
@@ -3302,7 +4179,12 @@ type jmapAccount struct {
 }
 
 func newJMAPAccount(root string, store objectStore) (*jmapAccount, error) {
-	be := &jmapBackend{key: root + "/.jmap/state.json", store: store}
+	var be jbackend.Backend
+	if _, staged := store.(*jmapBootstrapStore); staged {
+		be = &jmapLegacyBackend{key: root + "/.jmap/state.json", store: store}
+	} else {
+		be = &jmapBackend{key: root + "/.jmap/state.json", store: store}
+	}
 	a := &jmapAccount{root: root, id: jmapAccountID(root), blobs: jmapBlobs{store: store}, proc: jruntime.NewProcessor()}
 	a.db = jdb.New(be, jlease.NewStoreLease(be, jlease.StoreLeaseConfig{}))
 	core := jmapCore()
@@ -3326,7 +4208,76 @@ func newJMAPAccount(root string, store objectStore) (*jmapAccount, error) {
 	var err error
 	limits := jmapSubmitLimits()
 	a.queue, err = jsubmit.Register(a.proc, jsubmit.Config{DB: a.db, Store: a.blobs, Core: core, Policy: a, Limits: &limits})
-	return a, err
+	if err != nil {
+		return nil, err
+	}
+	if owned, ok := be.(*jmapBackend); ok {
+		state, e := owned.owner()
+		if e != nil {
+			return nil, e
+		}
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		state.rebuild = func(data map[string][]byte) error {
+			for encoded := range data {
+				raw, e := hex.DecodeString(encoded)
+				if e != nil {
+					return e
+				}
+				if jmapTransientKey(raw) {
+					delete(data, encoded)
+				}
+			}
+			var records []struct {
+				key   string
+				value []byte
+			}
+			for key, value := range data {
+				records = append(records, struct {
+					key   string
+					value []byte
+				}{key, value})
+			}
+			for _, record := range records {
+				raw, _ := hex.DecodeString(record.key)
+				parts := jmapKeySegments(raw)
+				if len(parts) == 3 && parts[1] == "u" {
+					data[hex.EncodeToString(jmapIndexKey(string(a.id), "p", parts[2]))] = []byte{}
+				}
+				if len(parts) != 4 || parts[1] != "o" {
+					continue
+				}
+				data[hex.EncodeToString(jmapIndexKey("!tag", "exists", string(a.id)))] = []byte{}
+				// Tags and collection hints are supersets; the worker/sweeper verifies
+				// authoritative records before acting, then drops drained hints.
+				if parts[2] == "EmailSubmission" {
+					data[hex.EncodeToString(jmapIndexKey("!tag", "mail:submission-queued", string(a.id)))] = []byte{}
+				}
+				batch, e := jmapObjectIndexes(a.db.Type(parts[2]), a.id, jmap.Id(parts[3]), record.value)
+				if e != nil {
+					return e
+				}
+				for _, op := range batch.Ops {
+					key := hex.EncodeToString(op.Key)
+					switch op.Kind {
+					case jbackend.OpSet:
+						data[key] = append([]byte{}, op.Value...)
+					case jbackend.OpDelete:
+						delete(data, key)
+					}
+				}
+			}
+			return nil
+		}
+		if e = state.refresh(context.Background(), false); e != nil {
+			return nil, e
+		}
+		if e = state.rebuild(state.data); e != nil {
+			return nil, e
+		}
+		state.ordered = nil
+	}
+	return a, nil
 }
 func jmapCore() jmap.CoreCapabilities {
 	c := jruntime.DefaultCoreCapabilities()
@@ -3719,7 +4670,84 @@ func (s *jmapBootstrapStore) Swap(key string, data []byte, etag string) error {
 	s.revision++
 	return nil
 }
+
+type jmapAccountReady struct {
+	done    chan struct{}
+	account *jmapAccount
+	err     error
+}
+
+var jmapAccounts = struct {
+	sync.Mutex
+	items map[jmapOwnerCacheKey]*jmapAccountReady
+}{items: map[jmapOwnerCacheKey]*jmapAccountReady{}}
+
 func openJMAPAccount(ctx context.Context, root string) (*jmapAccount, error) {
+	if !usernameRE.MatchString(root) {
+		return nil, jauth.ErrUnauthenticated
+	}
+	key := jmapOwnerCacheKey{objects, root}
+	jmapAccounts.Lock()
+	entry := jmapAccounts.items[key]
+	if entry != nil {
+		jmapAccounts.Unlock()
+		select {
+		case <-entry.done:
+			return entry.account, entry.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	entry = &jmapAccountReady{done: make(chan struct{})}
+	jmapAccounts.items[key] = entry
+	jmapAccounts.Unlock()
+	entry.account, entry.err = openJMAPAccountUncached(ctx, root)
+	jmapAccounts.Lock()
+	if entry.err != nil {
+		delete(jmapAccounts.items, key)
+	}
+	close(entry.done)
+	jmapAccounts.Unlock()
+	return entry.account, entry.err
+}
+func flushJMAPOwners(ctx context.Context) error {
+	jmapOwnerStates.Lock()
+	var states []*jmapOwnerState
+	for key, s := range jmapOwnerStates.states {
+		if key.store == objects {
+			states = append(states, s)
+		}
+	}
+	jmapOwnerStates.Unlock()
+	var errs []error
+	for _, s := range states {
+		s.mu.Lock()
+		if s.loaded && s.finalized != s.head.Transaction {
+			if e := s.refresh(ctx, true); e != nil {
+				errs = append(errs, e)
+			} else if e = s.flush(ctx); e != nil {
+				errs = append(errs, e)
+			}
+		}
+		s.mu.Unlock()
+	}
+	return errors.Join(errs...)
+}
+func serveJMAPOwnerFlush(ctx context.Context) error {
+	timer := time.NewTicker(time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+			if err := flushJMAPOwners(ctx); err != nil {
+				logger.Error("account metadata flush failed", "error", err)
+			}
+		}
+	}
+}
+func openJMAPAccountUncached(ctx context.Context, root string) (*jmapAccount, error) {
 	if !usernameRE.MatchString(root) {
 		return nil, jauth.ErrUnauthenticated
 	}
@@ -3795,7 +4823,26 @@ func openJMAPAccount(ctx context.Context, root string) (*jmapAccount, error) {
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err = objects.Create(key, staged.data); err != nil && !errors.Is(err, fs.ErrExist) {
+	// Publish owner records directly: bootstrap's temporary indexes never
+	// leave process memory, even for the first version of the account file.
+	var data map[string][]byte
+	if err = json.Unmarshal(staged.data, &data); err != nil {
+		return nil, err
+	}
+	state := &jmapOwnerState{key: key, store: objects, data: data, locations: map[string]string{}, head: jmapOwnerFile{Format: 1, User: map[string][]byte{}}}
+	delta := map[string]*[]byte{}
+	for key, value := range data {
+		raw, e := hex.DecodeString(key)
+		if e != nil {
+			return nil, e
+		}
+		if jmapTransientKey(raw) {
+			continue
+		}
+		v := bytes.Clone(value)
+		delta[key] = &v
+	}
+	if err = state.persist(ctx, delta); err != nil && !errors.Is(err, fs.ErrExist) {
 		return nil, err
 	}
 	return newJMAPAccount(root, objects)
@@ -4060,24 +5107,71 @@ func (sender jmapSubmitter) Submit(ctx context.Context, env jsubmit.Envelope, r 
 	}
 	return results, nil
 }
+
+// Delimiter listing discovers accounts without listing every message and
+// without a persistent queue/account index. Small test stores use flat listing.
+func jmapAccountRoots(store objectStore) ([]string, error) {
+	if guard, ok := store.(*guardedStore); ok {
+		guard.mu.RLock()
+		defer guard.mu.RUnlock()
+		if guard.closed || guard.lease != nil && !guard.lease.valid(time.Now()) {
+			return nil, net.ErrClosed
+		}
+		return jmapAccountRoots(guard.base)
+	}
+	if bucket, ok := store.(*s3Bucket); ok {
+		ctx, cancel := bucket.requestContext()
+		defer cancel()
+		pages := s3.NewListObjectsV2Paginator(bucket.client, &s3.ListObjectsV2Input{Bucket: &bucket.bucket, Delimiter: aws.String("/")})
+		var roots []string
+		for pages.HasMorePages() {
+			page, err := pages.NextPage(ctx)
+			if err != nil {
+				return nil, err
+			}
+			for _, prefix := range page.CommonPrefixes {
+				root := strings.TrimSuffix(aws.ToString(prefix.Prefix), "/")
+				if usernameRE.MatchString(root) {
+					roots = append(roots, root)
+				}
+			}
+		}
+		return roots, nil
+	}
+	keys, err := store.List("")
+	if err != nil {
+		return nil, err
+	}
+	var roots []string
+	for _, key := range keys {
+		root, suffix, _ := strings.Cut(key, "/")
+		if suffix == ".jmap/state.json" && usernameRE.MatchString(root) {
+			roots = append(roots, root)
+		}
+	}
+	return roots, nil
+}
+
 func scanJMAPTasks(ctx context.Context, lease *bucketLease, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
 	}
-	keys, err := objects.List(".jmap-queue/")
+	roots, err := jmapAccountRoots(objects)
 	if err != nil {
 		return 0, err
 	}
 	count := 0
-	for _, key := range keys {
+	for _, root := range roots {
 		if ctx.Err() != nil || !lease.valid(time.Now()) || count >= limit {
 			break
 		}
-		root, err := jmapRoot(jmap.Id(path.Base(key)))
-		if err != nil {
+		// Discover committed account files, including submissions after a restart.
+		if _, err := objects.Get(root + "/.jmap/state.json"); errors.Is(err, fs.ErrNotExist) {
 			continue
+		} else if err != nil {
+			return count, err
 		}
-		a, err := newJMAPAccount(root, objects)
+		a, err := openJMAPAccount(ctx, root)
 		if err != nil {
 			return count, err
 		}
@@ -4173,7 +5267,27 @@ func (a *jmapAccount) materializePart(ctx context.Context, id jmap.Id, uploader 
 	} else if !errors.Is(err, jblob.ErrNotFound) {
 		return err
 	}
-	key, _ := a.blobs.key(a.id, id)
+	key, err := a.blobs.key(a.id, id)
+	if err != nil {
+		return err
+	}
+	if parent, _, ok := strings.Cut(key, "/attachments/"); ok {
+		directory := a.blobs.directory(a.root)
+		directory.mu.Lock()
+		var source jmap.Id
+		for candidate, location := range directory.paths {
+			if path.Dir(location) == parent {
+				source = jmap.Id(candidate)
+				break
+			}
+		}
+		directory.mu.Unlock()
+		if source != "" {
+			if found, e := a.authorizeStoredPart(ctx, source, id, uploader); e != nil || found {
+				return e
+			}
+		}
+	}
 	if data, e := a.blobs.store.Get(key + ".origin.json"); e == nil {
 		var origin jmapPartOrigin
 		if e = json.Unmarshal(data, &origin); e != nil {
@@ -4239,19 +5353,20 @@ func (w jmapPartWriter) Write([]byte) (int, error) { return 0, fmt.Errorf("immut
 func (w jmapPartWriter) ID() jmap.Id               { return w.id }
 func (w jmapPartWriter) Abort() error              { return nil }
 func (w jmapPartWriter) Commit() (jmap.Id, error) {
-	key, err := w.store.key(w.account, w.id)
+	root, err := jmapRoot(w.account)
 	if err != nil {
 		return "", err
 	}
-	data, err := json.Marshal(w.part)
-	if err != nil {
-		return "", err
+	if !jmapBlobIDRE.MatchString(string(w.id)) || w.part.Source == w.id || w.part.Size < 0 || w.part.Size > maxAttachmentSize {
+		return "", fmt.Errorf("invalid attachment locator")
 	}
-	err = w.store.store.Create(key+".part", data)
-	if errors.Is(err, fs.ErrExist) {
-		err = nil
-	}
-	return w.id, err
+	directory := w.store.directory(root)
+	directory.mu.Lock()
+	part := w.part
+	part.Path = slices.Clone(part.Path)
+	directory.parts[w.id] = part
+	directory.mu.Unlock()
+	return w.id, nil
 }
 func decodeMIME(r io.Reader, h textproto.MIMEHeader) io.Reader {
 	switch strings.ToLower(h.Get("Content-Transfer-Encoding")) {
@@ -4579,16 +5694,27 @@ func openObject(ctx context.Context, store objectStore, key string) (io.ReadClos
 	if err != nil {
 		return nil, 0, err
 	}
+	if jmapBlobDescriptorID(key) != "" {
+		ref, err := decodeObjectReference(key, data)
+		if err != nil {
+			return nil, 0, err
+		}
+		data, err = store.Get(ref.Key)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
 	return io.NopCloser(bytes.NewReader(data)), int64(len(data)), nil
 }
 func newObjectUpload(ctx context.Context, store objectStore, prefix string) (objectUpload, error) {
 	if s, ok := store.(streamingStore); ok {
 		return s.NewUpload(ctx, prefix)
 	}
-	return &bufferedObjectUpload{ctx: ctx, store: store}, nil // Small in-memory test stores only.
+	return &bufferedObjectUpload{ctx: ctx, store: store, physical: prefix}, nil // Small in-memory test stores only.
 }
 
 type bufferedObjectUpload struct {
+	physical string
 	bytes.Buffer
 	ctx   context.Context
 	store objectStore
@@ -4607,7 +5733,14 @@ func (w *bufferedObjectUpload) Commit(key string, metadata map[string]string) er
 	if len(metadata) != 0 {
 		return fmt.Errorf("test store does not support compressed object metadata")
 	}
-	err := w.store.Create(key, w.Bytes())
+	data := w.Bytes()
+	if jmapBlobDescriptorID(key) != "" {
+		if err := w.store.Create(w.physical, data); err != nil {
+			return err
+		}
+		data = jraw(namedObjectReference{Key: w.physical})
+	}
+	err := w.store.Create(key, data)
 	if errors.Is(err, fs.ErrExist) {
 		err = nil
 	}
@@ -4616,8 +5749,8 @@ func (w *bufferedObjectUpload) Commit(key string, metadata map[string]string) er
 }
 func (w *bufferedObjectUpload) Abort() error { w.Reset(); return nil }
 
-// A small JMAP index points at an immutable, named physical object. Publishing
-// the index is the commit: the large object is never renamed or copied.
+// An immutable blob descriptor records the physical bytes and their encoding.
+// New descriptors live beside those bytes; ID lookup tables exist only in memory.
 type namedObjectReference struct {
 	Key      string            `json:"key"`
 	Metadata map[string]string `json:"metadata,omitempty"`
@@ -4731,7 +5864,7 @@ func (b *s3Bucket) CopyStream(ctx context.Context, src, dst string) error {
 	}
 	if srcRoot != dstRoot {
 		// Re-delivery to the same content-addressed account index is idempotent.
-		if path.Base(src) == path.Base(dst) && jmapBlobIDRE.MatchString(path.Base(dst)) {
+		if path.Base(src) == path.Base(dst) && (jmapBlobIDRE.MatchString(path.Base(dst)) || jmapBlobDescriptorID(dst) != "") {
 			_, existing := b.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &b.bucket, Key: &dst})
 			if existing == nil {
 				return nil
@@ -5382,23 +6515,7 @@ func (s *mimePipelineStore) PutMessageMetadata(_ context.Context, _, _ jmap.Id, 
 	return nil
 }
 func (s *mimePipelineStore) publish(ctx context.Context, account, id jmap.Id) error {
-	ids, err := jmail.MessagePartIDs(s.metadata)
-	if err != nil {
-		return err
-	}
-	origin, err := json.Marshal(jmapPartOrigin{Source: id})
-	if err != nil {
-		return err
-	}
-	for _, part := range ids {
-		key, err := s.key(account, part)
-		if err != nil {
-			return err
-		}
-		if err = s.store.Create(key+".origin.json", origin); err != nil && !errors.Is(err, fs.ErrExist) {
-			return err
-		}
-	}
+
 	return s.jmapBlobs.PutMessageMetadata(ctx, account, id, s.metadata)
 }
 func storeMailStream(ctx context.Context, root string, r io.Reader) (*jmapBlobRef, error) {
@@ -5494,18 +6611,29 @@ func (w jmapExistingBlob) Commit() (jmap.Id, error) {
 	if err != nil {
 		return "", err
 	}
-	dst, err := w.store.key(w.account, id)
-	if err != nil {
-		return "", err
-	}
-	if stream, ok := w.store.store.(streamingStore); ok {
+	root, _ := jmapRoot(w.account)
+	sourceRoot, _ := jmapRoot(w.source.AccountID)
+	if stream, ok := w.store.store.(streamingStore); ok && jmapBlobDescriptorID(src) != "" {
+		dst := root + strings.TrimPrefix(src, sourceRoot)
 		err = stream.CopyStream(w.ctx, src, dst)
-	} else {
-		var data []byte
-		data, err = w.store.store.Get(src)
 		if err == nil {
-			err = w.store.Put(w.ctx, w.account, id, data)
+			w.store.remember(root, id, dst)
 		}
+	} else {
+		reader, _, e := w.store.Open(w.ctx, w.source.AccountID, id)
+		if e != nil {
+			return "", e
+		}
+		defer reader.Close()
+		writer, e := w.store.Create(w.ctx, w.account)
+		if e != nil {
+			return "", e
+		}
+		defer writer.Abort()
+		if _, e = copyStream(w.ctx, writer, reader); e != nil {
+			return "", e
+		}
+		_, err = writer.Commit()
 	}
 	return id, err
 }

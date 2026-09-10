@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -1392,6 +1393,9 @@ func TestJMAPS3BackendContract(t *testing.T) {
 		Reopen: func(t *testing.T, old jbackend.Backend) jbackend.Backend {
 			b := old.(*jmapBackend)
 			checkError(t, b.Close())
+			jmapOwnerStates.Lock()
+			delete(jmapOwnerStates.states, jmapOwnerCacheKey{b.store, b.key})
+			jmapOwnerStates.Unlock()
 			return &jmapBackend{key: b.key, store: b.store}
 		},
 	})
@@ -2499,5 +2503,361 @@ func TestStreamTaskPoolDispatchAndShutdown(t *testing.T) {
 	}
 	if _, err := pool.Submit(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, net.ErrClosed) {
 		t.Fatal("submission after shutdown", err)
+	}
+}
+
+// A fresh store identity simulates another process without sharing any caches.
+type ownerTestStore struct {
+	objectStore
+	versionedStore
+	reads, writes, lists int
+	failHead             bool
+}
+
+func (s *ownerTestStore) Get(key string) ([]byte, error) { s.reads++; return s.objectStore.Get(key) }
+func (s *ownerTestStore) GetVersion(key string) ([]byte, string, error) {
+	s.reads++
+	return s.versionedStore.GetVersion(key)
+}
+func (s *ownerTestStore) Create(key string, value []byte) error {
+	s.writes++
+	return s.objectStore.Create(key, value)
+}
+func (s *ownerTestStore) Swap(key string, value []byte, version string) error {
+	s.writes++
+	if s.failHead && strings.HasSuffix(key, "/state.json") {
+		return fs.ErrPermission
+	}
+	return s.versionedStore.Swap(key, value, version)
+}
+func (s *ownerTestStore) List(prefix string) ([]string, error) {
+	s.lists++
+	return s.objectStore.List(prefix)
+}
+func ownerTestSnapshot(t *testing.T, s *jmapOwnerState) map[string][]byte {
+	t.Helper()
+	result := map[string][]byte{}
+	for key, value := range s.data {
+		raw, err := hex.DecodeString(key)
+		checkError(t, err)
+		parts := jmapKeySegments(raw)
+		// Pending garbage-collection hints are supersets, and tags are worklists.
+		if len(parts) > 1 && (parts[1] == "x" || parts[1] == "r") {
+			result[key] = bytes.Clone(value)
+		}
+	}
+	return result
+}
+func TestJMAPOwnerColdRecoveryAndLayout(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
+	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	ctx := context.Background()
+	a, err := openJMAPAccount(ctx, "alice")
+	checkError(t, err)
+	box, err := a.mailbox(ctx, "alice")
+	checkError(t, err)
+	body := []byte("From: sender@example.com\r\nSubject: owner storage\r\nMessage-ID: <owner@example.com>\r\n\r\nhello\r\n")
+	id, err := a.importMail(ctx, box, body, nil, time.Now())
+	checkError(t, err)
+	backend := &jmapBackend{key: "alice/.jmap/state.json", store: objects}
+	state, err := backend.owner()
+	checkError(t, err)
+	expected := ownerTestSnapshot(t, state)
+	if len(expected) == 0 {
+		t.Fatal("missing live indexes")
+	}
+	raw, err := objects.Get(state.key)
+	checkError(t, err)
+	var head jmapOwnerFile
+	checkError(t, json.Unmarshal(raw, &head))
+	for key := range head.User {
+		raw, err := hex.DecodeString(key)
+		checkError(t, err)
+		if jmapTransientKey(raw) || jmapOwnedKey(raw) {
+			t.Fatal("account retained mail or indexes")
+		}
+	}
+	keys, err := objects.List("alice/")
+	checkError(t, err)
+	for _, key := range keys {
+		if key == state.key || key == "alice/.kind" || key == "alice/.password" {
+			continue
+		}
+		if !strings.HasPrefix(key, "alice/mail/") {
+			t.Fatalf("mail escaped prefix: %s", key)
+		}
+		if strings.HasSuffix(key, ".origin.json") {
+			t.Fatal("persisted attachment reverse index")
+		}
+		if strings.Contains(key, ".fma.json") {
+			data, err := objects.Get(key)
+			checkError(t, err)
+			var record jmapOwnerRecord
+			checkError(t, json.Unmarshal(data, &record))
+			raw, err := hex.DecodeString(record.Key)
+			checkError(t, err)
+			if jmapTransientKey(raw) {
+				t.Fatal("persisted query index")
+			}
+		}
+	}
+	// Do not flush first: a killed process must recover the published decision.
+	remote := &ownerTestStore{objectStore: objects, versionedStore: objects.(versionedStore)}
+	cold, err := newJMAPAccount("alice", remote)
+	checkError(t, err)
+	coldBackend := &jmapBackend{key: state.key, store: remote}
+	recovered, err := coldBackend.owner()
+	checkError(t, err)
+	accounts, err := cold.db.Accounts(ctx)
+	checkError(t, err)
+	if !slices.Contains(accounts, cold.id) {
+		t.Fatal("cold account discovery tag missing")
+	}
+	actual := ownerTestSnapshot(t, recovered)
+	if len(expected) != len(actual) {
+		t.Fatalf("index rows: live=%d cold=%d", len(expected), len(actual))
+	}
+	for key := range expected {
+		if _, ok := actual[key]; !ok {
+			t.Fatalf("lost index %x", key)
+		}
+	}
+	email, err := cold.db.Get(ctx, cold.id, "Email", id)
+	checkError(t, err)
+	reader, _, err := cold.blobs.Open(ctx, cold.id, jvalue[jmap.Id](email, "blobId"))
+	checkError(t, err)
+	got, err := io.ReadAll(reader)
+	reader.Close()
+	checkError(t, err)
+	if !bytes.Equal(got, body) {
+		t.Fatal("cold blob content differs")
+	}
+	result, err := cold.call(ctx, "Email/query", map[string]any{"filter": map[string]any{"inMailbox": box}})
+	checkError(t, err)
+	if !slices.Contains(jvalue[[]jmap.Id](result, "ids"), id) {
+		t.Fatal("cold membership query lost email")
+	}
+}
+
+func TestJMAPOwnerAtomicFailureAndIncrementalWrites(t *testing.T) {
+	base := &memoryObjects{data: map[string][]byte{}}
+	store := &ownerTestStore{objectStore: base, versionedStore: base}
+	ctx := context.Background()
+	b := &jmapBackend{key: "alice/.jmap/state.json", store: store}
+	batch := &jbackend.Batch{}
+	userKey := jmapIndexKey("Aalice", "q")
+	mailKey := jmapIndexKey("Aalice", "o", "Thread", "T1")
+	batch.Set(userKey, []byte("old"))
+	batch.Set(mailKey, []byte(`{"id":"T1"}`))
+	checkError(t, b.WriteBatch(ctx, batch))
+	state, err := b.owner()
+	checkError(t, err)
+	checkError(t, state.flush(ctx))
+	store.failHead = true
+	failed := &jbackend.Batch{}
+	failed.Set(userKey, []byte("new"))
+	failed.Set(mailKey, []byte(`{"id":"T1","updated":true}`))
+	if err := b.WriteBatch(ctx, failed); !errors.Is(err, fs.ErrPermission) {
+		t.Fatal("expected commit failure", err)
+	}
+	remote := &ownerTestStore{objectStore: base, versionedStore: base}
+	cold := &jmapBackend{key: b.key, store: remote}
+	got, err := cold.Get(ctx, userKey)
+	checkError(t, err)
+	if string(got) != "old" {
+		t.Fatal("uncommitted user data visible")
+	}
+	got, err = cold.Get(ctx, mailKey)
+	checkError(t, err)
+	if string(got) != `{"id":"T1"}` {
+		t.Fatal("uncommitted mail visible")
+	}
+	store.failHead = false
+	checkError(t, b.WriteBatch(ctx, failed))
+	// Cached reads do no S3 work, including MultiGet and bounded Scan.
+	reads, lists := store.reads, store.lists
+	for range 100 {
+		_, err = b.MultiGet(ctx, [][]byte{mailKey, userKey})
+		checkError(t, err)
+		checkError(t, b.Scan(ctx, mailKey, nil, false, func(_, _ []byte) bool { return false }))
+	}
+	if store.reads != reads || store.lists != lists {
+		t.Fatal("warm reads touched S3")
+	}
+	index := &jbackend.Batch{}
+	index.Set(jmapIndexKey("Aalice", "x", "Thread", "example", "v", "T1"), nil)
+	writes := store.writes
+	checkError(t, b.WriteBatch(ctx, index))
+	if store.writes != writes {
+		t.Fatal("index-only batch wrote to S3")
+	}
+	// A one-record update never lists or rewrites unrelated owner records.
+	lists = store.lists
+	writes = store.writes
+	failed.Set(userKey, []byte("last"))
+	checkError(t, b.WriteBatch(ctx, failed))
+	if store.lists != lists || store.writes-writes > 5 {
+		t.Fatalf("update amplified: lists=%d writes=%d", store.lists-lists, store.writes-writes)
+	}
+}
+
+func BenchmarkJMAPMetadataGet(b *testing.B) {
+	for _, size := range []int{100, 1000, 10000} {
+		for _, kind := range []string{"legacy", "owners"} {
+			b.Run(fmt.Sprintf("%s/%d", kind, size), func(b *testing.B) {
+				store := &memoryObjects{data: map[string][]byte{}}
+				var backend jbackend.Backend
+				if kind == "legacy" {
+					backend = &jmapLegacyBackend{key: "alice/.jmap/state.json", store: store}
+				} else {
+					backend = &jmapBackend{key: "alice/.jmap/state.json", store: store}
+				}
+				ctx := context.Background()
+				batch := &jbackend.Batch{}
+				var key []byte
+				for i := 0; i < size; i++ {
+					key = jmapIndexKey("Aalice", "o", "Thread", fmt.Sprintf("T%d", i))
+					batch.Set(key, []byte(`{"id":"thread","emailIds":["email"],"example":"metadata"}`))
+				}
+				if err := backend.WriteBatch(ctx, batch); err != nil {
+					b.Fatal(err)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					if _, err := backend.Get(ctx, key); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestJMAPOwnerSubmissionDiscoveryAfterRestart(t *testing.T) {
+	base := &memoryObjects{data: map[string][]byte{}}
+	ctx := context.Background()
+	be := &jmapBackend{key: "alice/.jmap/state.json", store: base}
+	batch := &jbackend.Batch{}
+	batch.Set(jmapIndexKey(string(jmapAccountID("alice")), "o", "EmailSubmission", "S1"), []byte(`{"id":"S1","undoStatus":"pending","sendAt":"2050-01-01T00:00:00Z"}`))
+	checkError(t, be.WriteBatch(ctx, batch))
+	remote := &ownerTestStore{objectStore: base, versionedStore: base}
+	a, err := newJMAPAccount("alice", remote)
+	checkError(t, err)
+	accounts, err := a.db.TaggedAccounts(ctx, "mail:submission-queued")
+	checkError(t, err)
+	if !slices.Contains(accounts, a.id) {
+		t.Fatal("cold worker cannot discover durable submission")
+	}
+	roots, err := jmapAccountRoots(remote)
+	checkError(t, err)
+	if !slices.Contains(roots, "alice") {
+		t.Fatal("account prefix discovery failed")
+	}
+	keys, err := base.List(".jmap-queue/")
+	checkError(t, err)
+	if len(keys) != 0 {
+		t.Fatal("queue discovery persisted an index")
+	}
+}
+
+type ownerNodeStore struct {
+	objectStore
+	versionedStore
+}
+
+func TestJMAPOwnerConcurrentNodes(t *testing.T) {
+	base := &memoryObjects{data: map[string][]byte{}}
+	ctx := context.Background()
+	initial := &jmapBackend{key: "alice/.jmap/state.json", store: base}
+	key := jmapIndexKey("Aalice", "q")
+	record := jmapIndexKey("Aalice", "o", "Thread", "T1")
+	batch := &jbackend.Batch{}
+	batch.Set(key, jbackend.EncodeInt64(0))
+	batch.Set(record, []byte(`{"counter":0}`))
+	checkError(t, initial.WriteBatch(ctx, batch))
+	var group sync.WaitGroup
+	failures := make(chan error, 4)
+	for range 4 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			node := &jmapBackend{key: initial.key, store: &ownerNodeStore{objectStore: base, versionedStore: base}}
+			for range 20 {
+				committed := false
+				for attempt := 0; attempt < 256; attempt++ {
+					value, err := node.Get(ctx, key)
+					if errors.Is(err, jbackend.ErrAssertFailed) {
+						continue
+					}
+					if err != nil {
+						failures <- err
+						return
+					}
+					n, err := jbackend.DecodeInt64(value)
+					if err != nil {
+						failures <- err
+						return
+					}
+					update := &jbackend.Batch{}
+					update.Assert(key, value)
+					update.Set(key, jbackend.EncodeInt64(n+1))
+					update.Set(record, fmt.Appendf(nil, `{"counter":%d}`, n+1))
+					err = node.WriteBatch(ctx, update)
+					if errors.Is(err, jbackend.ErrAssertFailed) {
+						continue
+					}
+					if err != nil {
+						failures <- err
+						return
+					}
+					committed = true
+					break
+				}
+				if !committed {
+					failures <- fmt.Errorf("concurrent commit retries exhausted")
+					return
+				}
+			}
+		}()
+	}
+	group.Wait()
+	close(failures)
+	for err := range failures {
+		checkError(t, err)
+	}
+	cold := &jmapBackend{key: initial.key, store: &ownerNodeStore{objectStore: base, versionedStore: base}}
+	values, err := cold.MultiGet(ctx, [][]byte{key, record})
+	checkError(t, err)
+	n, err := jbackend.DecodeInt64(values[0])
+	checkError(t, err)
+	if n != 80 || string(values[1]) != `{"counter":80}` {
+		t.Fatalf("lost/partial update: %d %s", n, values[1])
+	}
+}
+
+func TestJMAPLegacyPartLocatorIsMemoryOnly(t *testing.T) {
+	base := &memoryObjects{data: map[string][]byte{}}
+	blobs := jmapBlobs{store: base}
+	account := jmapAccountID("alice")
+	source := jmap.Id("G" + strings.Repeat("a", 43))
+	partID := jmap.Id("G" + strings.Repeat("b", 43))
+	checkError(t, base.Put("alice/.jmap/blobs/"+string(source), []byte("Content-Type: text/plain\r\n\r\nhello")))
+	writer := jmapPartWriter{store: blobs, account: account, id: partID, part: jmapPartManifest{Source: source, Size: 5}}
+	_, err := writer.Commit()
+	checkError(t, err)
+	keys, err := base.List("alice/")
+	checkError(t, err)
+	if len(keys) != 1 {
+		t.Fatalf("locator persisted: %v", keys)
+	}
+	reader, size, err := blobs.Open(context.Background(), account, partID)
+	checkError(t, err)
+	data, err := io.ReadAll(reader)
+	reader.Close()
+	checkError(t, err)
+	if size != 5 || string(data) != "hello" {
+		t.Fatalf("bad legacy part: %d %q", size, data)
 	}
 }

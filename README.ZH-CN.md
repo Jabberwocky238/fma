@@ -38,7 +38,7 @@ FMA_S3_BUCKET=fma FMA_S3_ACCESS_KEY_ID=your-key FMA_S3_SECRET_ACCESS_KEY=your-se
 可用性依赖 S3，以及将客户端流量导向健康节点的接入设施。节点故障后，原有连接需要重连。
 账户、邮件、文件夹、任务队列和租约全部存放在 S3。证书默认从 S3 读取，Kubernetes 部署则直接只读挂载 TLS Secret。邮件二进制不提供注册、用户管理、CSV 导入、本地数据库、磁盘缓存或临时文件管理能力。HTTP 提供 JMAP 和存活检查，DEBUG/INFO/WARN 日志输出到 stdout，ERROR/FATAL 输出到 stderr。
 
-JMAP 与其他协议共用账户元数据和 MIME 对象。一个账户的元数据用一次 S3 条件写原子提交，MIME 字节单独存储；同账户写入会串行协调，大邮箱的元数据更新成本随规模增长，不宣称未经测量的吞吐或内存数字。
+JMAP 与其他协议共用邮件记录和 MIME 对象。邮件相关数据保存在账户的 `mail/` prefix；账户文件只保存文件夹、身份、UID/状态计数、租约与当前事务的提交信息。属性、成员关系、blob 引用和排序索引仅在内存中维护，冷启动从权威记录重建。更新只写变更记录和一个条件提交文件，不再重写整个邮箱；同账户写入仍通过 S3 条件写协调。
 
 ### 支持的 RFC 与范围
 
@@ -486,14 +486,15 @@ printf '%s' account | curl -f -X PUT --data-binary @- \
 | `<alias>/.alias` | Target local ID / 目标本地 ID |
 | `<proxy>/.proxy` | Forwarding address / 转发邮箱地址 |
 | `<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body / 无正文的失败诊断 |
-| `<account>/.jmap/state.json` | Canonical mailbox metadata, indexes, state changes, UID bookkeeping, submission records and account lease / 统一邮箱元数据、索引、变更、UID、提交记录和账户租约 |
+| `<account>/.jmap/state.json` | 最小账户状态：文件夹、身份、UID/状态计数、账户租约和当前事务决定；不保存邮件记录或查询索引 |
 | `<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | 流式写入的不可变 MIME 或上传附件；超过 10 MiB 使用 gzip |
-| `<account>/.jmap/blobs/<blobId>` | 命名对象及其编码、大小的小型索引；旧对象仍直接包含 MIME/blob 字节 |
+| `<physical-object>.blob-<blobId>.json` | 与正文/附件同目录的不可变 blob 描述，记录物理对象和编码/大小；blobId 到描述文件的查找表仅在内存中 |
 | `<account>/mail/<mail-id>/attachments/<part-id>/<escaped-filename>` | 解码后的 MIME 部件，超过 1 MiB 使用 gzip |
-| `<account>/.jmap/blobs/<blobId>.mime.json` | 持久化 MIME 结构、部件哈希、大小和预览 |
-| `<account>/.jmap/blobs/<blobId>.origin.json` | 附件权限校验所需的父邮件关系 |
-| `<account>/.jmap/blobs/<blobId>.part` | 旧邮件在原始 MIME 内的读取位置索引 |
-| `.jmap-queue/<accountId>` | Durable discovery hint for submission accounts; not a delivery task or auth grant / 提交账户发现标记，不是投递任务或认证授权 |
+| `<blob-descriptor>.mime.json` | 同邮件 prefix 内的 MIME 结构、部件哈希、大小和预览 |
+| `<account>/mail/<mail-id>/.fma/*.fma.json` | 邮件记录及单邮件变更历史 |
+| `<account>/mail/.records/`, `mail/.history/`, `mail/.uploads/` | 线程/提交记录、批量变更历史、正文发布前登记的上传记录 |
+| `<owner-record>.prepare.<transaction>` | 条件提交前写入的不可变事务记录；不属于查询索引 |
+| `<account>/.jmap/blobs/*` | 旧版正文、描述、MIME 元数据和部件定位记录的兼容读取路径 |
 | `.outbox/<id>.json` | SMTP outbound task and embedded preclaim / SMTP 外发任务及内嵌 preclaim |
 | `.lock` | Shared 15-second scan/renewal lease / 共享的 15 秒扫描与续期租约 |
 | `cert.pem, key.pem` | TLS certificate and key unless mounted from a Secret / TLS 证书与私钥，Secret 挂载时不需要 |
@@ -503,8 +504,10 @@ printf '%s' account | curl -f -X PUT --data-binary @- \
 邮件物理目录 ID 使用 `subject + UTC timestamp`，时间戳精确到纳秒。
 主题先解码 RFC 2047，再与文件名分别做百分号转义；`/`、`%`、`?`、`#`、Unicode、单独的 `.` 和 `..` 不会改变路径层级，并限制各段长度。S3 条件创建保证时间戳或名称碰撞时报错，不覆盖已有内容。
 MIME 正文使用 `message.eml`；HTTP 上传可通过 `Content-Disposition` 提供附件名，未提供时使用 `attachment.bin`，无主题时使用 `untitled`。接收 MIME 时并行上传原文和解析部件，附件解码后直接流式存入独立对象，成功提交后发布 JSON 元数据。首次 JMAP 获取元数据直接读记录，首次下载直接读附件对象。保留原文供 IMAP/POP3 使用，因此增加存储用量；没有新记录的旧邮件仍走原有读取路径。
-JMAP 的 blobId 保留为库要求的内容标识，只关联小型索引，不再决定正文或附件的物理对象名。分片直接上传到命名路径，完成后只 PUT 小索引，提交时不再复制整对象。
-旧对象可继续读取。部署该存储格式前需停止旧节点，旧版本无法读取新索引。索引发布中断或重复上传相同内容后，可能留下未引用的物理对象；当前没有自动 blob 清理器。
+JMAP 的 blobId 保留为内容标识。分片直接上传到命名路径，完成后在同目录发布不可变描述文件，提交时不再复制整对象。描述文件保存读取字节所需的编码信息；反向查找表从对象名称重建，不写入 S3。附件父邮件关系由目录推导并校验 MIME 元数据，不再写 `.origin.json`；旧邮件的部件定位信息仅在内存中重建，不再写 `.part`。提交队列通过顶层 prefix 发现账户，不再创建 `.jmap-queue` 索引。
+旧对象可继续读取。首次访问会将旧版整账户 `state.json` 拆分为权威记录，再条件切换账户文件；旧索引不写入新格式。部署前必须停止旧节点，旧版本无法读取新格式。每批更新先写 prepare 对象，再以 ETag 条件写发布事务决定；下一次写入、每秒刷新或正常退出将已提交记录落实到固定路径。中途退出可依据提交决定恢复，未提交的 prepare 不可见。当前保留 prepare、删除墓碑和未引用的 blob，不自动清理。
+
+热缓存中的 Get/MultiGet 直接读取内存；Scan 使用排序键范围，纯索引批次不写 S3。读缓存最多每秒检查账户版本，写入前强制检查；跨节点版本变化和冷启动需要读取记录并重建索引，仍有与邮箱规模相关的恢复成本。所有已访问账户的索引保留在进程内存中，当前没有缓存淘汰策略。
 
 SMTP 通过 `go.mod replace` 使用固定版本的性能修复 fork（[PR #312](https://github.com/emersion/go-smtp/pull/312)）。DATA reader 的单文件补丁改编自 [uponusolutions/go-smtp](https://github.com/uponusolutions/go-smtp/blob/86ff2622fb52f86371265b74a976333ff53c10a0/internal/textsmtp/dotreader.go) 的跨行扫描，保留原有服务端 API、默认 4 KiB 协议缓冲和行长度检查；fma 在 TLS 下方增加可复用的 1 MiB TCP 输入缓冲，合并小读取。POP3 直接导入独立模块 `github.com/Jabberwocky238/go-pop3`；`main` 包含性能修复和 fork 说明，`pr` 仅向上游提交性能补丁（[PR #3](https://github.com/migadu/go-pop3/pull/3)）。
 

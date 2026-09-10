@@ -24,6 +24,7 @@ import threading
 import time
 import urllib.request
 import urllib.parse
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 BLOCK = bytes(range(256)) * 4096
@@ -322,7 +323,25 @@ def main():
             expected_id = 'G' + base64.urlsafe_b64encode(digest.digest()).decode().rstrip('=')
             assert uploaded['blobId'] == expected_id and uploaded['size'] == size, uploaded
             results['sha256'] = digest.hexdigest()
-            object_key = f'/stream-test/alice/.jmap/blobs/{uploaded["blobId"]}'
+            # Discover the descriptor beside its bytes; there is no persisted
+            # account-level blob lookup index in the new storage format.
+            listed = []
+            token = None
+            while True:
+                query = {'list-type': '2', 'prefix': 'alice/'}
+                if token:
+                    query['continuation-token'] = token
+                page = ET.fromstring(s3request('/stream-test?' + urllib.parse.urlencode(query)))
+                listed.extend(item.text for item in page.findall('.//{*}Contents/{*}Key'))
+                token = page.findtext('{*}NextContinuationToken')
+                if page.findtext('{*}IsTruncated') != 'true':
+                    break
+                assert token, 'truncated S3 listing without continuation token'
+            suffix = f'.blob-{uploaded["blobId"]}.json'
+            descriptors = [key for key in listed if key.startswith('alice/mail/') and key.endswith(suffix)]
+            assert len(descriptors) == 1, descriptors
+            assert not any(key.startswith('alice/.jmap/blobs/') for key in listed), listed
+            object_key = '/stream-test/' + urllib.parse.quote(descriptors[0], safe='/')
             reference = json.loads(s3request(object_key))
             assert reference['key'].startswith('alice/mail/'), reference
             results['object_key'] = reference['key']

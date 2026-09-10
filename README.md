@@ -46,7 +46,7 @@ come from S3 by default, or a read-only mounted TLS Secret in Kubernetes.
 The mail binary has no registration API, user management commands, CSV import,
 local database, disk cache, or temporary file management. HTTP serves JMAP and a liveness endpoint. DEBUG/INFO/WARN logs go to stdout; ERROR/FATAL go to stderr.
 
-JMAP and the other protocols share account metadata and MIME objects. One conditional S3 write commits an account metadata transaction atomically; MIME bytes are stored separately. Writes within one account are serialized, and metadata update cost grows with mailbox size. No unmeasured throughput or memory numbers are claimed.
+JMAP and the other protocols share mail records and MIME objects under each account’s `mail/` prefix. The account file retains folders, identities, UID/state counters, the lease and the current transaction decision. Property, membership, blob-reference and ordered lookup indexes live only in memory and are rebuilt from authoritative records on cold start. Updates write changed records and one conditional account commit, instead of rewriting the mailbox. Same-account writers still coordinate through S3 conditional writes.
 
 ### Supported RFCs and scope
 
@@ -720,14 +720,15 @@ type, prepare its new configuration first and replace `.kind` last.
 | `<alias>/.alias` | Target local ID |
 | `<proxy>/.proxy` | Forwarding address |
 | `<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body |
-| `<account>/.jmap/state.json` | Canonical mailbox metadata, indexes, state changes, UID bookkeeping, submission records and account lease |
+| `<account>/.jmap/state.json` | Minimal account state: folders, identities, UID/state counters, lease and current transaction decision; no mail records or query indexes |
 | `<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | Immutable streamed MIME or uploaded attachment bytes; gzip above 10 MiB |
-| `<account>/.jmap/blobs/<blobId>` | Small reference to a named object and its encoding/size; legacy objects still contain raw MIME/blob bytes |
+| `<physical-object>.blob-<blobId>.json` | Immutable blob descriptor beside its bytes, recording the physical object and encoding/size; the ID lookup table exists only in memory |
 | `<account>/mail/<mail-id>/attachments/<part-id>/<escaped-filename>` | Decoded MIME parts; gzip above 1 MiB |
-| `<account>/.jmap/blobs/<blobId>.mime.json` | Persisted MIME structure, part identities, sizes and preview |
-| `<account>/.jmap/blobs/<blobId>.origin.json` | Parent message for attachment authorization |
-| `<account>/.jmap/blobs/<blobId>.part` | Legacy locator inside an original MIME message |
-| `.jmap-queue/<accountId>` | Durable discovery hint for submission accounts; not a delivery task or auth grant |
+| `<blob-descriptor>.mime.json` | MIME structure, part identities, sizes and preview under the same mail prefix |
+| `<account>/mail/<mail-id>/.fma/*.fma.json` | Email records and single-message change history |
+| `<account>/mail/.records/`, `mail/.history/`, `mail/.uploads/` | Threads/submissions, batch change history and upload records registered before content publication |
+| `<owner-record>.prepare.<transaction>` | Immutable transaction record written before conditional publication; not a query index |
+| `<account>/.jmap/blobs/*` | Compatibility reads of legacy content, descriptors, MIME metadata and part locators |
 | `.outbox/<id>.json` | SMTP outbound task and embedded preclaim |
 | `.lock` | Shared 15-second scan/renewal lease |
 | `cert.pem, key.pem` | TLS certificate and key unless mounted from a Secret |
@@ -745,13 +746,30 @@ individual decoded parts. JSON metadata is published after successful part and M
 commits. First JMAP metadata reads use this record and attachment downloads read the
 part object directly. The original MIME remains for IMAP/POP3, increasing storage use.
 Legacy messages without these records retain their existing read path.
-A JMAP blob ID remains the library's content
-identifier; it no longer dictates the physical object's name. Multipart upload writes
-directly to that name, followed by a small index PUT, with no whole-object copy at commit.
-Existing objects remain readable. Stop older nodes before deploying this storage format;
-they cannot read the new reference objects. Completed but unreferenced physical objects
-may remain after interrupted index publication or repeated identical uploads; no automatic
-blob garbage collector is provided.
+A JMAP blob ID remains a content identifier. Multipart upload writes directly to the
+named object, followed by an immutable descriptor beside it, without copying the
+whole object at commit. Descriptors retain the encoding information needed to read
+bytes; ID lookup tables are rebuilt from object names and never written to S3.
+Attachment parent relationships are derived from directories and checked against
+MIME metadata; new `.origin.json` indexes are not written. Legacy part locators
+are rebuilt in memory without new `.part` writes. Submission scheduling
+discovers accounts through top-level prefixes, without `.jmap-queue` markers.
+
+Existing objects remain readable. On first access, the old whole-account
+`state.json` is split into owner records before a conditional account-file switch;
+legacy indexes are omitted from the new format. Stop all older nodes before this
+upgrade: they cannot read the new format. Each batch writes immutable prepare
+objects, then publishes the transaction decision with an ETag condition. The next
+write, a one-second flush loop or clean shutdown materializes committed records at
+stable paths. Recovery follows the published decision; unpublished prepare objects
+are invisible. Prepare objects, deletion tombstones and unreferenced blobs are
+currently retained without automatic garbage collection.
+
+Warm Get/MultiGet calls read memory, Scan uses ordered key ranges, and index-only
+batches never write S3. Reads check the account version at most once per second;
+writes always check it. Cold starts and changes made by other nodes require record
+reads and index reconstruction, so recovery still scales with mailbox size. Indexes
+for accessed accounts remain in process memory; there is currently no cache eviction.
 
 SMTP uses a pinned performance fork through `go.mod replace` ([PR #312](https://github.com/emersion/go-smtp/pull/312)). Its single-file DATA reader patch adapts the cross-line scan from [uponusolutions/go-smtp](https://github.com/uponusolutions/go-smtp/blob/86ff2622fb52f86371265b74a976333ff53c10a0/internal/textsmtp/dotreader.go), retaining the existing server API, default 4 KiB protocol buffer, and line-length checks. fma adds a reusable 1 MiB TCP input buffer below TLS to coalesce small reads. POP3 directly imports the independent `github.com/Jabberwocky238/go-pop3` module; its `main` includes the performance fix and fork documentation, while `pr` submits only the patch to upstream ([PR #3](https://github.com/migadu/go-pop3/pull/3)).
 
