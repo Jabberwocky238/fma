@@ -81,6 +81,7 @@ import (
 
 // Config is loaded once before startup; serving code only reads this snapshot.
 type Config struct {
+	StreamWorkers                                          int
 	Domain, CertFile, KeyFile, TLSDir, JMAPURL             string
 	SMTPAddr, SubmissionAddr, SMTPSAddr                    string
 	POP3Addr, POP3SAddr, IMAPAddr, IMAPSAddr, HTTPAddr     string
@@ -160,6 +161,8 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	}
 	// Flags override environment values, which override the defaults below.
 	f := flag.NewFlagSet("fma", flag.ContinueOnError)
+	var streamWorkers string
+	f.StringVar(&streamWorkers, "stream-workers", getenv("STREAM_WORKERS", "8"), "parallel MIME ingestion workers (1-128)")
 	f.StringVar(&c.Domain, "domain", "t12e.cc", "local email domain")
 	f.StringVar(&c.S3.Endpoint, "s3-endpoint", getenv("S3_ENDPOINT", ""), "S3 endpoint URL; empty for AWS")
 	f.StringVar(&c.S3.Bucket, "s3-bucket", getenv("S3_BUCKET", ""), "existing S3 bucket for all persistent data")
@@ -186,6 +189,11 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	if f.NArg() != 0 {
 		return Config{}, fmt.Errorf("unexpected positional arguments")
 	}
+	workers, err := strconv.Atoi(streamWorkers)
+	if err != nil || workers < 1 || workers > 128 {
+		return Config{}, fmt.Errorf("stream-workers must be between 1 and 128")
+	}
+	c.StreamWorkers = workers
 	return c, nil
 }
 
@@ -322,6 +330,12 @@ func run() error {
 	objects = guard
 	useJMAP = true
 	defer guard.close()
+	streamTasks.Close()
+	streamTasks = newStreamTaskPool(config.StreamWorkers)
+	partProbePool = newBufferPool(config.StreamWorkers, 1<<20)
+	partGzipWriters = newWaitPool(config.StreamWorkers, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
+	defer streamTasks.Close()
+	logger.Info("stream task pool started", "workers", config.StreamWorkers, "queue_capacity", config.StreamWorkers)
 
 	if err := loadRelayObjects(&config); err != nil {
 		return err
@@ -344,6 +358,9 @@ func run() error {
 		l, e := net.Listen("tcp", addr)
 		if e != nil {
 			return e
+		}
+		if i < 3 {
+			l = smtpBufferedListener{Listener: l}
 		}
 		if i >= 2 && i <= 4 {
 			l = tls.NewListener(l, cfg)
@@ -1350,6 +1367,25 @@ func saveSent(user string, body []byte) error {
 }
 
 // Smtp
+
+// Coalesce the protocol library's small reads before crossing into the kernel.
+// Wrap TCP below TLS so implicit TLS detection and STARTTLS remain intact.
+type smtpBufferedListener struct{ net.Listener }
+
+func (l smtpBufferedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &smtpBufferedConn{Conn: c, reader: bufio.NewReaderSize(c, 1<<20)}, nil
+}
+
+type smtpBufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *smtpBufferedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
 
 type smtpBackend struct{ requireAuth bool }
 type smtpSession struct {
@@ -2874,6 +2910,148 @@ func (s jmapBlobs) Delete(ctx context.Context, acct, id jmap.Id) error {
 	return err
 }
 
+// MIME metadata is an import-time storage record, not a read-through cache.
+func (s jmapBlobs) GetMessageMetadata(ctx context.Context, acct, source jmap.Id) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key, err := s.key(acct, source)
+	if err != nil {
+		return nil, err
+	}
+	data, err := s.store.Get(key + ".mime.json")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return data, err
+}
+func (s jmapBlobs) PutMessageMetadata(ctx context.Context, acct, source jmap.Id, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key, err := s.key(acct, source)
+	if err != nil {
+		return err
+	}
+	if _, err = jmail.MessagePartIDs(data); err != nil {
+		return err
+	}
+	total, err := jmail.MessageAttachmentBytes(data)
+	if err != nil {
+		return err
+	}
+	if total > maxAttachmentSize {
+		return fmt.Errorf("attachments exceed 4 GiB total")
+	}
+	err = s.store.Create(key+".mime.json", data)
+	if errors.Is(err, fs.ErrExist) {
+		return nil
+	}
+	return err
+}
+func (s jmapBlobs) CreateMessagePart(ctx context.Context, acct, source jmap.Id, partID, filename string) (jmail.PartWriter, error) {
+	root, err := jmapRoot(acct)
+	if err != nil {
+		return nil, err
+	}
+	physical, _ := ctx.Value(mimeParentContext{}).(string)
+	if physical == "" {
+		key, err := s.key(acct, source)
+		if err != nil {
+			return nil, err
+		}
+		data, err := s.store.Get(key)
+		if err != nil {
+			return nil, err
+		}
+		if ref, e := decodeObjectReference(key, data); e == nil {
+			physical = ref.Key[:strings.LastIndex(ref.Key, "/")]
+		}
+		if physical == "" {
+			physical = strings.TrimSuffix(namedBlobKey(root, blobName{MIME: true}, data), "/message.eml")
+		}
+	}
+	// A part-number directory prevents duplicate filenames from overwriting.
+	physical += "/attachments/" + objectNameSegment(partID, "part") + "/" + objectNameSegment(filename, "body.bin")
+	w := &jmapBlobWriter{ctx: ctx, store: s, account: acct, physicalKey: physical, externalDigest: true}
+	return &jmapIngestPart{writer: w, source: source}, nil
+}
+
+type jmapIngestPart struct {
+	writer *jmapBlobWriter
+	source jmap.Id
+}
+
+func (p *jmapIngestPart) Write(data []byte) (int, error) {
+	if p.writer.size+int64(len(data)) > maxAttachmentSize {
+		return 0, fmt.Errorf("attachment exceeds 4 GiB")
+	}
+	return p.writer.Write(data)
+}
+func (p *jmapIngestPart) Commit(id jmap.Id, size uint64) error {
+	if size != uint64(p.writer.size) {
+		return fmt.Errorf("attachment size mismatch")
+	}
+	p.writer.partID = id
+	if _, err := p.writer.Commit(); err != nil {
+		return err
+	}
+	if p.source == "" {
+		return nil
+	} // Pipeline publishes origins after the raw ID is known.
+	key, err := p.writer.store.key(p.writer.account, id)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(jmapPartOrigin{Source: p.source})
+	if err != nil {
+		return err
+	}
+	err = p.writer.store.store.Create(key+".origin.json", data)
+	if errors.Is(err, fs.ErrExist) {
+		return nil
+	}
+	return err
+}
+func (p *jmapIngestPart) Abort() error { return p.writer.Abort() }
+
+type jmapPartOrigin struct {
+	Source jmap.Id `json:"source"`
+}
+
+// Publication in the JMAP upload registry follows parent-email authorization.
+// The attachment content was already committed during import.
+type jmapStoredPart struct{ id jmap.Id }
+
+func (p jmapStoredPart) Write([]byte) (int, error) { return 0, fmt.Errorf("immutable stored part") }
+func (p jmapStoredPart) ID() jmap.Id               { return p.id }
+func (p jmapStoredPart) Commit() (jmap.Id, error)  { return p.id, nil }
+func (p jmapStoredPart) Abort() error              { return nil }
+func (a *jmapAccount) authorizeStoredPart(ctx context.Context, source, id jmap.Id, uploader string) (bool, error) {
+	referenced, err := a.db.BlobReferenced(ctx, a.id, source)
+	if err != nil || !referenced {
+		return false, err
+	}
+	data, err := a.blobs.GetMessageMetadata(ctx, a.id, source)
+	if err != nil || data == nil {
+		return false, err
+	}
+	ids, err := jmail.MessagePartIDs(data)
+	if err != nil {
+		return false, err
+	}
+	if !slices.Contains(ids, id) {
+		return false, nil
+	}
+	r, _, err := a.blobs.Open(ctx, a.id, id)
+	if err != nil {
+		return false, err
+	}
+	r.Close()
+	_, err = a.db.FinalizeBlobUpload(ctx, a.id, jmapStoredPart{id: id}, uploader, time.Now())
+	return err == nil, err
+}
+
 // Blob IDs belong to the JMAP library; physical objects use human-readable names.
 type blobNameContext struct{}
 type blobName struct {
@@ -2957,22 +3135,42 @@ func (w *jmapBlobWriter) startUpload(extra []byte) error {
 	if w.probe != nil {
 		prefix = w.probe.Bytes()
 	}
-	w.writer, err = newObjectUpload(w.ctx, w.store.store, namedBlobKey(root, name, prefix))
+	physicalKey := w.physicalKey
+	if physicalKey == "" {
+		physicalKey = namedBlobKey(root, name, prefix)
+	}
+	w.writer, err = newObjectUpload(w.ctx, w.store.store, physicalKey)
 	return err
 }
 
 type jmapBlobWriter struct {
-	ctx      context.Context
-	store    jmapBlobs
-	account  jmap.Id
-	writer   objectUpload
-	digest   hash.Hash
-	probe    *bytes.Buffer
-	gzip     *gzip.Writer
-	writeErr error
-	metadata map[string]string
-	size     int64
-	finished bool
+	physicalKey    string
+	partID         jmap.Id
+	externalDigest bool
+	ctx            context.Context
+	store          jmapBlobs
+	account        jmap.Id
+	writer         objectUpload
+	digest         hash.Hash
+	probe          *bytes.Buffer
+	gzip           *gzip.Writer
+	writeErr       error
+	metadata       map[string]string
+	size           int64
+	finished       bool
+}
+
+func (w *jmapBlobWriter) probeBuffers() *WaitPool[*bytes.Buffer] {
+	if w.externalDigest {
+		return partProbePool
+	}
+	return mailProbePool
+}
+func (w *jmapBlobWriter) compressionWriters() *WaitPool[*gzip.Writer] {
+	if w.externalDigest {
+		return partGzipWriters
+	}
+	return gzipWriters
 }
 
 func (w *jmapBlobWriter) Write(data []byte) (int, error) {
@@ -2990,9 +3188,13 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 	}
 	var n int
 	var err error
-	if w.gzip == nil && w.size+int64(len(data)) <= gzipThreshold {
+	threshold := int64(gzipThreshold)
+	if w.externalDigest {
+		threshold = 1 << 20
+	}
+	if w.gzip == nil && w.size+int64(len(data)) <= threshold {
 		if w.probe == nil {
-			w.probe, err = mailProbePool.Get(w.ctx)
+			w.probe, err = w.probeBuffers().Get(w.ctx)
 			if err != nil {
 				return 0, err
 			}
@@ -3003,14 +3205,14 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 			if err = w.startUpload(data); err != nil {
 				return 0, err
 			}
-			w.gzip, err = gzipWriters.Get(w.ctx)
+			w.gzip, err = w.compressionWriters().Get(w.ctx)
 			if err != nil {
 				return 0, err
 			}
 			w.gzip.Reset(w.writer)
 			if w.probe != nil {
 				_, err = w.gzip.Write(w.probe.Bytes())
-				mailProbePool.Put(w.probe)
+				w.probeBuffers().Put(w.probe)
 				w.probe = nil
 			}
 			if err != nil {
@@ -3021,11 +3223,16 @@ func (w *jmapBlobWriter) Write(data []byte) (int, error) {
 		n, err = w.gzip.Write(data)
 	}
 	w.writeErr = err
-	w.digest.Write(data[:n])
+	if !w.externalDigest {
+		w.digest.Write(data[:n])
+	}
 	w.size += int64(n)
 	return n, err
 }
 func (w *jmapBlobWriter) ID() jmap.Id {
+	if w.externalDigest {
+		return w.partID
+	}
 	return jmap.Id("G" + base64.RawURLEncoding.EncodeToString(w.digest.Sum(nil)))
 }
 func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
@@ -3045,13 +3252,13 @@ func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
 	}
 	if w.gzip != nil {
 		err = w.gzip.Close()
-		gzipWriters.Put(w.gzip)
+		w.compressionWriters().Put(w.gzip)
 		w.gzip = nil
 		w.metadata = map[string]string{"fma-encoding": "gzip", "fma-size": strconv.FormatInt(w.size, 10)}
 	} else {
 		if w.probe != nil {
 			_, err = w.writer.Write(w.probe.Bytes())
-			mailProbePool.Put(w.probe)
+			w.probeBuffers().Put(w.probe)
 			w.probe = nil
 		}
 	}
@@ -3068,11 +3275,11 @@ func (w *jmapBlobWriter) Commit() (jmap.Id, error) {
 func (w *jmapBlobWriter) Abort() error {
 	w.finished = true
 	if w.probe != nil {
-		mailProbePool.Put(w.probe)
+		w.probeBuffers().Put(w.probe)
 		w.probe = nil
 	}
 	if w.gzip != nil {
-		gzipWriters.Put(w.gzip)
+		w.compressionWriters().Put(w.gzip)
 		w.gzip = nil
 	}
 	if w.writer != nil {
@@ -3962,11 +4169,32 @@ func (a *jmapAccount) materializePart(ctx context.Context, id jmap.Id, uploader 
 	} else if !errors.Is(err, jblob.ErrNotFound) {
 		return err
 	}
+	key, _ := a.blobs.key(a.id, id)
+	if data, e := a.blobs.store.Get(key + ".origin.json"); e == nil {
+		var origin jmapPartOrigin
+		if e = json.Unmarshal(data, &origin); e != nil {
+			return e
+		}
+		if found, e := a.authorizeStoredPart(ctx, origin.Source, id, uploader); e != nil || found {
+			return e
+		}
+	} else if !errors.Is(e, fs.ErrNotExist) {
+		return e
+	}
 	emails, err := a.all(ctx, "Email")
 	if err != nil {
 		return err
 	}
 	for _, email := range emails {
+		source := jvalue[jmap.Id](email, "blobId")
+		if metadata, e := a.blobs.GetMessageMetadata(ctx, a.id, source); e != nil {
+			return e
+		} else if metadata != nil {
+			if found, e := a.authorizeStoredPart(ctx, source, id, uploader); e != nil || found {
+				return e
+			}
+			continue
+		}
 		r, _, err := a.blobs.Open(ctx, a.id, jvalue[jmap.Id](email, "blobId"))
 		if err != nil {
 			return err
@@ -4912,18 +5140,247 @@ type jmapBlobRef struct {
 	Size      int64   `json:"size"`
 }
 
+// Workers pull from one bounded queue: an idle worker takes the next task,
+// so a slow transfer cannot pin subsequent tasks to that worker's private queue.
+type streamTask struct {
+	ctx  context.Context
+	run  func(context.Context) error
+	done chan error
+}
+type streamTaskPool struct {
+	jobs   chan streamTask
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.RWMutex
+	closed bool
+	wg     sync.WaitGroup
+}
+
+func newStreamTaskPool(workers int) *streamTaskPool {
+	if workers < 1 {
+		panic("stream task pool requires a worker")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &streamTaskPool{jobs: make(chan streamTask, workers), ctx: ctx, cancel: cancel}
+	p.wg.Add(workers)
+	for range workers {
+		go func() {
+			defer p.wg.Done()
+			for job := range p.jobs {
+				ctx, cancel := context.WithCancel(job.ctx)
+				stop := context.AfterFunc(p.ctx, cancel)
+				if p.ctx.Err() != nil {
+					cancel()
+				}
+				err := ctx.Err()
+				if err == nil {
+					err = job.run(ctx)
+				}
+				stop()
+				cancel()
+				job.done <- err
+			}
+		}()
+	}
+	return p
+}
+func (p *streamTaskPool) Submit(ctx context.Context, run func(context.Context) error) (<-chan error, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return nil, net.ErrClosed
+	}
+	job := streamTask{ctx: ctx, run: run, done: make(chan error, 1)}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-p.ctx.Done():
+		return nil, net.ErrClosed
+	case p.jobs <- job:
+		return job.done, nil
+	}
+}
+func (p *streamTaskPool) Close() {
+	p.cancel()
+	p.mu.Lock()
+	if !p.closed {
+		p.closed = true
+		close(p.jobs)
+	}
+	p.mu.Unlock()
+	p.wg.Wait()
+}
+
+var streamTasks = newStreamTaskPool(8)
+
+// Blocks move from the receiver to the parser and back only after consumption.
+// Three owned 1 MiB blocks allow CPU overlap without copying or unbounded queues.
+type mimeStreamBlocks struct {
+	ctx     context.Context
+	ready   chan []byte
+	free    chan []byte
+	current []byte
+	owned   []byte
+	err     error // written before ready closes, read after receiving the closed channel
+}
+
+func newMIMEStreamBlocks() *mimeStreamBlocks {
+	return &mimeStreamBlocks{ctx: context.Background(), ready: make(chan []byte, 3), free: make(chan []byte, 3)}
+}
+func (s *mimeStreamBlocks) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for len(s.current) == 0 {
+		var block []byte
+		var ok bool
+		select {
+		case block, ok = <-s.ready:
+		case <-s.ctx.Done():
+			return 0, s.ctx.Err()
+		}
+		if !ok {
+			if s.err != nil {
+				return 0, s.err
+			}
+			return 0, io.EOF
+		}
+		s.current = block
+		s.owned = block[:cap(block)]
+	}
+	n := copy(p, s.current)
+	if n == len(s.current) {
+		s.free <- s.owned
+		s.current = nil
+		s.owned = nil
+	} else {
+		s.current = s.current[n:]
+	}
+	return n, nil
+}
+func (s *mimeStreamBlocks) receive(ctx context.Context, r io.Reader, w io.Writer) (size int64, err error) {
+	defer func() { s.err = err; close(s.ready) }()
+	for range 3 {
+		s.free <- make([]byte, 1<<20)
+	}
+	empty := 0
+	for {
+		var b []byte
+		select {
+		case b = <-s.free:
+		case <-ctx.Done():
+			return size, ctx.Err()
+		}
+		n, e := r.Read(b)
+		if n > 0 {
+			empty = 0
+			if size+int64(n) > maxMailSize {
+				return size, &smtp.SMTPError{Code: 552, Message: "message too large"}
+			}
+			written, we := w.Write(b[:n])
+			size += int64(written)
+			if we != nil {
+				return size, we
+			}
+			if written != n {
+				return size, io.ErrShortWrite
+			}
+			select {
+			case s.ready <- b[:n]:
+			case <-ctx.Done():
+				return size, ctx.Err()
+			}
+		} else {
+			s.free <- b
+			empty++
+			if empty >= 100 {
+				return size, io.ErrNoProgress
+			}
+		}
+		if e == io.EOF {
+			return size, nil
+		}
+		if e != nil {
+			return size, e
+		}
+	}
+}
+
+// The raw MIME uploader and MIME parser consume the same incoming bytes.
+// A bounded block queue applies backpressure and transfers buffer ownership.
+type mimeParentContext struct{}
+type mimePipelineStore struct {
+	jmapBlobs
+	metadata []byte
+}
+
+func (s *mimePipelineStore) PutMessageMetadata(_ context.Context, _, _ jmap.Id, data []byte) error {
+	s.metadata = bytes.Clone(data)
+	return nil
+}
+func (s *mimePipelineStore) publish(ctx context.Context, account, id jmap.Id) error {
+	ids, err := jmail.MessagePartIDs(s.metadata)
+	if err != nil {
+		return err
+	}
+	origin, err := json.Marshal(jmapPartOrigin{Source: id})
+	if err != nil {
+		return err
+	}
+	for _, part := range ids {
+		key, err := s.key(account, part)
+		if err != nil {
+			return err
+		}
+		if err = s.store.Create(key+".origin.json", origin); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+	}
+	return s.jmapBlobs.PutMessageMetadata(ctx, account, id, s.metadata)
+}
 func storeMailStream(ctx context.Context, root string, r io.Reader) (*jmapBlobRef, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	readStart := time.Now()
+	input := bufio.NewReaderSize(r, 128<<10)
+	prefix, err := input.Peek(64 << 10)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	physical := namedBlobKey(root, blobName{MIME: true}, prefix)
+	ctx = context.WithValue(ctx, mimeParentContext{}, physical[:strings.LastIndex(physical, "/")])
 	store := jmapBlobs{store: objects}
 	account := jmapAccountID(root)
-	writer, err := store.Create(ctx, account)
+	writer := &jmapBlobWriter{ctx: ctx, store: store, account: account, digest: sha256.New(), physicalKey: physical}
+	defer writer.Abort()
+	pipeline := &mimePipelineStore{jmapBlobs: store}
+	stopPoolCancel := context.AfterFunc(streamTasks.ctx, cancel)
+	defer stopPoolCancel()
+	blocks := newMIMEStreamBlocks()
+	done, err := streamTasks.Submit(ctx, func(taskCtx context.Context) error {
+		blocks.ctx = taskCtx // Only the worker reads this field.
+		err := jmail.IngestMessage(taskCtx, pipeline, account, "", blocks)
+		if err == nil {
+			_, err = io.Copy(io.Discard, blocks)
+		}
+		if err != nil {
+			cancel()
+		}
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer writer.Abort()
-	readStart := time.Now()
-	size, err := copyStream(ctx, writer, io.LimitReader(r, maxMailSize+1))
-	if err != nil {
-		return nil, err
+	size, readErr := blocks.receive(ctx, input, writer)
+	if readErr != nil {
+		cancel()
+	}
+	parseErr := <-done
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	if readErr != nil {
+		return nil, readErr
 	}
 	if size > maxMailSize {
 		return nil, &smtp.SMTPError{Code: 552, Message: "message too large"}
@@ -4932,6 +5389,9 @@ func storeMailStream(ctx context.Context, root string, r io.Reader) (*jmapBlobRe
 	commitStart := time.Now()
 	id, err := writer.Commit()
 	if err != nil {
+		return nil, err
+	}
+	if err = pipeline.publish(ctx, account, id); err != nil {
 		return nil, err
 	}
 	logger.Debug("mail stream stored", "bytes", size, "read_seconds", readElapsed.Seconds(), "commit_seconds", time.Since(commitStart).Seconds())
@@ -5182,10 +5642,12 @@ func newBufferPool(count, size int) *WaitPool[*bytes.Buffer] {
 }
 
 var (
-	mailProbePool  = newBufferPool(4, gzipThreshold)
-	s3BufferPool   = newWaitPool(s3BufferLimit/s3PartSize, func() *s3PartBuffer { return new(s3PartBuffer) }, func(p *s3PartBuffer) { p.size, p.offset = 0, 0 })
-	copyBufferPool = newBufferPool(32, 128<<10)
-	gzipWriters    = newWaitPool(4, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
+	mailProbePool   = newBufferPool(4, gzipThreshold)
+	partProbePool   = newBufferPool(8, 1<<20)
+	partGzipWriters = newWaitPool(8, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
+	s3BufferPool    = newWaitPool(s3BufferLimit/s3PartSize, func() *s3PartBuffer { return new(s3PartBuffer) }, func(p *s3PartBuffer) { p.size, p.offset = 0, 0 })
+	copyBufferPool  = newBufferPool(32, 128<<10)
+	gzipWriters     = newWaitPool(4, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
 )
 
 func copyStream(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {

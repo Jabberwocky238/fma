@@ -1259,3 +1259,119 @@ threshold, interruption handling and the no-local-spool assertion. The new
 Validation and profile evidence remains outside the repository under
 `/tmp/fma-cold-*` and `/tmp/fma-mime-parser-*`; all historical measurements above
 are retained.
+
+
+## Persisted MIME parts, concurrent ingestion and task workers (2026-09-10)
+
+This supersedes the earlier virtual-attachment design for newly ingested mail. Original MIME remains available for IMAP/POP3; each decoded leaf is also stored as a named S3 object, with a separate versioned JSON record containing MIME headers/structure, part hashes and sizes, and preview. A small parent-message record supports attachment authorization. These records are produced at write time, not populated by repeated downloads. First metadata access reads JSON; first attachment download reads the decoded object without scanning the original MIME. Text body values read the stored text part with charset conversion and the requested truncation limit. Legacy objects without metadata retain the previous read path.
+
+The parser fork is [ea6016819f55](https://github.com/Jabberwocky238/naust-jmap/commit/ea6016819f557258bc1adf95488dca474c37e846), pinned as `github.com/Jabberwocky238/naust-jmap/datatypes/mail v0.3.4-0.20260910204519-ea6016819f55`. Its optional `MessageStore`, `PartWriter` and `IngestMessage` APIs stream parts and propagate required storage-write/commit errors. No SMTP or POP3 library version or PR was changed in this round. AWS S3 v1.97.3, AWS core v1.41.5, smithy v1.24.2, Go 1.25.3, Apple M4 and Fals3y 0.3.1-dev.b8e48bf remain as recorded above. Intermediate runs used a temporary local module replacement for this fork; final runs use the published version.
+
+Physical parts use `<account>/mail/<escaped-subject>_<timestamp>/attachments/<part-id>/<escaped-filename>`. Part-number directories disambiguate duplicate filenames. Raw MIME and all parts must commit before the final JSON metadata is published. Interrupted or failed publication can leave unreferenced objects, matching the existing no-automatic-GC policy; it does not publish a successful Email with unfinished attachments. Keeping original MIME plus decoded parts consumes additional S3 storage. Attachment identities are hashed once by the parser and passed to the writer, avoiding a second application-level hash of decoded bytes.
+
+### Why the first implementation took eight seconds
+
+The first persisted-parts prototype still received/stored MIME and then read it back from S3 for import. In its unprofiled 2 GiB run, reception/write took **4.370775 s**, raw commit **0.038265 s**, and import/part storage **4.144295 s**, yielding **8.562 s SMTP DATA**. It made JMAP metadata **0.004 s** and first attachment download **0.898 s**, but moved work into a serial upload stage. The full SMTP-plus-JMAP sequence was **9.464 s**, compared with **14.820 s** for the prior first-request run. This prototype is retained as evidence, not presented as the final upload result.
+
+Concurrent ingestion removes that S3 reread. The receiver writes the original object and transfers ownership of three reusable 1 MiB blocks to the parser; blocks return only after consumption. The parser decodes/hashes each leaf and writes its object while reception continues. Completed parts upload incrementally. This is bounded streaming with backpressure, not full-message buffering. The first parallel run reduced SMTP to **4.525 s**, final import to **0.012954 s**, with **0.004 s** metadata and **0.904 s** first download: **5.433 s** for SMTP plus JMAP. SMTP CPU changed **11.92 → 11.94 CPU-seconds** while peak SMTP RSS changed **170.73 → 209.59 MiB**: concurrency reduced elapsed time, not total CPU work.
+
+### TCP read-count experiment and mmap assessment
+
+A 1 MiB reusable TCP reader below TLS batches the SMTP library's existing 4 KiB requests without changing its line limits, DATA state machine or TLS detection. Two otherwise matched diagnostic builds counted calls immediately around the underlying `net.Conn.Read`; the small-read control bypassed the added buffer. These are underlying Read calls, not a count of every kernel retry/EAGAIN. Both transferred 2,938,662,512 bytes including SMTP commands/framing, with identical attachment content.
+
+| Receive buffer | Underlying Read calls | Mean bytes/read | SMTP wall s | SMTP CPU s | SMTP peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Existing 4 KiB protocol reads | 717,453 | 4,096.0 | 4.423 | 11.790 | 219.72 |
+| Added 1 MiB TCP buffer | 2,818 | 1,042,818.5 | 4.278 | 11.620 | 220.39 |
+
+Read calls fall **99.6%**, but wall time falls only **3.3% (4.423 → 4.278 s)**. Small reads were real overhead; their count alone does not explain the remaining critical path. The block queue already supplies bounded buffer rotation. Merely allocating it with anonymous mmap does not change the socket-read batching policy; mmap is a memory/file mapping API, not a replacement for receiving this TCP stream. No mmap or file-backed spool was introduced. See [POSIX mmap](https://pubs.opengroup.org/onlinepubs/9799919799/functions/mmap.html) and [Go buffered reads](https://go.dev/src/bufio/bufio.go).
+
+An earlier buffered pilot retained a 10 MiB decoded-part compression probe and failed the existing 256 MiB whole-run RSS assertion: peak **258.34375 MiB** after POP3, despite correct content transfers. Its SMTP was **4.305 s**, metadata **0.004 s**, and download **0.908 s**; it is excluded from passing-run comparisons. Decoded-part probes now use 1 MiB and begin gzip above that threshold; original MIME/raw uploads retain their 10 MiB threshold. Raw and part compression/probe pools are separate, preventing dependent stages from exhausting one shared pool. The two read-count runs and subsequent profile use the smaller part probe and passed the RSS assertion.
+
+### SMTP CPU hot functions
+
+CPU profiling was enabled only during SMTP DATA in temporary Go source overlays, with no profiling endpoint added to the application. Samples are CPU time across all fma threads, not elapsed stage time or syscall counts. The first serial profile lasted **8.61 s**, with **11.20 CPU-seconds** sampled: `syscall.syscall` flat **7.83 s (69.91%)**, SHA-256 `blockSHA2` flat **1.04 s (9.29%)**. The receiving `dataReader.Read → bufio.ReadByte` chain accumulated **3.92 s**; import `base64Filter.fill` accumulated **3.48 s**, mostly including its downstream reads. These cumulative figures do not mean those functions themselves spent that time computing, and the read-count experiment above is a stronger test of the syscall-count hypothesis.
+
+The concurrent buffered profile lasted **4.41 s**, with **10.82 CPU-seconds** sampled. Its principal flat samples were:
+
+| Function | Flat CPU s | Flat % | Interpretation |
+| --- | ---: | ---: | --- |
+| syscall.syscall | 3.19 | 29.48 | Socket/system work across concurrent paths |
+| sha256.blockSHA2 | 1.75 | 16.17 | SHA2-accelerated content hashing |
+| runtime.pthread_cond_signal | 1.67 | 15.43 | Thread wakeups |
+| runtime.pthread_cond_wait | 1.02 | 9.43 | Runtime synchronization samples |
+| message.(*base64Filter).fill | 0.84 | 7.76 | Filtering; cumulative 1.16 s including callees |
+| base64.(*Encoding).Decode | 0.48 | 4.44 | Decode; cumulative 0.55 s |
+| smtp.(*lineLimitReader).Read | 0.48 | 4.44 | Protocol reader; cumulative 2.61 s including reads |
+| runtime.memmove | 0.29 | 2.68 | Memory copies |
+| crc32.ieeeUpdate | 0.16 | 1.48 | CRC work |
+
+The same diagnostic run timed decoded-part `Write` calls: **0.418693 s** accumulated over 2 GiB during SMTP (and **0.403204 s** during IMAP APPEND). This includes synchronous gzip/write work and any backpressure in those calls; it excludes final Commit and independently running S3 workers. Therefore treating the remaining four seconds as gzip time is also unsupported. Profiling runs are retained below but excluded from unprofiled latency comparisons. Profiles and diagnostic logs remain under `/tmp/fma-ingest-*`, `/tmp/fma-pipeline-*` and `/tmp/fma-smtp-count-*`, outside the repository.
+
+### Startup task pool
+
+The final implementation starts **8 worker goroutines**. `FMA_STREAM_WORKERS` or `-stream-workers` changes the count (1–128), with the command-line flag taking precedence. Workers pull MIME parsing tasks from a single shared queue; queue capacity equals worker count. Busy workers do not retain private queues, so the next idle worker takes the next waiting message. A full queue applies backpressure, and the three block allocations occur only after admission. Canceled queued work is skipped; shutdown cancels running task contexts and drains pending results. Part compression pools scale with the parser-worker count; raw upload pools stay independent. S3 multipart bodies retain their separate 1 GiB active-capacity bound. This controls concurrent messages, not eight-way decoding of one Base64 stream, and does not replace protocol or SDK network goroutines.
+
+Configuration and scheduling regressions verify the default, environment/flag precedence, invalid counts, eight simultaneous active tasks, bounded-queue cancellation, shutdown cancellation, post-shutdown rejection, buffer ownership/reuse and cancellation of blocked producers. Storage regressions deny complete-MIME reads after import and account reopen while exercising metadata, first attachment authorization/download and cross-account rejection. Library regressions cover create/write/short-write/commit/metadata failures, mandatory sink error propagation, decoded identity equality and stored text-value truncation.
+
+### Intermediate results and exact UTC provenance
+
+All runs use a fresh fixture and process, seed 20260910, a 2 GiB decoded attachment and 2,938,662,361 MIME bytes. JMAP requests occur immediately after SMTP, before IMAP/POP3 reads, once each. CPU/RSS describe fma only; Fals3y and client resources are excluded. 100% CPU is one logical core. These are first application requests, not a claim of cold OS page caches. The `cold-first-after` row is the previously recorded streaming-decoder baseline. The other rows precede the startup worker-pool change; final-version results follow separately.
+
+| Run | Raw up | Raw down | SMTP | IMAP down | APPEND | POP3 | JMAP metadata | JMAP first down | Whole-run peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cold-first-after | 1.827 | 0.869 | 5.290 | 1.912 | 3.777 | 1.856 | 3.637 | 5.893 | 176.59 |
+| ingest-after-1 | 1.828 | 0.867 | 8.562 | 1.901 | 2.905 | 1.814 | 0.004 | 0.898 | 188.44 |
+| ingest-profile | 1.813 | 0.866 | 8.620 | 1.943 | 2.759 | 1.819 | 0.004 | 0.890 | 192.23 |
+| pipeline-after-1 | 1.826 | 0.877 | 4.525 | 1.920 | 4.326 | 1.867 | 0.004 | 0.904 | 221.81 |
+| smtp-count-small | 1.825 | 0.855 | 4.423 | 1.964 | 4.319 | 1.827 | 0.004 | 0.886 | 228.98 |
+| smtp-count-buffered | 1.791 | 0.885 | 4.278 | 1.926 | 4.313 | 1.826 | 0.005 | 0.880 | 251.20 |
+| pipeline-profile | 1.835 | 0.880 | 4.417 | 1.974 | 4.334 | 1.858 | 0.006 | 0.888 | 243.38 |
+
+| Run | SMTP start UTC | First JMAP download end UTC | SMTP CPU s | JMAP download CPU s |
+| --- | --- | --- | ---: | ---: |
+| cold-first-after | 2026-09-10T20:13:59.385619Z | 2026-09-10T20:14:14.211803Z | 7.460 | 6.300 |
+| ingest-after-1 | 2026-09-10T20:28:31.189259Z | 2026-09-10T20:28:40.660257Z | 11.920 | 0.600 |
+| ingest-profile | 2026-09-10T20:31:43.619118Z | 2026-09-10T20:31:53.140911Z | 12.090 | 0.600 |
+| pipeline-after-1 | 2026-09-10T20:34:58.653505Z | 2026-09-10T20:35:04.092502Z | 11.940 | 0.610 |
+| smtp-count-small | 2026-09-10T20:38:05.961465Z | 2026-09-10T20:38:11.281544Z | 11.790 | 0.600 |
+| smtp-count-buffered | 2026-09-10T20:38:26.318019Z | 2026-09-10T20:38:31.488412Z | 11.620 | 0.620 |
+| pipeline-profile | 2026-09-10T20:39:37.863227Z | 2026-09-10T20:39:43.182892Z | 11.780 | 0.600 |
+
+Each run maps to `/tmp/<run>.json` and `.log` with the `fma-` prefix retained; no log dump or standalone benchmark source is embedded here. Reproduce using `python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --stream-workers 8 --report /tmp/fma-workers.json`; add `--data compressible` for the high-compression fixture. The report records worker count, UTC timestamps and executable SHA-256. Historical results above have not been removed.
+
+### Final published-library, eight-worker results
+
+These three unprofiled runs use the published `ea6016819f55` parser, the final application source and `--stream-workers 8`, with no Go source overlay or local module replacement. They are single-message throughput measurements; the eight-way scheduling property is separately covered by concurrent worker tests. All passed SHA-256 content verification, the 256 MiB fma RSS limit, interrupted-upload handling and no-local-spool checks.
+
+| Run | Raw up s | Raw down s | SMTP s | IMAP down s | APPEND s | POP3 s | JMAP metadata s | First attachment down s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| workers-8-1 | 1.828 | 0.865 | 4.280 | 1.934 | 4.367 | 1.821 | 0.004 | 0.888 |
+| workers-8-2 | 2.044 | 0.885 | 4.289 | 1.898 | 4.315 | 1.766 | 0.004 | 0.889 |
+| workers-8-compressed | 1.477 | 0.844 | 5.045 | 2.146 | 3.746 | 2.257 | 0.004 | 0.849 |
+
+| Run | SMTP CPU s / average % | SMTP peak MiB | JMAP download CPU s / average % | JMAP download peak MiB | Whole-run peak MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| workers-8-1 | 11.660 / 272.45% | 190.48 | 0.590 / 66.45% | 190.55 | 217.42 |
+| workers-8-2 | 11.650 / 271.64% | 184.53 | 0.590 / 66.39% | 186.16 | 240.11 |
+| workers-8-compressed | 8.990 / 178.20% | 79.64 | 0.510 / 60.09% | 82.69 | 116.59 |
+
+Two-run incompressible means: SMTP **4.2845 s**, metadata **0.004 s**, first attachment download **0.8885 s**, and SMTP plus metadata plus download **5.1770 s**. Against the serial persisted-parts prototype, SMTP falls **8.562 → 4.2845 s (50.0%)**; against the prior streaming-decoder first-request run it falls **5.290 → 4.2845 s (19.0%)**, despite now also storing decoded parts. First download falls **5.893 → 0.8885 s (84.9%)** and metadata-plus-download **9.530 → 0.8925 s (90.6%)**. The full SMTP-plus-JMAP sequence falls **14.820 → 5.1770 s (65.1%)** relative to that prior run. The older comparison points are individual preserved runs, not new multi-run confidence estimates.
+
+Final SMTP CPU averages **11.655 CPU-seconds**, versus **11.920** in the serial persisted-parts prototype, while average utilization is about **272% of one core**. This is parallel work over a shorter interval, not an eightfold throughput claim. Raw upload-plus-download means **2.811 s**; JMAP metadata-plus-download is under one second. **SMTP itself and SMTP-plus-download remain above the 3-second goal.**
+
+| Run | SMTP start UTC | SMTP end UTC | First attachment download end UTC |
+| --- | --- | --- | --- |
+| workers-8-1 | 2026-09-10T20:50:38.087133Z | 2026-09-10T20:50:42.366938Z | 2026-09-10T20:50:43.265287Z |
+| workers-8-2 | 2026-09-10T20:50:58.571384Z | 2026-09-10T20:51:02.860164Z | 2026-09-10T20:51:03.759382Z |
+| workers-8-compressed | 2026-09-10T20:51:18.271031Z | 2026-09-10T20:51:23.315904Z | 2026-09-10T20:51:24.175748Z |
+
+Final `main.go` SHA-256: `8d0e9a5adbb4f661633326862d1e9b8f1c1c65dc9b477dae0d91775c30920bc4`. The benchmark JSON checkout field records base commit `3e488709981b365027fe2f50b9dab33bdb29a964` plus the then-uncommitted changes; it is not an assertion that the base commit alone contains this implementation.
+
+| Run | Executable SHA-256 |
+| --- | --- |
+| workers-8-1 | `0bbc387e5ae7fd1fb402cf4f5e5d77032c54a4fecf4a0b5bf7ad73ff0bb668e6` |
+| workers-8-2 | `0bbc387e5ae7fd1fb402cf4f5e5d77032c54a4fecf4a0b5bf7ad73ff0bb668e6` |
+| workers-8-compressed | `0bbc387e5ae7fd1fb402cf4f5e5d77032c54a4fecf4a0b5bf7ad73ff0bb668e6` |
+
+Final validation: **`make test` and `make build` passed**, including race, native S3, SMTP STARTTLS/SMTPS, IMAP/POP3, JMAP account isolation and restart checks. The published fork passed `go test -race ./...`; its additional required-sink and metadata tests are committed with the library. Local validation records are `/tmp/fma-workers-full-tests.log`, `/tmp/fma-workers-full-build.log` and `/tmp/fma-pipeline-library-tests.log`. Final reports are `/tmp/fma-workers-final-{1,2,compressed}.json`. No upstream SMTP PR was modified.

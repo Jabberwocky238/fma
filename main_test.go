@@ -343,8 +343,8 @@ func TestConfigDefaultsAndFlagPrecedence(t *testing.T) {
 	if c.Domain != "example.org" || c.OutboundMode != "direct" || c.QueueRetry != 2*time.Second || c.SMTPSAddr != "127.0.0.1:2465" || c.POP3SAddr != "127.0.0.1:1995" {
 		t.Fatal("configuration defaults or flag precedence changed")
 	}
-	if len(calls) != 14 {
-		t.Fatalf("expected 14 environment inputs, got %d", len(calls))
+	if len(calls) != 15 {
+		t.Fatalf("expected 15 environment inputs, got %d", len(calls))
 	}
 	for key, count := range calls {
 		if count != 1 {
@@ -2216,5 +2216,207 @@ func TestS3CopyStreamStaysOnServer(t *testing.T) {
 				t.Fatalf("copies=%d body reads=%d", copies.Load(), bodyReads.Load())
 			}
 		})
+	}
+}
+
+// Deny reads of the complete MIME after import. Metadata, first attachment
+// authorization and download must work even after reopening the account.
+type denyMIMEStore struct {
+	objectStore
+	denied string
+	reads  int
+}
+
+func (s *denyMIMEStore) GetVersion(key string) ([]byte, string, error) {
+	return s.objectStore.(versionedStore).GetVersion(key)
+}
+func (s *denyMIMEStore) Swap(key string, data []byte, version string) error {
+	return s.objectStore.(versionedStore).Swap(key, data, version)
+}
+func (s *denyMIMEStore) Get(key string) ([]byte, error) {
+	if key == s.denied {
+		s.reads++
+		return nil, fmt.Errorf("unexpected complete MIME read")
+	}
+	return s.objectStore.Get(key)
+}
+func TestJMAPStoredPartsFirstRead(t *testing.T) {
+	outboundTestDir(t)
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
+	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	old := useJMAP
+	useJMAP = true
+	t.Cleanup(func() { useJMAP = old })
+	ctx := context.Background()
+	a, err := openJMAPAccount(ctx, "alice")
+	checkError(t, err)
+	box, err := a.mailbox(ctx, "alice")
+	checkError(t, err)
+	raw := []byte("From: a@example.com\r\nSubject: stored / ?\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"../same.bin\"\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAwQ=\r\n--x--\r\n")
+	id, err := a.importMail(ctx, box, raw, nil, time.Now())
+	checkError(t, err)
+	email, err := a.db.Get(ctx, a.id, "Email", id)
+	checkError(t, err)
+	source := jvalue[jmap.Id](email, "blobId")
+	sourceKey, err := a.blobs.key(a.id, source)
+	checkError(t, err)
+	store := &denyMIMEStore{objectStore: a.blobs.store, denied: sourceKey}
+	reopened, err := newJMAPAccount("alice", store)
+	checkError(t, err)
+	result, err := reopened.call(ctx, "Email/get", map[string]any{"ids": []jmap.Id{id}, "properties": []string{"id", "attachments"}})
+	checkError(t, err)
+	list := jvalue[[]map[string]json.RawMessage](result, "list")
+	var parts []struct {
+		BlobID jmap.Id `json:"blobId"`
+		Size   int64   `json:"size"`
+	}
+	checkError(t, json.Unmarshal(list[0]["attachments"], &parts))
+	if len(parts) != 1 || parts[0].Size != 5 {
+		t.Fatalf("parts: %+v", parts)
+	}
+	checkError(t, reopened.materializePart(ctx, parts[0].BlobID, "alice"))
+	r, n, err := reopened.blobs.Open(ctx, reopened.id, parts[0].BlobID)
+	checkError(t, err)
+	got, err := io.ReadAll(r)
+	r.Close()
+	checkError(t, err)
+	if n != 5 || !bytes.Equal(got, []byte{0, 1, 2, 3, 4}) || store.reads != 0 {
+		t.Fatalf("first read: %x, MIME reads=%d", got, store.reads)
+	}
+	bob, err := newJMAPAccount("bob", store)
+	checkError(t, err)
+	if err = bob.materializePart(ctx, parts[0].BlobID, "bob"); err == nil {
+		t.Fatal("cross-account attachment access")
+	}
+}
+
+func TestMIMEStreamBlocksOwnershipAndCancellation(t *testing.T) {
+	data := make([]byte, 5<<20)
+	for i := range data {
+		data[i] = byte(i*17 + i/251)
+	}
+	blocks := newMIMEStreamBlocks()
+	done := make(chan error, 1)
+	var raw bytes.Buffer
+	go func() { _, err := blocks.receive(context.Background(), bytes.NewReader(data), &raw); done <- err }()
+	var decoded bytes.Buffer
+	buf := make([]byte, 7777)
+	_, err := io.CopyBuffer(struct{ io.Writer }{&decoded}, blocks, buf)
+	checkError(t, err)
+	checkError(t, <-done)
+	if !bytes.Equal(raw.Bytes(), data) || !bytes.Equal(decoded.Bytes(), data) {
+		t.Fatal("reused block changed unread data")
+	}
+	for range 3 {
+		if b := <-blocks.free; len(b) != 1<<20 || cap(b) != 1<<20 {
+			t.Fatal("lost original block allocation")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	blocked := newMIMEStreamBlocks()
+	go func() { _, err := blocked.receive(ctx, bytes.NewReader(data), io.Discard); done <- err }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("producer stuck after cancellation")
+	}
+	if mailProbePool == partProbePool || gzipWriters == partGzipWriters {
+		t.Fatal("dependent streams share an exhaustible pool")
+	}
+}
+
+func TestStreamWorkerConfiguration(t *testing.T) {
+	c, err := loadConfig(nil, func(string) string { return "" })
+	checkError(t, err)
+	if c.StreamWorkers != 8 {
+		t.Fatal("default worker count")
+	}
+	env := func(k string) string {
+		if k == "FMA_STREAM_WORKERS" {
+			return "3"
+		}
+		return ""
+	}
+	c, err = loadConfig(nil, env)
+	checkError(t, err)
+	if c.StreamWorkers != 3 {
+		t.Fatal("worker environment ignored")
+	}
+	c, err = loadConfig([]string{"-stream-workers", "5"}, env)
+	checkError(t, err)
+	if c.StreamWorkers != 5 {
+		t.Fatal("worker flag precedence")
+	}
+	for _, v := range []string{"0", "-1", "129", "abc"} {
+		if _, err := loadConfig([]string{"-stream-workers", v}, env); err == nil {
+			t.Fatal("invalid workers accepted", v)
+		}
+	}
+}
+func TestStreamTaskPoolDispatchAndShutdown(t *testing.T) {
+	pool := newStreamTaskPool(8)
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var active, peak atomic.Int32
+	var results []<-chan error
+	for range 8 {
+		done, err := pool.Submit(context.Background(), func(ctx context.Context) error {
+			n := active.Add(1)
+			defer active.Add(-1)
+			for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
+			}
+			started <- struct{}{}
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		checkError(t, err)
+		results = append(results, done)
+	}
+	for range 8 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("workers failed to run concurrently")
+		}
+	}
+	if peak.Load() != 8 {
+		t.Fatal("not all workers dispatched")
+	}
+	var cancelledRuns atomic.Int32
+	for range 8 {
+		done, err := pool.Submit(context.Background(), func(context.Context) error { cancelledRuns.Add(1); return nil })
+		checkError(t, err)
+		results = append(results, done)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := pool.Submit(ctx, func(context.Context) error { return nil }); !errors.Is(err, context.Canceled) {
+		t.Fatal("full-queue cancellation", err)
+	}
+	stopped := make(chan struct{})
+	go func() { pool.Close(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown blocked")
+	}
+	for _, done := range results {
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatal("shutdown lost task result", err)
+		}
+	}
+	if cancelledRuns.Load() != 0 {
+		t.Fatal("ran queued tasks during shutdown")
+	}
+	if _, err := pool.Submit(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, net.ErrClosed) {
+		t.Fatal("submission after shutdown", err)
 	}
 }

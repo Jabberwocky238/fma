@@ -136,6 +136,7 @@ Command-line values override the corresponding environment variables, then defau
 | `—` | `FMA_RELAY_TLS` | `starttls` | starttls or implicit |
 | `—` | `FMA_RELAY_CA_FILE` | `empty` | Optional CA certificate object key in S3 |
 | `-queue-retry` | `—` | `1m` | Initial retry delay for SMTP delivery jobs |
+| `-stream-workers` | `FMA_STREAM_WORKERS` | `8` | MIME ingestion workers (1–128); flag overrides environment |
 | `-queue` | `—` | `false` | Inspect SMTP delivery jobs without message bodies |
 | `-version` | `—` | `false` | Print version, commit and release time; no S3 needed |
 | `-h` | `—` | `—` | Print command-line help |
@@ -156,6 +157,7 @@ The generator also reads the table below. S3, relay, outbound and logging enviro
 | `FMA_CERT_KEY` | `cert.pem` | Maps to -cert |
 | `FMA_KEY_KEY` | `key.pem` | Maps to -key |
 | `FMA_QUEUE_RETRY` | `1m` | Maps to -queue-retry |
+| `FMA_STREAM_WORKERS` | `8` | MIME ingestion workers created at startup |
 | `FMA_SMTP_PORT` | `2525` | Loopback listener port |
 | `FMA_SUBMISSION_PORT` | `1587` | Loopback listener port |
 | `FMA_SMTPS_PORT` | `1465` | Loopback listener port |
@@ -721,7 +723,10 @@ type, prepare its new configuration first and replace `.kind` last.
 | `<account>/.jmap/state.json` | Canonical mailbox metadata, indexes, state changes, UID bookkeeping, submission records and account lease |
 | `<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | Immutable streamed MIME or uploaded attachment bytes; gzip above 10 MiB |
 | `<account>/.jmap/blobs/<blobId>` | Small reference to a named object and its encoding/size; legacy objects still contain raw MIME/blob bytes |
-| `<account>/.jmap/blobs/<blobId>.part` | Small locator for an incoming attachment inside its original MIME message |
+| `<account>/mail/<mail-id>/attachments/<part-id>/<escaped-filename>` | Decoded MIME parts; gzip above 1 MiB |
+| `<account>/.jmap/blobs/<blobId>.mime.json` | Persisted MIME structure, part identities, sizes and preview |
+| `<account>/.jmap/blobs/<blobId>.origin.json` | Parent message for attachment authorization |
+| `<account>/.jmap/blobs/<blobId>.part` | Legacy locator inside an original MIME message |
 | `.jmap-queue/<accountId>` | Durable discovery hint for submission accounts; not a delivery task or auth grant |
 | `.outbox/<id>.json` | SMTP outbound task and embedded preclaim |
 | `.lock` | Shared 15-second scan/renewal lease |
@@ -735,8 +740,12 @@ RFC 2047 subjects are decoded, and each subject/filename path segment is percent
 Object creation is conditional: a timestamp/name collision fails instead of overwriting data.
 Raw MIME uses `message.eml`. HTTP uploads accept a filename in `Content-Disposition`;
 without one they use `attachment.bin`, and without a subject they use `untitled`.
-Incoming attachments remain streaming views of the original MIME, so receiving a mail
-never duplicates all attachment bytes. A JMAP blob ID remains the library's content
+Incoming MIME is streamed concurrently to its original object and a parser that writes
+individual decoded parts. JSON metadata is published after successful part and MIME
+commits. First JMAP metadata reads use this record and attachment downloads read the
+part object directly. The original MIME remains for IMAP/POP3, increasing storage use.
+Legacy messages without these records retain their existing read path.
+A JMAP blob ID remains the library's content
 identifier; it no longer dictates the physical object's name. Multipart upload writes
 directly to that name, followed by a small index PUT, with no whole-object copy at commit.
 Existing objects remain readable. Stop older nodes before deploying this storage format;
@@ -744,11 +753,13 @@ they cannot read the new reference objects. Completed but unreferenced physical 
 may remain after interrupted index publication or repeated identical uploads; no automatic
 blob garbage collector is provided.
 
-SMTP uses a pinned performance fork through `go.mod replace` ([PR #312](https://github.com/emersion/go-smtp/pull/312)). Its single-file DATA reader patch adapts the cross-line scan from [uponusolutions/go-smtp](https://github.com/uponusolutions/go-smtp/blob/86ff2622fb52f86371265b74a976333ff53c10a0/internal/textsmtp/dotreader.go), retaining the existing server API, default 4 KiB input buffer, and line-length checks. POP3 directly imports the independent `github.com/Jabberwocky238/go-pop3` module; its `main` includes the performance fix and fork documentation, while `pr` submits only the patch to upstream ([PR #3](https://github.com/migadu/go-pop3/pull/3)).
+SMTP uses a pinned performance fork through `go.mod replace` ([PR #312](https://github.com/emersion/go-smtp/pull/312)). Its single-file DATA reader patch adapts the cross-line scan from [uponusolutions/go-smtp](https://github.com/uponusolutions/go-smtp/blob/86ff2622fb52f86371265b74a976333ff53c10a0/internal/textsmtp/dotreader.go), retaining the existing server API, default 4 KiB protocol buffer, and line-length checks. fma adds a reusable 1 MiB TCP input buffer below TLS to coalesce small reads. POP3 directly imports the independent `github.com/Jabberwocky238/go-pop3` module; its `main` includes the performance fix and fork documentation, while `pr` submits only the patch to upstream ([PR #3](https://github.com/migadu/go-pop3/pull/3)).
 
 POP3 v0.1.6 adds bounded ARM64 vector scanning with a portable fallback. The isolated 2 GiB writer benchmark gains another 2.04x throughput; complete-download gains remain unproven. CPU, RSS, input-shape comparisons and reproduction commands are recorded in [PERFORMANCE.md](PERFORMANCE.md).
 
-S3 upload buffers use 1 MiB blocks, grouped into 8 MiB multipart requests without concatenation. Up to four parts are active per upload, with a global 1 GiB active-buffer limit allocated on demand. Cross-account object copies use S3 CopyObject or UploadPartCopy. JMAP MIME parsing uses the pinned [streaming fork](https://github.com/Jabberwocky238/naust-jmap/commit/86f12015507c) to reuse buffers and decode blocks without a metadata or body cache.
+The task pool creates eight workers at startup; configure `FMA_STREAM_WORKERS=16` or `-stream-workers 16`. Idle workers take MIME ingestion tasks from one shared queue whose capacity equals the worker count. A full queue applies backpressure. The three 1 MiB rotating blocks are allocated only after admission. Protocol connections and S3 multipart requests retain their own concurrency. More workers allow more messages to be processed concurrently; they do not split one Base64 stream into eight parallel decoders. Cancellation and shutdown notify tasks and drain the queue; raw and decoded compression pools remain separate.
+
+S3 upload buffers use 1 MiB blocks, grouped into 8 MiB multipart requests without concatenation. Up to four parts are active per upload, with a global 1 GiB active-buffer limit allocated on demand. Cross-account object copies use S3 CopyObject or UploadPartCopy. JMAP MIME parsing uses the pinned [streaming fork](https://github.com/Jabberwocky238/naust-jmap/commit/ea60168) to reuse buffers and decode blocks. It now persists MIME metadata and decoded parts at ingestion; these are durable storage records, available on the first request after a restart. The receive/parse pipeline transfers ownership of three 1 MiB blocks. Raw and decoded streams have separate bounded compression pools to avoid mutual resource starvation.
 
 See [PERFORMANCE.md](PERFORMANCE.md) for measured throughput and the remaining limits.
 

@@ -220,6 +220,7 @@ def main():
     parser.add_argument('--repeat-jmap', action='store_true', help='repeat metadata and attachment download to separate locator reuse from first-download work')
     parser.add_argument('--seed', type=int, help='reproducible random fixture seed for paired performance comparisons')
     parser.add_argument('--jmap-first', action='store_true', help='measure the first JMAP attachment request immediately after SMTP, before IMAP/POP3 reads')
+    parser.add_argument('--stream-workers', type=int, help='override the server MIME ingestion worker count')
     args = parser.parse_args()
     # Repeat a random 1 MiB block: its period exceeds gzip's 32 KiB window.
     # Generate it outside the timed phase, keeping client memory bounded.
@@ -231,7 +232,7 @@ def main():
     with open(fals3y, 'rb') as executable:
         fals3y_sha256 = hashlib.file_digest(executable, 'sha256').hexdigest()
     fals3y_version = subprocess.run([fals3y, 'version'], capture_output=True, text=True, timeout=10)
-    results = {'jmap_first': args.jmap_first, 'fixture_seed': args.seed, 'repeat_jmap': args.repeat_jmap, 'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
+    results = {'stream_workers': args.stream_workers if args.stream_workers is not None else int(os.environ.get('FMA_STREAM_WORKERS', '8')), 'jmap_first': args.jmap_first, 'fixture_seed': args.seed, 'repeat_jmap': args.repeat_jmap, 'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
                'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                'pop3_module': json.loads(subprocess.check_output(
                    ['go', 'list', '-m', '-json', 'github.com/Jabberwocky238/go-pop3'], cwd=ROOT, text=True)),
@@ -279,6 +280,8 @@ def main():
                    'FMA_OUTBOUND_MODE': 'disabled', 'LOG_LEVEL': 'debug'}
             mail_ports = {name: free_port() for name in ['smtp', 'imaps', 'pop3s']}
             command = [str(binary), '-http', f'127.0.0.1:{port}']
+            if args.stream_workers is not None:
+                command += ['-stream-workers', str(args.stream_workers)]
             for protocol in ['smtp', 'submission', 'smtps', 'pop3', 'pop3s', 'imap', 'imaps']:
                 command += ['-' + protocol, f'127.0.0.1:{mail_ports.get(protocol, 0)}']
             with (tmp / 'fma.log').open('wb') as output:

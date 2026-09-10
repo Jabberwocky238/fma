@@ -32,4 +32,4 @@ require (
 
 replace github.com/emersion/go-smtp => github.com/Jabberwocky238/go-smtp v0.25.1-0.20260910174640-b0673510e580
 
-replace github.com/naust-mail/naust-jmap/datatypes/mail => github.com/Jabberwocky238/naust-jmap/datatypes/mail v0.3.4-0.20260910200323-86f12015507c
+replace github.com/naust-mail/naust-jmap/datatypes/mail => github.com/Jabberwocky238/naust-jmap/datatypes/mail v0.3.4-0.20260910204519-ea6016819f55

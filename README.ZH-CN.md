@@ -108,6 +108,7 @@ S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节�
 | `—` | `FMA_RELAY_TLS` | `starttls` | starttls 或 implicit |
 | `—` | `FMA_RELAY_CA_FILE` | `empty / 空` | 可选自定义 CA 的 S3 对象键 |
 | `-queue-retry` | `—` | `1m` | SMTP 投递任务初始重试间隔 |
+| `-stream-workers` | `FMA_STREAM_WORKERS` | `8` | MIME 解析任务池大小（1–128），参数优先于环境变量 |
 | `-queue` | `—` | `false` | 检查 SMTP 投递任务，不显示邮件正文 |
 | `-version` | `—` | `false` | 打印版本、commit 和发行时间；无需 S3 |
 | `-h` | `—` | `—` | 显示命令行帮助 |
@@ -128,6 +129,7 @@ S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节�
 | `FMA_CERT_KEY` | `cert.pem` | Maps to -cert / 对应 -cert |
 | `FMA_KEY_KEY` | `key.pem` | Maps to -key / 对应 -key |
 | `FMA_QUEUE_RETRY` | `1m` | Maps to -queue-retry / 对应 -queue-retry |
+| `FMA_STREAM_WORKERS` | `8` | 启动时创建的 MIME 解析 worker 数量 |
 | `FMA_SMTP_PORT` | `2525` | Loopback listener port / 回环监听端口 |
 | `FMA_SUBMISSION_PORT` | `1587` | Loopback listener port / 回环监听端口 |
 | `FMA_SMTPS_PORT` | `1465` | Loopback listener port / 回环监听端口 |
@@ -487,7 +489,10 @@ printf '%s' account | curl -f -X PUT --data-binary @- \
 | `<account>/.jmap/state.json` | Canonical mailbox metadata, indexes, state changes, UID bookkeeping, submission records and account lease / 统一邮箱元数据、索引、变更、UID、提交记录和账户租约 |
 | `<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | 流式写入的不可变 MIME 或上传附件；超过 10 MiB 使用 gzip |
 | `<account>/.jmap/blobs/<blobId>` | 命名对象及其编码、大小的小型索引；旧对象仍直接包含 MIME/blob 字节 |
-| `<account>/.jmap/blobs/<blobId>.part` | 原始 MIME 内附件的流式读取位置索引 |
+| `<account>/mail/<mail-id>/attachments/<part-id>/<escaped-filename>` | 解码后的 MIME 部件，超过 1 MiB 使用 gzip |
+| `<account>/.jmap/blobs/<blobId>.mime.json` | 持久化 MIME 结构、部件哈希、大小和预览 |
+| `<account>/.jmap/blobs/<blobId>.origin.json` | 附件权限校验所需的父邮件关系 |
+| `<account>/.jmap/blobs/<blobId>.part` | 旧邮件在原始 MIME 内的读取位置索引 |
 | `.jmap-queue/<accountId>` | Durable discovery hint for submission accounts; not a delivery task or auth grant / 提交账户发现标记，不是投递任务或认证授权 |
 | `.outbox/<id>.json` | SMTP outbound task and embedded preclaim / SMTP 外发任务及内嵌 preclaim |
 | `.lock` | Shared 15-second scan/renewal lease / 共享的 15 秒扫描与续期租约 |
@@ -497,15 +502,17 @@ printf '%s' account | curl -f -X PUT --data-binary @- \
 
 邮件物理目录 ID 使用 `subject + UTC timestamp`，时间戳精确到纳秒。
 主题先解码 RFC 2047，再与文件名分别做百分号转义；`/`、`%`、`?`、`#`、Unicode、单独的 `.` 和 `..` 不会改变路径层级，并限制各段长度。S3 条件创建保证时间戳或名称碰撞时报错，不覆盖已有内容。
-MIME 正文使用 `message.eml`；HTTP 上传可通过 `Content-Disposition` 提供附件名，未提供时使用 `attachment.bin`，无主题时使用 `untitled`。收到的附件仍从原始 MIME 流式读取，不在收信时重复存储整份附件。
+MIME 正文使用 `message.eml`；HTTP 上传可通过 `Content-Disposition` 提供附件名，未提供时使用 `attachment.bin`，无主题时使用 `untitled`。接收 MIME 时并行上传原文和解析部件，附件解码后直接流式存入独立对象，成功提交后发布 JSON 元数据。首次 JMAP 获取元数据直接读记录，首次下载直接读附件对象。保留原文供 IMAP/POP3 使用，因此增加存储用量；没有新记录的旧邮件仍走原有读取路径。
 JMAP 的 blobId 保留为库要求的内容标识，只关联小型索引，不再决定正文或附件的物理对象名。分片直接上传到命名路径，完成后只 PUT 小索引，提交时不再复制整对象。
 旧对象可继续读取。部署该存储格式前需停止旧节点，旧版本无法读取新索引。索引发布中断或重复上传相同内容后，可能留下未引用的物理对象；当前没有自动 blob 清理器。
 
-SMTP 通过 `go.mod replace` 使用固定版本的性能修复 fork（[PR #312](https://github.com/emersion/go-smtp/pull/312)）。DATA reader 的单文件补丁改编自 [uponusolutions/go-smtp](https://github.com/uponusolutions/go-smtp/blob/86ff2622fb52f86371265b74a976333ff53c10a0/internal/textsmtp/dotreader.go) 的跨行扫描，保留原有服务端 API、默认 4 KiB 输入缓冲和行长度检查。POP3 直接导入独立模块 `github.com/Jabberwocky238/go-pop3`；`main` 包含性能修复和 fork 说明，`pr` 仅向上游提交性能补丁（[PR #3](https://github.com/migadu/go-pop3/pull/3)）。
+SMTP 通过 `go.mod replace` 使用固定版本的性能修复 fork（[PR #312](https://github.com/emersion/go-smtp/pull/312)）。DATA reader 的单文件补丁改编自 [uponusolutions/go-smtp](https://github.com/uponusolutions/go-smtp/blob/86ff2622fb52f86371265b74a976333ff53c10a0/internal/textsmtp/dotreader.go) 的跨行扫描，保留原有服务端 API、默认 4 KiB 协议缓冲和行长度检查；fma 在 TLS 下方增加可复用的 1 MiB TCP 输入缓冲，合并小读取。POP3 直接导入独立模块 `github.com/Jabberwocky238/go-pop3`；`main` 包含性能修复和 fork 说明，`pr` 仅向上游提交性能补丁（[PR #3](https://github.com/migadu/go-pop3/pull/3)）。
 
 POP3 v0.1.6 增加 ARM64 向量扫描，并保留通用实现。独立 2 GiB 编码测试的吞吐量再提升 2.04 倍，但完整下载尚未验证出稳定加速。CPU、RSS、不同输入类型的对照和复现命令见 [PERFORMANCE.md](PERFORMANCE.md)。
 
-S3 上传缓冲按 1 MiB 分块，直接组合成 8 MiB 上传分片，不进行拼接复制。每次上传最多四片在途或正在填充，全局在用分片缓冲上限 1 GiB，按需分配。跨账户对象复制使用 S3 CopyObject 或 UploadPartCopy。JMAP MIME 解析使用固定版本的[流式优化 fork](https://github.com/Jabberwocky238/naust-jmap/commit/86f12015507c)，通过缓冲区复用和分块解码提速，不缓存元数据或正文。
+S3 上传缓冲按 1 MiB 分块，直接组合成 8 MiB 上传分片，不进行拼接复制。每次上传最多四片在途或正在填充，全局在用分片缓冲上限 1 GiB，按需分配。跨账户对象复制使用 S3 CopyObject 或 UploadPartCopy。JMAP MIME 解析使用固定版本的[流式优化 fork](https://github.com/Jabberwocky238/naust-jmap/commit/ea60168)，通过缓冲区复用和分块解码提速，并在写入时持久化 MIME 元数据和独立部件，重启后的首次请求即可使用。接收与解析之间轮转三个 1 MiB 缓冲块，转移所有权后才复用；原文与部件使用独立的有界压缩池，避免相互等待资源。
+
+任务池启动时创建 8 个 worker，可通过 `FMA_STREAM_WORKERS=16` 或 `-stream-workers 16` 调整。空闲 worker 从共享队列领取 MIME 解析任务，队列容量与 worker 数相同，满时接收端等待，形成背压。三个 1 MiB 轮转缓冲在任务入队后才分配；网络协议和 S3 分片仍使用各自的并发机制。增加 worker 提升多封邮件并发处理能力，不会把单个 Base64 流自动切成八份。取消和退出会通知任务并排空队列，原文与部件的压缩池隔离。
 
 实测吞吐量和当前瓶颈见 [PERFORMANCE.md](PERFORMANCE.md)。
 
