@@ -84,7 +84,7 @@ export FMA_S3_SECRET_ACCESS_KEY=local
 
 Fals3y accepts arbitrary credentials, but the SDK requires a key pair. Use real
 credentials for other S3 services; `FMA_S3_SESSION_TOKEN` supports temporary credentials.
-The binary does not load local AWS configuration files. All environment settings use the `FMA_` prefix, which is added centrally by the
+The binary does not load local AWS configuration files. Mail configuration environment settings use the `FMA_` prefix, which is added centrally by the
 configuration reader. Flags `-s3-endpoint`,
 `-s3-bucket`, and `-s3-region` override connection settings. Startup fails if the bucket
 is unavailable. Listeners bind to loopback by default; see `./fma -h` for ports.
@@ -244,3 +244,9 @@ Alias chains are resolved on each login and recipient lookup; cycles and missing
 accounts are rejected. Hidden metadata objects such as `.profile.json` are excluded
 from mail listings. Protocol logins retain the login ID separately from the root ID;
 SMTP, POP3 and IMAP do not expose an avatar/profile management API.
+
+Logging uses the global structured logger. Set `LOG_LEVEL=debug|info|warn|error`
+(default `info`); this variable has no `FMA_` prefix and is read before configuration.
+Startup validates the complete configuration before connecting to S3 or opening
+listeners, failing on missing required values and reporting warnings such as disabled
+outbound delivery. `--version` needs no S3 configuration; `--queue` only needs S3.

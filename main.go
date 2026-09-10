@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/mail"
@@ -70,6 +70,19 @@ type Config struct {
 }
 
 var config Config
+var logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+func initLogger(value string) error {
+	level := slog.LevelInfo
+	if value != "" {
+		if err := level.UnmarshalText([]byte(value)); err != nil {
+			return fmt.Errorf("invalid LOG_LEVEL: %w", err)
+		}
+	}
+	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
+	return nil
+}
 
 // Injected by Make or GoReleaser with -ldflags -X.
 var version, commit, releaseTime string
@@ -93,7 +106,7 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 		},
 		RelayAddr: getenv("RELAY_ADDR", ""), RelayUser: getenv("RELAY_USER", ""),
 		RelayPassword: getenv("RELAY_PASSWORD", ""), RelayPasswordFile: getenv("RELAY_PASSWORD_FILE", ""),
-		RelayTLS: getenv("RELAY_TLS", ""), RelayCAFile: getenv("RELAY_CA_FILE", ""),
+		RelayTLS: getenv("RELAY_TLS", "starttls"), RelayCAFile: getenv("RELAY_CA_FILE", ""),
 	}
 	// Flags override environment values, which override the defaults below.
 	f := flag.NewFlagSet("fma", flag.ContinueOnError)
@@ -118,52 +131,121 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	if err := f.Parse(args); err != nil {
 		return Config{}, err
 	}
-	// Queue inspection does not need an outbound transport.
-	if c.ShowQueue || c.ShowVersion {
-		return c, nil
-	}
-	if c.QueueRetry <= 0 {
-		return Config{}, fmt.Errorf("queue-retry must be positive")
-	}
-	switch c.OutboundMode {
-	case "", "disabled", "direct":
-	case "relay":
-		if _, _, err := net.SplitHostPort(c.RelayAddr); err != nil {
-			return Config{}, fmt.Errorf("FMA_RELAY_ADDR must be host:port: %w", err)
-		}
-		if c.RelayUser == "" {
-			return Config{}, fmt.Errorf("FMA_RELAY_USER is required")
-		}
-		if c.RelayTLS == "" {
-			c.RelayTLS = "starttls"
-		}
-		if c.RelayTLS != "starttls" && c.RelayTLS != "implicit" {
-			return Config{}, fmt.Errorf("FMA_RELAY_TLS must be starttls or implicit")
-		}
-		if c.RelayPassword == "" && c.RelayPasswordFile == "" {
-			return Config{}, fmt.Errorf("relay password is required")
-		}
-	default:
-		return Config{}, fmt.Errorf("outbound must be disabled, direct or relay")
+	if f.NArg() != 0 {
+		return Config{}, fmt.Errorf("unexpected positional arguments")
 	}
 	return c, nil
 }
 
+// Validate the complete startup snapshot before opening S3 or any listener.
+func checkConfig(c Config) error {
+	if c.ShowVersion {
+		return nil
+	}
+	if c.S3.Bucket == "" || strings.ContainsAny(c.S3.Bucket, "/\\ \t\r\n") {
+		return fmt.Errorf("FMA_S3_BUCKET must name an existing bucket")
+	}
+	if c.S3.Region == "" {
+		return fmt.Errorf("FMA_S3_REGION is required")
+	}
+	if c.S3.AccessKey == "" || c.S3.SecretKey == "" {
+		return fmt.Errorf("FMA_S3_ACCESS_KEY_ID and FMA_S3_SECRET_ACCESS_KEY are required")
+	}
+	if c.S3.Endpoint != "" {
+		u, err := url.Parse(c.S3.Endpoint)
+		if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("FMA_S3_ENDPOINT must be an HTTP(S) URL without credentials, query or fragment")
+		}
+	}
+	// Queue inspection does not need an outbound transport.
+	if c.ShowQueue {
+		return nil
+	}
+	if c.Domain == "" || len(c.Domain) > 253 {
+		return fmt.Errorf("domain is required and must be a DNS name")
+	}
+	for _, label := range strings.Split(c.Domain, ".") {
+		if !regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`).MatchString(label) {
+			return fmt.Errorf("invalid mail domain")
+		}
+	}
+	if strings.TrimSpace(c.CertFile) == "" || strings.TrimSpace(c.KeyFile) == "" {
+		return fmt.Errorf("cert and key S3 object keys are required")
+	}
+	seen := map[string]bool{}
+	for _, addr := range []string{c.SMTPAddr, c.SubmissionAddr, c.SMTPSAddr, c.POP3Addr, c.POP3SAddr, c.IMAPAddr, c.IMAPSAddr, c.HTTPAddr} {
+		if err := checkAddress(addr); err != nil {
+			return err
+		}
+		_, port, _ := net.SplitHostPort(addr)
+		if seen[addr] && port != "0" {
+			return fmt.Errorf("duplicate listener address %q", addr)
+		}
+		seen[addr] = true
+	}
+	if c.QueueRetry <= 0 {
+		return fmt.Errorf("queue-retry must be positive")
+	}
+	switch c.OutboundMode {
+	case "", "disabled", "direct":
+	case "relay":
+		if err := checkAddress(c.RelayAddr); err != nil {
+			return fmt.Errorf("FMA_RELAY_ADDR must be host:port: %w", err)
+		}
+		if c.RelayUser == "" {
+			return fmt.Errorf("FMA_RELAY_USER is required")
+		}
+		if c.RelayTLS != "starttls" && c.RelayTLS != "implicit" {
+			return fmt.Errorf("FMA_RELAY_TLS must be starttls or implicit")
+		}
+		if c.RelayPassword == "" && c.RelayPasswordFile == "" {
+			return fmt.Errorf("relay password is required")
+		}
+	default:
+		return fmt.Errorf("outbound must be disabled, direct or relay")
+	}
+	return nil
+}
+
+func checkAddress(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid host:port address %q: %w", addr, err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("invalid port in %q", addr)
+	}
+	return nil
+}
+
 func main() {
+	if err := initLogger(os.Getenv("LOG_LEVEL")); err != nil {
+		logger.Error("logging configuration failed", "error", err)
+		os.Exit(1)
+	}
 	var err error
 	config, err = loadConfig(os.Args[1:], os.Getenv)
 	if errors.Is(err, flag.ErrHelp) {
 		return
 	}
 	if err != nil {
-		log.Fatal(err)
+		logger.Error("startup failed", "error", err)
+		os.Exit(1)
 	}
 	if err = run(); err != nil {
-		log.Fatal(err)
+		logger.Error("startup failed", "error", err)
+		os.Exit(1)
 	}
 }
 
 func run() error {
+	if err := checkConfig(config); err != nil {
+		return err
+	}
+	if !config.ShowVersion && !config.ShowQueue && (config.OutboundMode == "" || config.OutboundMode == "disabled") {
+		logger.Warn("outbound delivery is disabled")
+	}
 	if config.ShowVersion {
 		fmt.Printf("fma %s\ncommit: %s\nrelease-time: %s\n", version, commit, releaseTime)
 		return nil
@@ -229,6 +311,7 @@ func run() error {
 	var jobs []func() error
 	for i := 0; i < 3; i++ {
 		s := smtp.NewServer(smtpBackend{requireAuth: i != 0})
+		s.ErrorLog = slog.NewLogLogger(logger.Handler(), slog.LevelError)
 		s.Domain = "mail." + config.Domain
 		s.TLSConfig = cfg
 		s.MaxMessageBytes = 25 << 20
@@ -240,11 +323,12 @@ func run() error {
 		jobs = append(jobs, func() error { return s.Serve(l) })
 	}
 	im := server.New(imapBackend{})
+	im.ErrorLog = slog.NewLogLogger(logger.Handler(), slog.LevelError)
 	im.Enable(mailboxExtension{})
 	im.TLSConfig = cfg
 	im.MaxLiteralSize = 25 << 20
 	im.AutoLogout = 30 * time.Minute
-	web := &http.Server{ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	web := &http.Server{ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError), ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "fma mail server: SMTP, POP3S and IMAPS")
 	})}
@@ -254,7 +338,7 @@ func run() error {
 	jobs = append(jobs, func() error { return serveQueue(ctx) })
 	go serveGroup(jobs...)
 	go serveGroup(func() error { return pops.Serve(listeners[3]) }, func() error { return im.Serve(listeners[4]) }, func() error { return web.Serve(listeners[5]) }, func() error { return pop.Serve(listeners[6]) }, func() error { return im.Serve(listeners[7]) })
-	log.Print("SMTP, submission, POP3/STLS, POP3S, IMAP/STARTTLS, IMAPS and HTTP backends ready")
+	logger.Info("SMTP, submission, POP3/STLS, POP3S, IMAP/STARTTLS, IMAPS and HTTP backends ready")
 	select {
 	case <-ctx.Done():
 		err = nil
@@ -339,21 +423,6 @@ type s3Bucket struct {
 }
 
 func connectBucket(c S3Config) (*s3Bucket, error) {
-	if c.Bucket == "" || strings.ContainsAny(c.Bucket, "/\\") {
-		return nil, fmt.Errorf("s3-bucket must name an existing bucket")
-	}
-	if c.Endpoint != "" {
-		u, err := url.Parse(c.Endpoint)
-		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return nil, fmt.Errorf("s3-endpoint must be an HTTP(S) URL without credentials, query or fragment")
-		}
-	}
-	if c.AccessKey == "" || c.SecretKey == "" {
-		return nil, fmt.Errorf("FMA_S3_ACCESS_KEY_ID and FMA_S3_SECRET_ACCESS_KEY are required (any values for Fals3y)")
-	}
-	if c.Region == "" {
-		c.Region = "us-east-1"
-	}
 	client := s3.NewFromConfig(aws.Config{
 		Region:           c.Region,
 		Credentials:      credentials.NewStaticCredentialsProvider(c.AccessKey, c.SecretKey, c.SessionToken),
@@ -579,7 +648,7 @@ func (l *bucketLease) release(now time.Time) {
 	data, _ := json.Marshal(current)
 	// An expired record remains so release cannot race a new owner via DELETE.
 	if err := l.versions.Swap(".lock", data, etag); err != nil && !errors.Is(err, fs.ErrExist) {
-		log.Printf("release bucket lease: %v", err)
+		logger.Error(fmt.Sprintf("release bucket lease: %v", err))
 	}
 }
 func (l *bucketLease) keepAlive(ctx context.Context, cancel context.CancelFunc) <-chan struct{} {
@@ -1025,7 +1094,7 @@ func (u *imapUser) DeleteMailbox(name string) error {
 		}
 	}
 	if err != nil {
-		log.Printf("deleted folder cleanup user=%s name=%q: %v", u.name, name, err)
+		logger.Error(fmt.Sprintf("deleted folder cleanup user=%s name=%q: %v", u.name, name, err))
 	}
 	return nil
 }
@@ -1148,7 +1217,7 @@ type smtpSession struct {
 func (b smtpBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	_, encrypted := c.TLSConnectionState()
 	peer := c.Conn().RemoteAddr().String()
-	log.Printf("SMTP session peer=%q hello=%q tls=%t submission=%t", peer, c.Hostname(), encrypted, b.requireAuth)
+	logger.Debug(fmt.Sprintf("SMTP session peer=%q hello=%q tls=%t submission=%t", peer, c.Hostname(), encrypted, b.requireAuth))
 	return &smtpSession{requireAuth: b.requireAuth, peer: peer}, nil
 }
 func (s *smtpSession) AuthMechanisms() []string { return []string{sasl.Plain, sasl.Login} }
@@ -1157,7 +1226,7 @@ func (s *smtpSession) Auth(mechanism string) (sasl.Server, error) {
 		return &loginServer{authenticate: func(u, p string) error { return s.authenticate("", u, p) }}, nil
 	}
 	if mechanism != sasl.Plain {
-		log.Printf("SMTP auth unsupported peer=%q mechanism=%q", s.peer, mechanism)
+		logger.Warn(fmt.Sprintf("SMTP auth unsupported peer=%q mechanism=%q", s.peer, mechanism))
 		return nil, smtp.ErrAuthUnsupported
 	}
 	return sasl.NewPlainServer(s.authenticate), nil
@@ -1171,16 +1240,16 @@ func (s *smtpSession) authenticate(identity, u, p string) error {
 		}
 	}
 	if err != nil {
-		log.Printf("SMTP auth failed peer=%q user=%q", s.peer, localUser(u))
+		logger.Error(fmt.Sprintf("SMTP auth failed peer=%q user=%q", s.peer, localUser(u)))
 		return smtp.ErrAuthFailed
 	}
 	s.loginID, s.user = account.LoginID, account.RootID
-	log.Printf("SMTP auth accepted peer=%q login=%q root=%q", s.peer, s.loginID, s.user)
+	logger.Info(fmt.Sprintf("SMTP auth accepted peer=%q login=%q root=%q", s.peer, s.loginID, s.user))
 	return nil
 }
 func (s *smtpSession) Mail(from string, _ *smtp.MailOptions) error {
 	if s.requireAuth && s.user == "" {
-		log.Printf("SMTP MAIL rejected peer=%q code=530 reason=authentication-required", s.peer)
+		logger.Warn(fmt.Sprintf("SMTP MAIL rejected peer=%q code=530 reason=authentication-required", s.peer))
 		return &smtp.SMTPError{Code: 530, Message: "authentication required"}
 	}
 	if s.user != "" {
@@ -1238,7 +1307,7 @@ func (s *smtpSession) Data(r io.Reader) error {
 	if err = queueMail(s.user, s.from, s.recipients, s.remote, b); err != nil {
 		return fmt.Errorf("mail storage: %w", err)
 	}
-	log.Printf("SMTP DATA accepted peer=%q user=%q local=%d remote=%d", s.peer, s.user, len(s.recipients), len(s.remote))
+	logger.Info(fmt.Sprintf("SMTP DATA accepted peer=%q user=%q local=%d remote=%d", s.peer, s.user, len(s.recipients), len(s.remote)))
 	return nil
 }
 func (s *smtpSession) Reset()      { s.recipients = nil; s.remote = nil; s.from = "" }
@@ -1282,7 +1351,7 @@ var popLocks sync.Map
 
 // Each listener has its own library Server, including connection shutdown.
 func newPOPServer(cfg *tls.Config) *pop3server.Server {
-	return pop3server.New(pop3server.Options{
+	return pop3server.New(pop3server.Options{Logger: logger,
 		TLSConfig: cfg, Greeting: "fma POP3 ready", StrictSessionErrors: true,
 		IdleTimeout: 10 * time.Minute, WriteTimeout: time.Minute, MaxLineLength: 4096,
 		NewSession: func(*pop3server.Conn) (pop3server.Session, error) {
@@ -1504,7 +1573,7 @@ func (u *imapUser) ListMailboxes(subscribed bool) ([]backend.Mailbox, error) {
 			boxes = append(boxes, &inbox{user: u.name, name: name, meta: meta})
 		}
 	}
-	log.Printf("IMAP LIST user=%s folders=%d", u.name, len(boxes))
+	logger.Debug(fmt.Sprintf("IMAP LIST user=%s folders=%d", u.name, len(boxes)))
 	return boxes, nil
 }
 func (u *imapUser) GetMailbox(name string) (backend.Mailbox, error) {
@@ -1523,7 +1592,7 @@ func (u *imapUser) GetMailbox(name string) (backend.Mailbox, error) {
 	}
 	b := &inbox{user: u.name, name: name, meta: meta}
 	b.Mailbox, b.next, err = mailboxSnapshot(b.key())
-	log.Printf("IMAP mailbox user=%s name=%q messages=%d", u.name, name, len(b.Messages))
+	logger.Debug(fmt.Sprintf("IMAP mailbox user=%s name=%q messages=%d", u.name, name, len(b.Messages)))
 	return b, err
 }
 func (b *inbox) key() string  { return b.meta.Key }
@@ -1825,7 +1894,7 @@ func queueMail(user, from string, local, remote []string, body []byte) error {
 			return err
 		}
 		if err := saveSent(user, body); err != nil {
-			log.Printf("Sent archive failed user=%s: %v", user, err)
+			logger.Error(fmt.Sprintf("Sent archive failed user=%s: %v", user, err))
 		}
 		return nil
 	}
@@ -1848,7 +1917,7 @@ func queueMail(user, from string, local, remote []string, body []byte) error {
 	if err := writeJSON(path.Join(outbox, job.ID+".json"), job); err != nil {
 		return err
 	}
-	log.Printf("outbound queued id=%s recipients=%d", job.ID, len(remote))
+	logger.Info(fmt.Sprintf("outbound queued id=%s recipients=%d", job.ID, len(remote)))
 	return nil
 }
 
@@ -1899,7 +1968,7 @@ func (claim *claimedTask) process(ctx context.Context) error {
 		if err := claim.save(ctx); err != nil {
 			return err
 		}
-		log.Printf("outbound id=%s recipient=%s state=%s attempt=%d error=%q", job.ID, r.Address, r.State, r.Attempts, r.Error)
+		logger.Info(fmt.Sprintf("outbound id=%s recipient=%s state=%s attempt=%d error=%q", job.ID, r.Address, r.State, r.Attempts, r.Error))
 	}
 	var failed []string
 	pending := false
@@ -2040,7 +2109,7 @@ func scanTasks(ctx context.Context, lease *bucketLease, slots chan struct{}, wor
 		}
 		claim, err := preclaimTask(key, lease.owner(), time.Now())
 		if err != nil && !errors.Is(err, fs.ErrExist) && !errors.Is(err, fs.ErrNotExist) {
-			log.Printf("preclaim %s: %v", key, err)
+			logger.Error(fmt.Sprintf("preclaim %s: %v", key, err))
 		}
 		if claim == nil {
 			continue
@@ -2052,7 +2121,7 @@ func scanTasks(ctx context.Context, lease *bucketLease, slots chan struct{}, wor
 			defer workers.Done()
 			defer func() { <-slots }()
 			if err := execute(claim); err != nil {
-				log.Printf("task %s: %v", claim.key, err)
+				logger.Error(fmt.Sprintf("task %s: %v", claim.key, err))
 			}
 		}()
 	}
@@ -2093,13 +2162,13 @@ func serveQueue(ctx context.Context) error {
 					leaseCtx, stop = context.WithCancel(ctx)
 					done = lease.keepAlive(leaseCtx, stop)
 				} else if !errors.Is(err, fs.ErrExist) {
-					log.Printf("queue lease: %v", err)
+					logger.Error(fmt.Sprintf("queue lease: %v", err))
 				}
 			}
 			if lease != nil {
 				full, err := scanTasks(ctx, lease, slots, &workers, func(c *claimedTask) error { return c.execute(ctx) })
 				if err != nil {
-					log.Printf("queue scan: %v", err)
+					logger.Error(fmt.Sprintf("queue scan: %v", err))
 				}
 				if full || err != nil {
 					release()

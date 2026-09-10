@@ -13,6 +13,7 @@ import (
 	"github.com/emersion/go-imap"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http/httptest"
 	"os"
@@ -367,6 +368,15 @@ func TestConfigRelaySnapshot(t *testing.T) {
 }
 
 func TestConfigValidationAndQueue(t *testing.T) {
+	loadConfig := func(args []string, env func(string) string) (Config, error) {
+		c, err := loadConfig(args, env)
+		if err == nil {
+			c.S3 = S3Config{Bucket: "test", Region: "us-east-1", AccessKey: "test", SecretKey: "test"}
+			err = checkConfig(c)
+		}
+		return c, err
+	}
+
 	outboundTestDir(t)
 	base := map[string]string{"FMA_OUTBOUND_MODE": "relay", "FMA_RELAY_ADDR": "smtp.example.org:587", "FMA_RELAY_USER": "user", "FMA_RELAY_PASSWORD": "secret"}
 	for _, tc := range []struct{ key, value string }{
@@ -629,7 +639,7 @@ func TestS3StorageReloadAndPagination(t *testing.T) {
 	}
 }
 func TestMissingOrUnavailableBucket(t *testing.T) {
-	if _, err := connectBucket(S3Config{}); err == nil {
+	if err := checkConfig(defaultConfig()); err == nil {
 		t.Fatal("missing bucket accepted")
 	}
 	server := httptest.NewServer(nil)
@@ -1102,5 +1112,49 @@ func TestInvalidAliasesFailClosed(t *testing.T) {
 	checkError(t, objects.Put("support/.alias", []byte("sales")))
 	if authenticate("sales", "secret") {
 		t.Fatal("alias cycle accepted")
+	}
+}
+
+func TestStartupConfigValidation(t *testing.T) {
+	valid := defaultConfig()
+	valid.S3 = S3Config{Bucket: "test", Region: "us-east-1", AccessKey: "key", SecretKey: "secret"}
+	checkError(t, checkConfig(valid))
+	for _, change := range []func(*Config){
+		func(c *Config) { c.S3.Bucket = "" }, func(c *Config) { c.S3.Region = "" },
+		func(c *Config) { c.S3.AccessKey = "" }, func(c *Config) { c.S3.SecretKey = "" },
+		func(c *Config) { c.S3.Endpoint = "ftp://localhost" }, func(c *Config) { c.Domain = "" },
+		func(c *Config) { c.CertFile = "" }, func(c *Config) { c.KeyFile = "" },
+		func(c *Config) { c.SMTPAddr = "localhost:99999" }, func(c *Config) { c.IMAPAddr = c.SMTPAddr },
+	} {
+		c := valid
+		change(&c)
+		if checkConfig(c) == nil {
+			t.Fatal("invalid startup configuration accepted")
+		}
+	}
+	checkError(t, checkConfig(Config{ShowVersion: true}))
+	c := valid
+	c.ShowQueue = true
+	c.Domain = ""
+	c.OutboundMode = "invalid"
+	checkError(t, checkConfig(c))
+}
+
+func TestLogLevelFiltering(t *testing.T) {
+	old := logger
+	t.Cleanup(func() { logger = old; slog.SetDefault(old) })
+	for _, tc := range []struct {
+		value string
+		level slog.Level
+	}{{"", slog.LevelInfo}, {"DEBUG", slog.LevelDebug}, {"info", slog.LevelInfo}, {"warn", slog.LevelWarn}, {"error", slog.LevelError}} {
+		checkError(t, initLogger(tc.value))
+		for _, level := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
+			if logger.Enabled(context.Background(), level) != (level >= tc.level) {
+				t.Fatalf("incorrect filtering for %q", tc.value)
+			}
+		}
+	}
+	if initLogger("invalid") == nil {
+		t.Fatal("invalid log level accepted")
 	}
 }
