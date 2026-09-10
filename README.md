@@ -136,7 +136,7 @@ Command-line values override the corresponding environment variables, then defau
 | `—` | `FMA_RELAY_TLS` | `starttls` | starttls or implicit |
 | `—` | `FMA_RELAY_CA_FILE` | `empty` | Optional CA certificate object key in S3 |
 | `-queue-retry` | `—` | `1m` | Initial retry delay for SMTP delivery jobs |
-| `-stream-workers` | `FMA_STREAM_WORKERS` | `8` | MIME ingestion workers (1–128); flag overrides environment |
+| `-stream-workers` | `FMA_STREAM_WORKERS` | `4` | MIME ingestion workers (1–128); flag overrides environment |
 | `-queue` | `—` | `false` | Inspect SMTP delivery jobs without message bodies |
 | `-version` | `—` | `false` | Print version, commit and release time; no S3 needed |
 | `-h` | `—` | `—` | Print command-line help |
@@ -157,7 +157,7 @@ The generator also reads the table below. S3, relay, outbound and logging enviro
 | `FMA_CERT_KEY` | `cert.pem` | Maps to -cert |
 | `FMA_KEY_KEY` | `key.pem` | Maps to -key |
 | `FMA_QUEUE_RETRY` | `1m` | Maps to -queue-retry |
-| `FMA_STREAM_WORKERS` | `8` | MIME ingestion workers created at startup |
+| `FMA_STREAM_WORKERS` | `4` | MIME ingestion workers created at startup |
 | `FMA_SMTP_PORT` | `2525` | Loopback listener port |
 | `FMA_SUBMISSION_PORT` | `1587` | Loopback listener port |
 | `FMA_SMTPS_PORT` | `1465` | Loopback listener port |
@@ -757,7 +757,7 @@ SMTP uses a pinned performance fork through `go.mod replace` ([PR #312](https://
 
 POP3 v0.1.6 adds bounded ARM64 vector scanning with a portable fallback. The isolated 2 GiB writer benchmark gains another 2.04x throughput; complete-download gains remain unproven. CPU, RSS, input-shape comparisons and reproduction commands are recorded in [PERFORMANCE.md](PERFORMANCE.md).
 
-The task pool creates eight workers at startup; configure `FMA_STREAM_WORKERS=16` or `-stream-workers 16`. Idle workers take MIME ingestion tasks from one shared queue whose capacity equals the worker count. A full queue applies backpressure. The three 1 MiB rotating blocks are allocated only after admission. Protocol connections and S3 multipart requests retain their own concurrency. More workers allow more messages to be processed concurrently; they do not split one Base64 stream into eight parallel decoders. Cancellation and shutdown notify tasks and drain the queue; raw and decoded compression pools remain separate.
+The task pool creates four workers at startup; configure `FMA_STREAM_WORKERS=16` or `-stream-workers 16`. Idle workers take MIME ingestion tasks from one shared queue whose capacity equals the worker count. A full queue applies backpressure. The three 1 MiB rotating blocks are allocated only after admission. Protocol connections and S3 multipart requests retain their own concurrency. More workers allow more messages to be processed concurrently; they do not split one Base64 stream into eight parallel decoders. Cancellation and shutdown notify tasks and drain the queue; raw and decoded compression pools remain separate.
 
 S3 upload buffers use 1 MiB blocks, grouped into 8 MiB multipart requests without concatenation. Up to four parts are active per upload, with a global 1 GiB active-buffer limit allocated on demand. Cross-account object copies use S3 CopyObject or UploadPartCopy. JMAP MIME parsing uses the pinned [streaming fork](https://github.com/Jabberwocky238/naust-jmap/commit/ea60168) to reuse buffers and decode blocks. It now persists MIME metadata and decoded parts at ingestion; these are durable storage records, available on the first request after a restart. The receive/parse pipeline transfers ownership of three 1 MiB blocks. Raw and decoded streams have separate bounded compression pools to avoid mutual resource starvation.
 

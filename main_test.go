@@ -2332,7 +2332,7 @@ func TestMIMEStreamBlocksOwnershipAndCancellation(t *testing.T) {
 func TestStreamWorkerConfiguration(t *testing.T) {
 	c, err := loadConfig(nil, func(string) string { return "" })
 	checkError(t, err)
-	if c.StreamWorkers != 8 {
+	if c.StreamWorkers != 4 {
 		t.Fatal("default worker count")
 	}
 	env := func(k string) string {

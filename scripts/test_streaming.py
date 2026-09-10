@@ -232,7 +232,7 @@ def main():
     with open(fals3y, 'rb') as executable:
         fals3y_sha256 = hashlib.file_digest(executable, 'sha256').hexdigest()
     fals3y_version = subprocess.run([fals3y, 'version'], capture_output=True, text=True, timeout=10)
-    results = {'stream_workers': args.stream_workers if args.stream_workers is not None else int(os.environ.get('FMA_STREAM_WORKERS', '8')), 'jmap_first': args.jmap_first, 'fixture_seed': args.seed, 'repeat_jmap': args.repeat_jmap, 'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
+    results = {'stream_workers': args.stream_workers if args.stream_workers is not None else int(os.environ.get('FMA_STREAM_WORKERS', '4')), 'jmap_first': args.jmap_first, 'fixture_seed': args.seed, 'repeat_jmap': args.repeat_jmap, 'bytes': size, 'platform': os.uname().sysname + ' ' + os.uname().machine,
                'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                'pop3_module': json.loads(subprocess.check_output(
                    ['go', 'list', '-m', '-json', 'github.com/Jabberwocky238/go-pop3'], cwd=ROOT, text=True)),

@@ -1375,3 +1375,82 @@ Final `main.go` SHA-256: `8d0e9a5adbb4f661633326862d1e9b8f1c1c65dc9b477dae0d9177
 | workers-8-compressed | `0bbc387e5ae7fd1fb402cf4f5e5d77032c54a4fecf4a0b5bf7ad73ff0bb668e6` |
 
 Final validation: **`make test` and `make build` passed**, including race, native S3, SMTP STARTTLS/SMTPS, IMAP/POP3, JMAP account isolation and restart checks. The published fork passed `go test -race ./...`; its additional required-sink and metadata tests are committed with the library. Local validation records are `/tmp/fma-workers-full-tests.log`, `/tmp/fma-workers-full-build.log` and `/tmp/fma-pipeline-library-tests.log`. Final reports are `/tmp/fma-workers-final-{1,2,compressed}.json`. No upstream SMTP PR was modified.
+
+## Four default workers and the remaining SMTP critical path (2026-09-10)
+
+The default MIME worker count is now **4**, including startup workers and their dependent part pools. `FMA_STREAM_WORKERS` and `-stream-workers` still accept 1–128, with flags taking precedence. The benchmark script and both READMEs use the same default; the earlier eight-worker measurements above remain historical results. The configurable eight-way dispatch regression is retained.
+
+Two fresh, unprofiled 2 GiB runs used the default without an explicit worker flag: SMTP **4.313 / 4.343 s**, mean **4.328 s**; metadata **0.004 / 0.004 s**; first attachment download **0.904 / 0.895 s**, mean **0.8995 s**. The earlier eight-worker SMTP mean was 4.2845 s. This roughly 1% difference is not evidence that worker count controls single-message latency. Both normal runs passed content checks, the 256 MiB RSS assertion and interruption checks.
+
+### Measured wall-clock breakdown
+
+Temporary Go overlays instrumented the existing receiver, parser and writers; profiling hooks were not added to production code. The successful timing-only repeat measured **4.306 s SMTP DATA**. The receiver spends its time in the following sequential operations; gzip includes lower-level object writes and backpressure, and its child waits must not be added again. These are elapsed intervals around calls, including scheduling delays, not isolated CPU costs.
+
+| Receiver operation | Elapsed s |
+| --- | ---: |
+| Protocol input `Read` (network, SMTP DATA framing and line checks) | 2.646418 |
+| Original MIME SHA-256 in `jmapBlobWriter.Write` | 1.030694 |
+| Original MIME `gzip.Write`, including lower-level writes | 0.544498 |
+| Wait for a reusable receiver block | 0.014864 |
+| Send a filled block to the parser queue | 0.002526 |
+| Receiver total, including remaining overhead | 4.241502 |
+
+The parser runs **concurrently** for **4.274211 s**, including **0.224711 s** waiting for input. Task admission/start waits only **0.000017 s**. Attachment Write calls accumulate **0.426282 s**, with **0.029883 s** for final part Commit. Once the parser finishes, final original-MIME commit plus metadata publication takes **0.009679 s**. The earlier CPU-profile run independently measured reception **4.260854 s**, parser **4.287204 s**, original commit **0.009824 s** and delivery/import **0.012389 s**. Adding parser duration to receiver duration would double-count overlapping work.
+
+S3 backpressure is small in the timing repeat: original-MIME part-slot waits total **0.025666 s** and global-buffer waits **0.000245 s**; attachment part-slot waits **0.000082 s**, global-buffer waits **0.000168 s**. The first timing attempt measured original slot waits **0.004622 s**. This does not support increasing worker count, multipart concurrency or the 1 GiB active buffer budget as the main fix for this single transfer.
+
+The physical work is larger than a raw 2 GiB upload: original MIME stores **2,938,601,966 bytes**, decoded attachment **2,147,647,513 bytes**, plus the small text part and metadata—about **4.74 GiB** written to S3. BestSpeed gzip saves only about 0.002% of this high-entropy MIME fixture. This byte count explains why comparing SMTP directly with one raw-object upload is incomplete; it does not, by itself, establish a storage-hardware throughput limit.
+
+### Hot functions and separate hash consumers
+
+The four-worker SMTP CPU profile covers **4.41 s** and **10.93 CPU-seconds** of samples. Receiver-labeled tasks and their children account for 5.89 sampled CPU-seconds; parser-labeled tasks and children account for 3.27. The labels include concurrent S3 workers and therefore are not each stage's elapsed duration.
+
+| Function / consumer | Flat CPU s | Cumulative CPU s | Meaning |
+| --- | ---: | ---: | --- |
+| `smtp.(*lineLimitReader).Read` | 0.75 | 2.99 | Its own byte-wise line checks plus downstream reads |
+| `smtp.(*dataReader).Read` | 0.00 sampled | 3.16 | Framing chain, including the line reader and socket |
+| `message.(*base64Filter).fill` | 0.70 | 1.03 | MIME Base64 filtering and its callees |
+| `base64.(*Encoding).Decode` | 0.49 | 0.55 | Base64 decoding |
+| `sha256.blockSHA2` | 1.80 | 1.80 | All SHA-256 consumers combined |
+| `runtime.memmove` | 0.37 | 0.37 | Actual sampled copy work |
+| `syscall.syscall` | 3.27 | 3.27 | System-call samples across all paths, not call counts |
+
+SHA-256 has **three different consumers**: original MIME identity contributes about **0.41 sampled CPU-seconds**, parser part identity **0.35**, and hashing reached through `io.copyBuffer` **1.04**. The AWS SDK's `ComputePayloadSHA256.HandleFinalize` chain accumulates **1.17 CPU-seconds**, including its callees. Inspection of AWS core v1.41.5 confirms that the HTTP S3 path hashes each request body and rewinds it before transmission; its dynamic signing middleware chooses unsigned payloads for HTTPS. These request hashes are distinct from the content IDs, so the earlier general statement that all SHA-256 work belongs to attachment identity was incomplete. The per-part signing work occurs in concurrent upload workers: 1.17 CPU-seconds cannot simply be subtracted from 4.3 seconds of latency. Request-signing semantics were not changed in this investigation. Source: [AWS SigV4 middleware v1.41.5](https://github.com/aws/aws-sdk-go-v2/blob/v1.41.5/aws/signer/v4/middleware.go).
+
+The next code-level targets are the SMTP line-limit scan and original-MIME hashing on the receiver path, together with filtering/decoding on the parallel parser path. Both paths remain busy until near the end. Queue startup, final storage commit and Email import are already too small to explain the remaining seconds; optimizing only one branch may expose the other as the limiting branch.
+
+### Results, failures and provenance
+
+All runs below use seed 20260910, 2,147,483,648 decoded attachment bytes, 2,938,662,361 MIME bytes, and JMAP before IMAP/POP3 reads. Dependencies remain mail fork `v0.3.4-0.20260910204519-ea6016819f55`, SMTP fork `b0673510e580`, POP3 v0.1.6, AWS core v1.41.5 / S3 v1.97.3, Go 1.25.3, Apple M4, and Fals3y 0.3.1-dev.b8e48bf. CPU/RSS measure fma alone.
+
+| Run | Raw up s | Raw down s | SMTP s | IMAP down s | APPEND s | POP3 s | JMAP metadata s | JMAP down s | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| workers4-1 | 1.878 | 0.868 | 4.313 | 1.916 | 4.442 | 1.816 | 0.004 | 0.904 | 239.60938 |
+| workers4-2 | 1.879 | 0.877 | 4.343 | 2.004 | 4.420 | 1.786 | 0.004 | 0.895 | 233.56250 |
+| workers4-profile | 1.994 | 0.885 | 4.419 | 1.915 | 4.392 | 1.870 | 0.005 | 0.894 | 241.96875 |
+| workers4-timings-failed | 1.985 | 0.870 | 4.292 | 1.999 | 4.413 | 1.844 | 0.005 | 0.886 | 256.15625 |
+| workers4-timings-retry | 1.896 | 0.878 | 4.306 | 1.998 | 4.395 | 1.767 | 0.004 | 0.890 | 240.67188 |
+
+The first timing-only attempt failed the **256 MiB** whole-run RSS assertion at **256.15625 MiB** in the later POP3 phase; SMTP itself peaked at **211.53125 MiB**. Its content-transfer stages finished, but the subsequent interruption check was not reached. It is retained as a failed diagnostic, not included in passing latency means. Repeating the same instrumented source passed at **240.671875 MiB** peak. These samples do not establish a hard whole-process RSS bound. The existing 1 GiB limit applies to active S3 part capacity.
+
+| Run | SMTP start UTC | SMTP end UTC | SMTP CPU s / average % | SMTP peak MiB |
+| --- | --- | --- | ---: | ---: |
+| workers4-1 | 2026-09-10T20:56:18.798383Z | 2026-09-10T20:56:23.111817Z | 11.760 / 272.64% | 189.54688 |
+| workers4-2 | 2026-09-10T20:57:00.098039Z | 2026-09-10T20:57:04.441436Z | 11.810 / 271.91% | 206.04688 |
+| workers4-profile | 2026-09-10T20:56:39.606076Z | 2026-09-10T20:56:44.025338Z | 11.830 / 267.69% | 184.60938 |
+| workers4-timings-failed | 2026-09-10T20:59:08.515542Z | 2026-09-10T20:59:12.807108Z | 11.720 / 273.09% | 211.53125 |
+| workers4-timings-retry | 2026-09-10T21:01:07.016840Z | 2026-09-10T21:01:11.322727Z | 11.690 / 271.49% | 203.01562 |
+
+The first two rows have no source overlay. The CPU profile is `/tmp/fma-workers4-smtp.cpu`; other diagnostics are `/tmp/fma-workers4-profile.json`, `/tmp/fma-workers4-timings-failed.json` and `/tmp/fma-workers4-timings-retry.json`, with corresponding logs. The failed JSON was reconstructed from the benchmark's emitted assertion data and server log because its normal success-report path was not reached. Tables retain the results without embedding logs or probe code.
+
+Normal-run application SHA-256: `6dc9fa3776c7ee308703f543f51f57fb3ab7b3874ed21cb0e4e4f0a3a55acd3c`. Benchmarks record base checkout `ed6a3d57be9d39aab46604a49f98c16b17855d67` plus the then-uncommitted default-worker change.
+
+| Run | Executable SHA-256 |
+| --- | --- |
+| workers4-1 | `ab301cb39fd761e9daec21563a09507650456549246f576eb095d8729e8941b8` |
+| workers4-2 | `ab301cb39fd761e9daec21563a09507650456549246f576eb095d8729e8941b8` |
+| workers4-profile | `a5734ae3dc0039655c1c98a3cdcef43f0dea1b76fcb2d6dc554f10d7ed85b4a7` |
+| workers4-timings-failed | `ff0ad55e167409df634bbf0d530d74a744fd98785c1823ddea3e26c7d38ec8b5` |
+| workers4-timings-retry | `ff0ad55e167409df634bbf0d530d74a744fd98785c1823ddea3e26c7d38ec8b5` |
+
+**`make test` and `make build` passed** for the default-four change, including the configuration regression, task-pool race tests and native protocol suite. Records: `/tmp/fma-workers4-tests.log` and `/tmp/fma-workers4-build.log`. To reproduce the default configuration, run `python3 scripts/test_streaming.py --mail --jmap-first --seed 20260910 --report /tmp/fma-workers4.json` without a worker override. **SMTP remains above the 3-second target.**

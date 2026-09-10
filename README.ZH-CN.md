@@ -108,7 +108,7 @@ S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节�
 | `—` | `FMA_RELAY_TLS` | `starttls` | starttls 或 implicit |
 | `—` | `FMA_RELAY_CA_FILE` | `empty / 空` | 可选自定义 CA 的 S3 对象键 |
 | `-queue-retry` | `—` | `1m` | SMTP 投递任务初始重试间隔 |
-| `-stream-workers` | `FMA_STREAM_WORKERS` | `8` | MIME 解析任务池大小（1–128），参数优先于环境变量 |
+| `-stream-workers` | `FMA_STREAM_WORKERS` | `4` | MIME 解析任务池大小（1–128），参数优先于环境变量 |
 | `-queue` | `—` | `false` | 检查 SMTP 投递任务，不显示邮件正文 |
 | `-version` | `—` | `false` | 打印版本、commit 和发行时间；无需 S3 |
 | `-h` | `—` | `—` | 显示命令行帮助 |
@@ -129,7 +129,7 @@ S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节�
 | `FMA_CERT_KEY` | `cert.pem` | Maps to -cert / 对应 -cert |
 | `FMA_KEY_KEY` | `key.pem` | Maps to -key / 对应 -key |
 | `FMA_QUEUE_RETRY` | `1m` | Maps to -queue-retry / 对应 -queue-retry |
-| `FMA_STREAM_WORKERS` | `8` | 启动时创建的 MIME 解析 worker 数量 |
+| `FMA_STREAM_WORKERS` | `4` | 启动时创建的 MIME 解析 worker 数量 |
 | `FMA_SMTP_PORT` | `2525` | Loopback listener port / 回环监听端口 |
 | `FMA_SUBMISSION_PORT` | `1587` | Loopback listener port / 回环监听端口 |
 | `FMA_SMTPS_PORT` | `1465` | Loopback listener port / 回环监听端口 |
@@ -512,7 +512,7 @@ POP3 v0.1.6 增加 ARM64 向量扫描，并保留通用实现。独立 2 GiB 编
 
 S3 上传缓冲按 1 MiB 分块，直接组合成 8 MiB 上传分片，不进行拼接复制。每次上传最多四片在途或正在填充，全局在用分片缓冲上限 1 GiB，按需分配。跨账户对象复制使用 S3 CopyObject 或 UploadPartCopy。JMAP MIME 解析使用固定版本的[流式优化 fork](https://github.com/Jabberwocky238/naust-jmap/commit/ea60168)，通过缓冲区复用和分块解码提速，并在写入时持久化 MIME 元数据和独立部件，重启后的首次请求即可使用。接收与解析之间轮转三个 1 MiB 缓冲块，转移所有权后才复用；原文与部件使用独立的有界压缩池，避免相互等待资源。
 
-任务池启动时创建 8 个 worker，可通过 `FMA_STREAM_WORKERS=16` 或 `-stream-workers 16` 调整。空闲 worker 从共享队列领取 MIME 解析任务，队列容量与 worker 数相同，满时接收端等待，形成背压。三个 1 MiB 轮转缓冲在任务入队后才分配；网络协议和 S3 分片仍使用各自的并发机制。增加 worker 提升多封邮件并发处理能力，不会把单个 Base64 流自动切成八份。取消和退出会通知任务并排空队列，原文与部件的压缩池隔离。
+任务池启动时创建 4 个 worker，可通过 `FMA_STREAM_WORKERS=16` 或 `-stream-workers 16` 调整。空闲 worker 从共享队列领取 MIME 解析任务，队列容量与 worker 数相同，满时接收端等待，形成背压。三个 1 MiB 轮转缓冲在任务入队后才分配；网络协议和 S3 分片仍使用各自的并发机制。增加 worker 提升多封邮件并发处理能力，不会把单个 Base64 流自动切成八份。取消和退出会通知任务并排空队列，原文与部件的压缩池隔离。
 
 实测吞吐量和当前瓶颈见 [PERFORMANCE.md](PERFORMANCE.md)。
 

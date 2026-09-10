@@ -94,6 +94,8 @@ type Config struct {
 	S3                                                     S3Config
 }
 
+const defaultStreamWorkers = 4
+
 var config Config
 var logger = newLogger(os.Stdout, os.Stderr, slog.LevelInfo)
 
@@ -162,7 +164,7 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	// Flags override environment values, which override the defaults below.
 	f := flag.NewFlagSet("fma", flag.ContinueOnError)
 	var streamWorkers string
-	f.StringVar(&streamWorkers, "stream-workers", getenv("STREAM_WORKERS", "8"), "parallel MIME ingestion workers (1-128)")
+	f.StringVar(&streamWorkers, "stream-workers", getenv("STREAM_WORKERS", strconv.Itoa(defaultStreamWorkers)), "parallel MIME ingestion workers (1-128)")
 	f.StringVar(&c.Domain, "domain", "t12e.cc", "local email domain")
 	f.StringVar(&c.S3.Endpoint, "s3-endpoint", getenv("S3_ENDPOINT", ""), "S3 endpoint URL; empty for AWS")
 	f.StringVar(&c.S3.Bucket, "s3-bucket", getenv("S3_BUCKET", ""), "existing S3 bucket for all persistent data")
@@ -5211,7 +5213,7 @@ func (p *streamTaskPool) Close() {
 	p.wg.Wait()
 }
 
-var streamTasks = newStreamTaskPool(8)
+var streamTasks = newStreamTaskPool(defaultStreamWorkers)
 
 // Blocks move from the receiver to the parser and back only after consumption.
 // Three owned 1 MiB blocks allow CPU overlap without copying or unbounded queues.
@@ -5643,8 +5645,8 @@ func newBufferPool(count, size int) *WaitPool[*bytes.Buffer] {
 
 var (
 	mailProbePool   = newBufferPool(4, gzipThreshold)
-	partProbePool   = newBufferPool(8, 1<<20)
-	partGzipWriters = newWaitPool(8, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
+	partProbePool   = newBufferPool(defaultStreamWorkers, 1<<20)
+	partGzipWriters = newWaitPool(defaultStreamWorkers, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
 	s3BufferPool    = newWaitPool(s3BufferLimit/s3PartSize, func() *s3PartBuffer { return new(s3PartBuffer) }, func(p *s3PartBuffer) { p.size, p.offset = 0, 0 })
 	copyBufferPool  = newBufferPool(32, 128<<10)
 	gzipWriters     = newWaitPool(4, func() *gzip.Writer { w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed); return w }, func(w *gzip.Writer) { w.Reset(io.Discard) })
