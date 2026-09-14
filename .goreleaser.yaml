@@ -37,7 +37,6 @@ archives:
       - install.sh
       - LICENSE
       - CONTRIBUTING.md
-      - CODE_OF_CONDUCT.md
       - README.md
       - README.ZH-CN.md
       - deploy/gen.sh

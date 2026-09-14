@@ -45,12 +45,20 @@ jobs:
         run: make build
 
   release-config:
-    name: GoReleaser configuration
+    name: GoReleaser packaging
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
       - uses: goreleaser/goreleaser-action@v7
         with:
           version: v2.18.1
           args: check
+      - name: Build a snapshot archive without publishing
+        run: goreleaser release --snapshot --clean --skip=publish

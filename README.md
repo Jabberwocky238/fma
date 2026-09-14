@@ -28,7 +28,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/inst
 
 ## 2. Philosophy and design
 
-All runtime code stays in `main.go`, with Go tests in `main_test.go`. Reuse protocol libraries and connect them to S3 through explicit types and JSON fields; scripts, deployment templates and documentation may live separately. PRs for any part of the project, additions and AI-assisted programming are welcome. The one non-negotiable architectural rule is the single-file philosophy; see [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+All runtime code stays in `main.go`, with Go tests in `main_test.go`. Reuse protocol libraries and connect them to S3 through explicit types and JSON fields; scripts, deployment templates and documentation may live separately. PRs for any part of the project, additions and AI-assisted programming are welcome. The one non-negotiable architectural rule is the single-file philosophy; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - **High availability:** multiple nodes share one bucket; persisted delivery tasks
   can be reclaimed after a node crashes.
@@ -646,7 +646,8 @@ This script reuses the isolated native Fals3y fixture and is included in `make t
 
 GitHub Actions runs formatting, vet, race, native Fals3y integration tests, and a
 build on branch pushes and pull requests, using Go 1.25 and the current stable Go.
-Release configuration is checked with GoReleaser as part of CI.
+CI checks the GoReleaser configuration and builds snapshot archives for all
+release platforms without publishing them.
 
 Push a semantic version tag to publish a GitHub Release after the same checks pass:
 

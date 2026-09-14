@@ -29,7 +29,7 @@ FMA_S3_BUCKET=fma FMA_S3_ACCESS_KEY_ID=your-key FMA_S3_SECRET_ACCESS_KEY=your-se
 
 ## 2. 哲学和设计
 
-运行时代码全部放在 `main.go`，Go 测试全部放在 `main_test.go`。复用协议库，用明确的数据类型和 JSON 标签连接协议与 S3；脚本、部署模板和文档可独立存放。欢迎任何部分的 PR、修改、补充和 AI 辅助编程，唯一不能破坏的架构约束是单文件哲学，详见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
+运行时代码全部放在 `main.go`，Go 测试全部放在 `main_test.go`。复用协议库，用明确的数据类型和 JSON 标签连接协议与 S3；脚本、部署模板和文档可独立存放。欢迎任何部分的 PR、修改、补充和 AI 辅助编程，唯一不能破坏的架构约束是单文件哲学，详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 - **高可用**：多个节点共享一个桶，节点宕机后，其他节点可以接管持久化的投递任务。
 - **高并发设计**：并行处理协议连接，通过 S3 条件写协调跨节点任务归属和邮箱更新。
@@ -436,7 +436,7 @@ python3 scripts/verify_jmap.py
 
 ### CI 与发布
 
-GitHub Actions 在分支 push 和 PR 上使用 Go 1.25 及当前稳定版，执行格式、vet、race、原生 Fals3y 集成测试、构建和 GoReleaser 配置检查。
+GitHub Actions 在分支 push 和 PR 上使用 Go 1.25 及当前稳定版，执行格式、vet、race、原生 Fals3y 集成测试、构建和 GoReleaser 配置检查，并为所有发布平台实际生成快照安装包（不发布）。
 
 推送新的语义版本 tag，检查通过后自动发布 GitHub Release：
 

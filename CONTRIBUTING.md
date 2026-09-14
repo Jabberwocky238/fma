@@ -23,7 +23,7 @@ Shell/Python integration tests, deployment templates, workflows, documentation a
 other support files may live separately. This constraint is about the application's
 implementation, not forcing deployment or documentation into Go. Keep Markdown
 base names uppercase, for example `README.md`, `README.ZH-CN.md`,
-`CONTRIBUTING.md` and `CODE_OF_CONDUCT.md`.
+and `CONTRIBUTING.md`.
 
 Every part of the implementation and documentation is open to change within this
 constraint. Welcoming a PR does not promise automatic merging: maintainers still
@@ -59,7 +59,7 @@ which one and why rather than reporting it as passed.
 Keep commits focused and explain what changed. Submit the PR in whatever form is
 useful for review, including a draft when discussion would help. Contributions are
 provided under the project's [MIT license](LICENSE); preserve applicable upstream
-copyright and license notices. Follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+copyright and license notices.
 
 ## 中文说明
 
@@ -69,4 +69,4 @@ copyright and license notices. Follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 **唯一不可破坏的架构约束是单文件哲学：运行时 Go 实现放在 `main.go`，Go 测试放在 `main_test.go`。** 不要通过新增 Go 文件、内部包、生成代码或嵌入源码绕过它。鼓励复用第三方库，fma 自有协议和持久化字段使用明确类型与 JSON 标签。脚本、模板、工作流和文档可以独立存放。
 
-Markdown 文件基本名使用大写；`README.md` 只写英文，中文版写在 `README.ZH-CN.md`。行为、参数、部署或协议变化时同步更新两版。接受提交不等于自动合并，仍需检查正确性并讨论具体方案。上述命令提供本地验证入口；如有检查无法执行，请如实说明。遵守项目 MIT 许可证、上游许可证及行为准则。
+Markdown 文件基本名使用大写；`README.md` 只写英文，中文版写在 `README.ZH-CN.md`。行为、参数、部署或协议变化时同步更新两版。接受提交不等于自动合并，仍需检查正确性并讨论具体方案。上述命令提供本地验证入口；如有检查无法执行，请如实说明。遵守项目 MIT 许可证及上游许可证。
