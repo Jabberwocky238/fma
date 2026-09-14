@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -13,6 +15,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -2747,7 +2750,214 @@ func sendRemote(ctx context.Context, job *outboundJob, recipient string) error {
 	}
 	return last
 }
+
+// DKIM keys are selected per tenant. Publishing a new key before changing the
+// selector makes rotation atomic; queued messages never contain private keys.
+func (job *outboundJob) openSignedBody(ctx context.Context) (io.ReadCloser, error) {
+	if job.User == "" {
+		return job.openBody(ctx)
+	}
+	if !validAccountRoot(job.User) {
+		return nil, errors.New("invalid DKIM account")
+	}
+	domain := accountDomain(job.User)
+	selectorBytes, err := objects.Get(domain + "/.dkim/selector")
+	if errors.Is(err, fs.ErrNotExist) {
+		return job.openBody(ctx)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("DKIM selector: %w", err)
+	}
+	selector := strings.TrimSpace(string(selectorBytes))
+	if !validMailDomain(selector) || len(selector+"._domainkey."+domain) > 253 {
+		return nil, errors.New("invalid DKIM selector")
+	}
+	keyBytes, err := objects.Get(domain + "/.dkim/" + selector + ".pem")
+	if err != nil {
+		return nil, fmt.Errorf("DKIM key: %w", err)
+	}
+	if len(keyBytes) > 16384 {
+		return nil, errors.New("DKIM key too large")
+	}
+	block, rest := pem.Decode(keyBytes)
+	if block == nil || len(bytes.TrimSpace(rest)) != 0 {
+		return nil, errors.New("invalid DKIM PEM")
+	}
+	var key *rsa.PrivateKey
+	switch block.Type {
+	case "RSA PRIVATE KEY":
+		key, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+	case "PRIVATE KEY":
+		var parsed any
+		parsed, err = x509.ParsePKCS8PrivateKey(block.Bytes)
+		key, _ = parsed.(*rsa.PrivateKey)
+	default:
+		err = errors.New("unsupported DKIM PEM type")
+	}
+	if err != nil || key == nil {
+		return nil, errors.New("DKIM requires an RSA private key")
+	}
+	if key.N.BitLen() < 2048 {
+		return nil, errors.New("DKIM RSA key must be at least 2048 bits")
+	}
+	if err := key.Validate(); err != nil {
+		return nil, errors.New("invalid DKIM RSA key")
+	}
+	body, err := job.openBody(ctx)
+	if err != nil {
+		return nil, err
+	}
+	scanBody := body
+	stop := context.AfterFunc(ctx, func() { scanBody.Close() })
+	header, err := dkimSignature(ctx, body, job.User, selector, key)
+	stop()
+	body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("DKIM signing: %w", err)
+	}
+	body, err = job.openBody(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &prefixedReader{Reader: io.MultiReader(strings.NewReader(header), body), closer: body}, nil
+}
+
+// Relaxed canonicalization only folds ASCII whitespace, not Unicode spaces.
+func dkimRelaxed(value string) string {
+	return strings.Join(strings.FieldsFunc(value, func(r rune) bool {
+		return r == ' ' || r == '\t' || r == '\r' || r == '\n'
+	}), " ")
+}
+
+func dkimSignature(ctx context.Context, source io.Reader, user, selector string, key *rsa.PrivateKey) (string, error) {
+	reader := bufio.NewReader(source)
+	var raw bytes.Buffer
+	lineSize := 0
+	for {
+		line, err := reader.ReadSlice('\n')
+		if raw.Len()+len(line) > 64*1024 {
+			return "", errors.New("DKIM headers exceed 64 KiB")
+		}
+		raw.Write(line)
+		lineSize += len(line)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if lineSize == 2 && bytes.Equal(line, []byte("\r\n")) || lineSize == 1 && bytes.Equal(line, []byte("\n")) {
+			break
+		}
+		lineSize = 0
+	}
+	headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(raw.Bytes()))).ReadMIMEHeader()
+	if err != nil {
+		return "", err
+	}
+	from := headers.Values("From")
+	if len(from) != 1 {
+		return "", errors.New("DKIM requires exactly one From header")
+	}
+	addresses, err := mail.ParseAddressList(from[0])
+	if err != nil || len(addresses) != 1 {
+		return "", errors.New("DKIM requires exactly one From address")
+	}
+	identity, err := resolveIdentity(addresses[0].Address)
+	if err != nil || identity.RootID != user || accountDomain(localUser(addresses[0].Address)) != accountDomain(user) {
+		return "", errors.New("DKIM From does not belong to the authenticated account")
+	}
+	bodyHash, err := dkimBodyHash(ctx, reader)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	var names []string
+	for _, name := range []string{"From", "Sender", "Reply-To", "To", "Cc", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type", "Content-Transfer-Encoding", "In-Reply-To", "References"} {
+		values := headers.Values(name)
+		for i := len(values) - 1; i >= 0; i-- {
+			fmt.Fprintf(h, "%s:%s\r\n", strings.ToLower(name), dkimRelaxed(values[i]))
+			names = append(names, strings.ToLower(name))
+		}
+		// Oversign one missing occurrence to detect inserted headers as well.
+		names = append(names, strings.ToLower(name))
+	}
+	value := "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n\td=" + accountDomain(user) + "; s=" + selector + ";\r\n\th=" + strings.Join(names, ":\r\n\t") + ";\r\n\tbh=" + base64.StdEncoding.EncodeToString(bodyHash) + ";\r\n\tb="
+	fmt.Fprintf(h, "dkim-signature:%s", dkimRelaxed(value))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, h.Sum(nil))
+	if err != nil {
+		return "", err
+	}
+	encoded := base64.StdEncoding.EncodeToString(sig)
+	for len(encoded) > 64 {
+		value += encoded[:64] + "\r\n\t"
+		encoded = encoded[64:]
+	}
+	return "DKIM-Signature: " + value + encoded + "\r\n", nil
+}
+
+// Keep only a count of pending empty lines, so even a body consisting entirely
+// of CRLFs uses fixed memory. SMTP's DotWriter normalizes bare LF to CRLF too.
+func dkimBodyHash(ctx context.Context, source io.Reader) ([]byte, error) {
+	h := sha256.New()
+	out := bufio.NewWriter(h)
+	reader := bufio.NewReader(source)
+	var emptyLines int64
+	var whitespace, pendingCR, emitted bool
+	flushLines := func() {
+		for emptyLines > 0 {
+			out.WriteString("\r\n")
+			emptyLines--
+		}
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		b, err := reader.ReadByte()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if pendingCR && b != '\n' {
+			return nil, errors.New("bare CR in DKIM body")
+		}
+		pendingCR = false
+		switch b {
+		case '\r':
+			pendingCR = true
+		case '\n':
+			emptyLines++
+			whitespace = false
+		case ' ', '\t':
+			whitespace = true
+		default:
+			flushLines()
+			if whitespace {
+				out.WriteByte(' ')
+			}
+			out.WriteByte(b)
+			whitespace, emitted = false, true
+		}
+	}
+	if pendingCR {
+		return nil, errors.New("bare CR in DKIM body")
+	}
+	if emitted {
+		out.WriteString("\r\n")
+	}
+	out.Flush()
+	return h.Sum(nil), nil
+}
+
 func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient string, relay bool) error {
+	body, err := job.openSignedBody(ctx)
+	if err != nil {
+		return err
+	}
+	defer body.Close()
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return err
@@ -2803,11 +3013,6 @@ func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient s
 	if err != nil {
 		return err
 	}
-	body, err := job.openBody(ctx)
-	if err != nil {
-		return err
-	}
-	defer body.Close()
 	if _, err = copyStream(ctx, writer, body); err != nil {
 		return err
 	}

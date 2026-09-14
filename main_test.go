@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/emersion/go-imap"
+	"github.com/emersion/go-msgauth/dkim"
 
 	"slices"
 
@@ -40,6 +42,7 @@ import (
 	jmap "github.com/naust-mail/naust-jmap/core/jmap"
 	jbackend "github.com/naust-mail/naust-jmap/core/providers/backend"
 	"github.com/naust-mail/naust-jmap/core/providers/backend/backendtest"
+	jblob "github.com/naust-mail/naust-jmap/core/providers/blob"
 )
 
 // Outbound Test
@@ -50,9 +53,10 @@ type fakeRelay struct {
 	code     atomic.Int32
 	received atomic.Int32
 	workers  sync.WaitGroup
+	messages chan []byte
 }
 
-func newFakeRelay(t *testing.T, implicit bool) *fakeRelay {
+func newFakeRelay(t *testing.T, implicit bool, capture ...chan []byte) *fakeRelay {
 	t.Helper()
 	certServer := httptest.NewTLSServer(nil)
 	cfg := certServer.TLS.Clone()
@@ -65,6 +69,9 @@ func newFakeRelay(t *testing.T, implicit bool) *fakeRelay {
 		listener = tls.NewListener(listener, cfg)
 	}
 	relay := new(fakeRelay)
+	if len(capture) > 0 {
+		relay.messages = capture[0]
+	}
 	relay.code.Store(250)
 	config.RelayAddr = listener.Addr().String()
 	config.RelayUser, config.RelayPassword = "relay-user", "relay-password"
@@ -118,6 +125,13 @@ func (s *relaySession) Rcpt(string, *smtp.RcptOptions) error {
 	return nil
 }
 func (s *relaySession) Data(r io.Reader) error {
+	if s.relay.messages != nil {
+		data, err := io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+		s.relay.messages <- data
+	}
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		return err
 	}
@@ -3120,5 +3134,202 @@ func TestDomainPrefixDiscoveryWithoutConfiguration(t *testing.T) {
 	checkError(t, objects.Delete("new.example/alice/.password"))
 	if root, err := deliveryUser("alice@new.example"); err != nil || root != "" {
 		t.Fatal("removed domain remained hosted", root, err)
+	}
+}
+
+func TestDKIMSigning(t *testing.T) {
+	outboundTestDir(t)
+	key, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+	checkError(t, err)
+	public, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	checkError(t, err)
+	publicKeys := map[string][]byte{"example.com": public}
+	for _, domain := range []string{"example.com", "example.org"} {
+		domainKey := key
+		if domain == "example.org" {
+			domainKey, err = rsa.GenerateKey(cryptorand.Reader, 2048)
+			checkError(t, err)
+			publicKeys[domain], err = x509.MarshalPKIXPublicKey(&domainKey.PublicKey)
+			checkError(t, err)
+		}
+		checkError(t, objects.Put(domain+"/alice/.kind", []byte("account")))
+		checkError(t, objects.Put(domain+"/.dkim/selector", []byte("mail2026")))
+		checkError(t, objects.Put(domain+"/.dkim/mail2026.pem", pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(domainKey)})))
+	}
+	verify := func(message, domain, selector string) error {
+		results, err := dkim.VerifyWithOptions(strings.NewReader(message), &dkim.VerifyOptions{LookupTXT: func(name string) ([]string, error) {
+			if name != selector+"._domainkey."+domain {
+				return nil, fmt.Errorf("unexpected DNS lookup: %s", name)
+			}
+			return []string{"v=DKIM1; k=rsa; p=" + base64.StdEncoding.EncodeToString(publicKeys[domain])}, nil
+		}})
+		if err != nil {
+			return err
+		}
+		if len(results) != 1 {
+			return fmt.Errorf("got %d signatures", len(results))
+		}
+		return results[0].Err
+	}
+	for _, domain := range []string{"example.com", "example.org"} {
+		for i, body := range []string{"", "\r\n", " \t\r\n\r\n", "hello", "hello\r\n", "hello\r\n\r\n", " \thello \t world\t\r\n\r\n again\r\n", strings.Repeat("x", 10000) + "\r\n", strings.Repeat("\r\n", 10000) + "end"} {
+			t.Run(fmt.Sprintf("%s/%d", domain, i), func(t *testing.T) {
+				original := "From: Alice <alice@" + domain + ">\r\nTo: bob@elsewhere.test\r\nSubject: folded\r\n\t subject\r\nX-Unrelated: " + strings.Repeat("z", 4096) + "\r\n\r\n" + body
+				job := &outboundJob{User: domain + "/alice", From: "alice@" + domain, Body: []byte(original)}
+				stream, err := job.openSignedBody(context.Background())
+				checkError(t, err)
+				signed, err := io.ReadAll(stream)
+				stream.Close()
+				checkError(t, err)
+				if !bytes.HasSuffix(signed, []byte(original)) {
+					t.Fatal("original message changed")
+				}
+				checkError(t, verify(string(signed), domain, "mail2026"))
+				if verify(strings.Replace(string(signed), "Subject: folded", "Subject: altered", 1), domain, "mail2026") == nil {
+					t.Fatal("tampered subject accepted")
+				}
+				if verify("Reply-To: attacker@evil.test\r\n"+string(signed), domain, "mail2026") == nil {
+					t.Fatal("inserted header accepted")
+				}
+				if verify(string(signed)+"tampered", domain, "mail2026") == nil {
+					t.Fatal("tampered body accepted")
+				}
+			})
+		}
+	}
+	job := &outboundJob{User: "example.com/alice", From: "alice@example.com", Body: []byte("From: alice@example.com\r\n\r\nhello\r\n")}
+	for _, from := range []string{"alice@example.org", "bob@example.com", "alice@example.com, bob@example.com", "alice@example.com\r\nFrom: alice@example.com"} {
+		bad := *job
+		bad.Body = []byte("From: " + from + "\r\n\r\nhello")
+		if r, err := bad.openSignedBody(context.Background()); err == nil {
+			r.Close()
+			t.Fatalf("accepted From %q", from)
+		}
+	}
+	checkError(t, objects.Put("example.com/news/.kind", []byte("alias")))
+	checkError(t, objects.Put("example.com/news/.alias", []byte("alice")))
+	aliasJob := *job
+	aliasJob.Body = []byte("From: news@example.com\r\n\r\nhello")
+	aliasStream, err := aliasJob.openSignedBody(context.Background())
+	checkError(t, err)
+	aliasData, err := io.ReadAll(aliasStream)
+	aliasStream.Close()
+	checkError(t, err)
+	checkError(t, verify(string(aliasData), "example.com", "mail2026"))
+	oversized := *job
+	oversized.Body = []byte("From: alice@example.com\r\nX-Large: " + strings.Repeat("x", 64<<10) + "\r\n\r\nhello")
+	if r, err := oversized.openSignedBody(context.Background()); err == nil {
+		r.Close()
+		t.Fatal("oversized headers accepted")
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	checkError(t, err)
+	checkError(t, objects.Put("example.com/.dkim/mail2026.pem", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8})))
+	aliasStream, err = aliasJob.openSignedBody(context.Background())
+	checkError(t, err)
+	aliasData, err = io.ReadAll(aliasStream)
+	aliasStream.Close()
+	checkError(t, err)
+	checkError(t, verify(string(aliasData), "example.com", "mail2026"))
+	checkError(t, objects.Put("example.com/.dkim/selector", []byte("missing")))
+	if r, err := job.openSignedBody(context.Background()); err == nil {
+		r.Close()
+		t.Fatal("missing key accepted")
+	}
+	checkError(t, objects.Put("example.com/.dkim/missing.pem", []byte("invalid")))
+	if r, err := job.openSignedBody(context.Background()); err == nil {
+		r.Close()
+		t.Fatal("invalid key accepted")
+	}
+	checkError(t, objects.Put("example.com/.dkim/selector", []byte("../escape")))
+	if r, err := job.openSignedBody(context.Background()); err == nil {
+		r.Close()
+		t.Fatal("invalid selector accepted")
+	}
+	checkError(t, objects.Put("example.com/.dkim/rotated.pem", pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})))
+	checkError(t, objects.Put("example.com/.dkim/selector", []byte("rotated\n")))
+	stream, err := job.openSignedBody(context.Background())
+	checkError(t, err)
+	signed, err := io.ReadAll(stream)
+	stream.Close()
+	checkError(t, err)
+	checkError(t, verify(string(signed), "example.com", "rotated"))
+	// Exercise the actual TLS SMTP path and immutable S3 blob reopens.
+	messages := make(chan []byte, 2)
+	newFakeRelay(t, false, messages)
+	blobStore := jmapBlobs{store: objects}
+	blobID := jblob.IdFor(job.Body)
+	err = blobStore.Put(context.Background(), jmapAccountID(job.User), blobID, job.Body)
+	checkError(t, err)
+	blobJob := *job
+	blobJob.Body = nil
+	blobJob.Blob = &jmapBlobRef{AccountID: jmapAccountID(job.User), BlobID: blobID}
+	checkError(t, sendSMTP(context.Background(), config.RelayAddr, &blobJob, "bob@elsewhere.test", true))
+	select {
+	case data := <-messages:
+		checkError(t, verify(string(data), "example.com", "rotated"))
+	case <-time.After(time.Second):
+		t.Fatal("relay received no mail")
+	}
+	raw, err := blobJob.openBody(context.Background())
+	checkError(t, err)
+	stored, err := io.ReadAll(raw)
+	raw.Close()
+	checkError(t, err)
+	if !bytes.Equal(stored, job.Body) {
+		t.Fatal("stored blob was changed")
+	}
+	for _, skip := range []outboundJob{{Body: job.Body}, {Prefix: "forwarded", Body: job.Body}} {
+		r, err := skip.openSignedBody(context.Background())
+		checkError(t, err)
+		b, err := io.ReadAll(r)
+		r.Close()
+		checkError(t, err)
+		if !bytes.Equal(b, job.Body) {
+			t.Fatal("forwarded message changed")
+		}
+	}
+	checkError(t, objects.Delete("example.com/.dkim/selector"))
+	stream, err = job.openSignedBody(context.Background())
+	checkError(t, err)
+	unsigned, err := io.ReadAll(stream)
+	stream.Close()
+	checkError(t, err)
+	if !bytes.Equal(unsigned, job.Body) {
+		t.Fatal("unconfigured domain changed")
+	}
+}
+
+// Generates a large stream without allocating it, including pathological runs
+// of empty lines that must not accumulate in the canonicalizer.
+type dkimEmptyLines struct{ remaining int64 }
+
+func (r *dkimEmptyLines) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(int64(len(p)), r.remaining)
+	for i := range p[:n] {
+		p[i] = '\n'
+	}
+	r.remaining -= n
+	return int(n), nil
+}
+func TestDKIMBoundedBody(t *testing.T) {
+	h, err := dkimBodyHash(context.Background(), &dkimEmptyLines{remaining: 32 << 20})
+	checkError(t, err)
+	empty := sha256.Sum256(nil)
+	if !bytes.Equal(h, empty[:]) {
+		t.Fatal("empty body hash mismatch")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := dkimBodyHash(ctx, strings.NewReader("x")); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"x\ry", "x\r"} {
+		if _, err := dkimBodyHash(context.Background(), strings.NewReader(bad)); err == nil {
+			t.Fatal("bare CR accepted")
+		}
 	}
 }

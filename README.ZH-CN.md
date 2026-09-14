@@ -40,6 +40,29 @@ FMA_S3_BUCKET=fma FMA_S3_ACCESS_KEY_ID=your-key FMA_S3_SECRET_ACCESS_KEY=your-se
 
 JMAP 与其他协议共用邮件记录和 MIME 对象。邮件相关数据保存在账户的 `mail/` prefix；账户文件只保存文件夹、身份、UID/状态计数、租约与当前事务的提交信息。属性、成员关系、blob 引用和排序索引仅在内存中维护，冷启动从权威记录重建。更新只写变更记录和一个条件提交文件，不再重写整个邮箱；同账户写入仍通过 S3 条件写协调。
 
+### 按域配置 DKIM 签名
+
+SMTP 和 JMAP 认证提交的外发邮件支持按域签名，直投和中继共用。桶中配置：
+
+```text
+example.com/.dkim/selector       # 纯文本 mail2026
+example.com/.dkim/mail2026.pem   # RSA 私钥，PEM 格式，至少 2048 位
+```
+
+在本地生成私钥和 DNS 公钥值：
+
+```sh
+umask 077
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out mail2026.pem
+openssl pkey -in mail2026.pem -pubout -outform DER | openssl base64 -A
+```
+
+为 `mail2026._domainkey.example.com` 添加 TXT：`v=DKIM1; k=rsa; p=<公钥输出>`。如果 DNS 提供商要求带引号的字符串，将长值拆成相邻、每段不超过 255 字节的字符串。先发布 DNS，再上传私钥到上述 S3 路径，最后向 selector 对象写入 `mail2026` 启用签名。私钥仅供服务和可信管理员访问，支持 PKCS#1 和未加密 PKCS#8 RSA 私钥。
+
+没有 selector 时该域不签名；配置存在但损坏时停止外发并按现有策略重试，不会退回无签名发送。轮换无需重启：先发布新 selector 的 DNS 和私钥，再替换 selector 对象。DNS 传播期间及旧签名邮件仍可能投递期间保留旧 DNS 记录。
+
+使用 RSA-SHA256、relaxed/relaxed 规范化。From 必须只有一个地址，且属于认证账户或其同域别名。匿名转发不新增签名；已有签名和存储原文保留。每次投递先流式读取计算签名，再读取发送，使用固定缓冲、不落地，代价是额外一次 S3 读取和签名延迟。签名邮件的头部上限为 64 KiB，正文不能包含单独的 CR。中继需保留被签名的头部和正文。DKIM 不能替代 SPF、DMARC 或外发 IP/PTR 配置。
+
 ### 支持的 RFC 与范围
 
 | RFC | 协议 | 当前范围 |

@@ -48,6 +48,47 @@ local database, disk cache, or temporary file management. HTTP serves JMAP and a
 
 JMAP and the other protocols share mail records and MIME objects under each account’s `mail/` prefix. The account file retains folders, identities, UID/state counters, the lease and the current transaction decision. Property, membership, blob-reference and ordered lookup indexes live only in memory and are rebuilt from authoritative records on cold start. Updates write changed records and one conditional account commit, instead of rewriting the mailbox. Same-account writers still coordinate through S3 conditional writes.
 
+### Per-domain DKIM signing
+
+Authenticated SMTP and JMAP submissions can sign outbound mail independently for
+each domain, in both direct and relay modes. Store these objects in the bucket:
+
+```text
+example.com/.dkim/selector       # mail2026 (plain text)
+example.com/.dkim/mail2026.pem   # RSA private key, PEM, at least 2048 bits
+```
+
+Generate the key and DNS public-key value locally:
+
+```sh
+umask 077
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out mail2026.pem
+openssl pkey -in mail2026.pem -pubout -outform DER | openssl base64 -A
+```
+
+Publish a TXT record at `mail2026._domainkey.example.com` containing
+`v=DKIM1; k=rsa; p=<public-key output>`. DNS providers that require quoted strings
+need the long value split into adjacent strings of at most 255 bytes. Publish DNS
+first, upload the private key to its S3 path, then upload `mail2026` to the selector
+object to enable signing. Restrict private-key access to the service and trusted
+administrators. PKCS#1 and unencrypted PKCS#8 RSA keys are accepted.
+
+No selector means signing is disabled for that domain. Invalid configuration fails
+outbound delivery and follows the existing retry policy; it never falls back to
+unsigned mail. Rotation needs no restart: publish a new selector's DNS and key,
+then replace the selector object. Keep the old DNS record during propagation and
+while previously signed messages may still be delivered.
+
+Signing uses RSA-SHA256 and relaxed header/body canonicalization. The single From
+address must belong to the authenticated account or one of its same-domain
+aliases. Anonymous forwarding retains the original message without adding a
+signature. Existing signatures and stored messages are preserved. Each delivery
+attempt reads the message once to hash it and again to send it, using bounded
+buffers without local staging; this adds an S3 read and signing latency. Signed
+messages have a 64 KiB header limit and must not contain bare CR in the body.
+A relay must preserve signed headers and body for the signature to remain valid.
+DKIM does not replace SPF, DMARC, or correct outbound IP/PTR configuration.
+
 ### Supported RFCs and scope
 
 | RFC | Protocol | Current scope |
