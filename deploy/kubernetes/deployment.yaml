@@ -57,8 +57,6 @@ spec:
             - secretRef:
                 name: fma-s3
           args:
-            - -domain
-            - $(FMA_DOMAIN)
             - -tls-dir
             - /run/fma/tls
             - -queue-retry

@@ -58,7 +58,7 @@ ask() {
             input="${input%"${input##*[![:space:]]}"}"
         fi
         if [[ "$automated" == false ]]; then input=${input:-$fallback}; fi
-        case "$name" in DOMAIN|OUTBOUND|RELAY_TLS|LOG_LEVEL) input=$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]') ;; esac
+        case "$name" in MAIL_HOST|OUTBOUND|RELAY_TLS|LOG_LEVEL) input=$(printf '%s' "$input" | tr '[:upper:]' '[:lower:]') ;; esac
         if [[ "$input" == *$'\r'* || "$input" == *$'\n'* ]]; then
             printf 'Newlines are not allowed in %s.\n' "$env_name" >&2
             [[ "$automated" == false ]] || exit 1
@@ -147,7 +147,7 @@ valid_input() {
     local name=$1 value=$2 authority
     input_hint='A nonempty value is required.'
     case "$name" in
-        DOMAIN) input_hint='Enter a DNS domain such as example.com, without a scheme or path.'; valid_domain "$value" ;;
+        MAIL_HOST) input_hint='Enter a DNS domain such as example.com, without a scheme or path.'; valid_domain "$value" ;;
         JMAP_URL)
             input_hint='Use an HTTPS origin, without a path, credentials, query or fragment.'
             [[ "$value" == https://* ]] || return 1
@@ -213,9 +213,9 @@ render() {
 }
 
 printf '\nfma deployment configuration\nValues are saved only in deploy/generated/. Press Ctrl+C to cancel.\n\n'
-ask DOMAIN 'Mail domain (example.com)'
-required DOMAIN
-[[ "$DOMAIN" =~ ^[a-z0-9][a-z0-9.-]*\.[a-z0-9-]+$ && "$DOMAIN" != *..* ]] || { printf 'Invalid domain.\n' >&2; exit 1; }
+ask MAIL_HOST 'Public mail service hostname (mail.example.com)'
+required MAIL_HOST
+[[ "$MAIL_HOST" =~ ^[a-z0-9][a-z0-9.-]*\.[a-z0-9-]+$ && "$MAIL_HOST" != *..* ]] || { printf 'Invalid domain.\n' >&2; exit 1; }
 ask DEPLOY_USER 'Linux service user' "$(id -un)"
 [[ "$DEPLOY_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] || { printf 'Invalid service user.\n' >&2; exit 1; }
 default_uid=$(id -u "$DEPLOY_USER" 2>/dev/null || printf 1000)
@@ -290,12 +290,12 @@ for spec in SMTP:2525 SUBMISSION:1587 SMTPS:1465 POP3:1110 POP3S:1995 IMAP:1143 
     [[ "$used_ports" != *" $value "* ]] || { printf 'Ports must be distinct.\n' >&2; exit 1; }
     used_ports+="$value "
 done
-ask LINEAGE 'Certbot certificate directory' "/etc/letsencrypt/live/mail.$DOMAIN"
+ask LINEAGE 'Certbot certificate directory' "/etc/letsencrypt/live/$MAIL_HOST"
 ask WEBROOT 'ACME webroot directory' /var/www/certbot
 safe_path LINEAGE; safe_path WEBROOT
 ask LOG_LEVEL 'Log level: debug, info, warn, error' info
 quote_env LOG_LEVEL
-ask JMAP_URL 'Public JMAP HTTPS origin' "https://mail.$DOMAIN"
+ask JMAP_URL 'Public JMAP HTTPS origin' "https://$MAIL_HOST"
 quote_env JMAP_URL
 
 for name in S3_ENDPOINT S3_BUCKET S3_REGION ACCESS_KEY SECRET_KEY SESSION_TOKEN OUTBOUND RELAY_ADDR RELAY_TLS RELAY_USER RELAY_PASSWORD RELAY_PASSWORD_KEY RELAY_CA_KEY; do quote_env "$name"; done

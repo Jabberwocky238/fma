@@ -12,8 +12,8 @@ def verify(host, implicit_port, starttls_port):
         for initial in (True, False):
             for user, password, expected in (
                 ('jw238@t12e.cc', '123123', 235),
-                ('jw238', '123123', 235),
-                ('jw238', 'incorrect-password', 535),
+                ('jw238', '123123', 535),
+                ('jw238@t12e.cc', 'incorrect-password', 535),
                 ('nonexistent-user', '123123', 535),
             ):
                 c = (smtplib.SMTP_SSL(host, implicit_port, timeout=10, context=context)

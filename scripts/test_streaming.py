@@ -175,7 +175,7 @@ def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_
         measure_jmap()
     context = ssl._create_unverified_context()
     with imaplib.IMAP4_SSL('127.0.0.1', ports['imaps'], ssl_context=context, timeout=600) as client:
-        client.login('alice', 'password')
+        client.login('alice@t12e.cc', 'password')
         assert client.select('INBOX')[0] == 'OK'
         uid = client.uid('search', None, 'ALL')[1][0].split()[0]
         def fetch():
@@ -197,7 +197,7 @@ def mail_benchmark(proc, ports, conn, auth, account, size, block, results, smtp_
             assert client._get_tagged_response(tag)[0] == 'OK'
         phase('imap_mime_append', append)
     with closing(poplib.POP3_SSL('127.0.0.1', ports['pop3s'], context=context, timeout=600)) as client:
-        client.user('alice'); client.pass_('password')
+        client.user('alice@t12e.cc'); client.pass_('password')
         assert client.stat() == (2, 2*raw_size)
         def retr():
             client._putcmd('RETR 1'); assert client._getresp().startswith(b'+OK')
@@ -273,7 +273,7 @@ def main():
                             '-subj', '/CN=localhost'], check=True, capture_output=True)
             for key in ['key.pem', 'cert.pem']:
                 s3request('/stream-test/' + key, 'PUT', (tmp / key).read_bytes())
-            for key, value in [('alice/.password', b'password'), ('alice/.kind', b'account')]:
+            for key, value in [('t12e.cc/alice/.password', b'password'), ('t12e.cc/alice/.kind', b'account')]:
                 s3request('/stream-test/' + key, 'PUT', value)
             work = tmp / 'empty'; work.mkdir(mode=0o500)
             env = {**os.environ, 'FMA_S3_ENDPOINT': endpoint, 'FMA_S3_BUCKET': 'stream-test',
@@ -297,7 +297,7 @@ def main():
                     time.sleep(.05)
             else:
                 raise RuntimeError('fma did not start')
-            auth = {'Authorization': 'Basic ' + base64.b64encode(b'alice:password').decode()}
+            auth = {'Authorization': 'Basic ' + base64.b64encode(b'alice@t12e.cc:password').decode()}
             conn = http.client.HTTPConnection('127.0.0.1', port, timeout=600)
             conn.request('GET', '/.well-known/jmap', headers=auth)
             response = conn.getresponse(); session = json.load(response)
@@ -328,7 +328,7 @@ def main():
             listed = []
             token = None
             while True:
-                query = {'list-type': '2', 'prefix': 'alice/'}
+                query = {'list-type': '2', 'prefix': 't12e.cc/alice/'}
                 if token:
                     query['continuation-token'] = token
                 page = ET.fromstring(s3request('/stream-test?' + urllib.parse.urlencode(query)))
@@ -338,12 +338,12 @@ def main():
                     break
                 assert token, 'truncated S3 listing without continuation token'
             suffix = f'.blob-{uploaded["blobId"]}.json'
-            descriptors = [key for key in listed if key.startswith('alice/mail/') and key.endswith(suffix)]
+            descriptors = [key for key in listed if key.startswith('t12e.cc/alice/mail/') and key.endswith(suffix)]
             assert len(descriptors) == 1, descriptors
-            assert not any(key.startswith('alice/.jmap/blobs/') for key in listed), listed
+            assert not any(key.startswith('t12e.cc/alice/.jmap/blobs/') for key in listed), listed
             object_key = '/stream-test/' + urllib.parse.quote(descriptors[0], safe='/')
             reference = json.loads(s3request(object_key))
-            assert reference['key'].startswith('alice/mail/'), reference
+            assert reference['key'].startswith('t12e.cc/alice/mail/'), reference
             results['object_key'] = reference['key']
             metadata = reference.get('metadata', {})
             physical_url = endpoint + '/stream-test/' + urllib.parse.quote(reference['key'], safe='/')

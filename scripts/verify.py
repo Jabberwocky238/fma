@@ -21,6 +21,7 @@ import time
 import uuid
 import urllib.request
 import xml.etree.ElementTree as ET
+from verify_domains import verify_domains
 from verify_folders import verify_folders
 from verify_jmap import verify_jmap, verify_jmap_restart
 
@@ -42,11 +43,11 @@ def verify(host, ports, context, user='jw238', password='123123', isolated=False
         require(s.mail(recipient)[0] == 530, 'submission must require authentication')
         s.starttls(context=context)
         try:
-            s.login(user, 'wrong-password')
+            s.login(recipient, 'wrong-password')
             raise AssertionError('bad SMTP password accepted')
         except smtplib.SMTPAuthenticationError:
             pass
-        s.login(user, password)
+        s.login(recipient, password)
         require(s.mail(recipient)[0] == 250, 'authenticated MAIL failed')
         external_code = s.rcpt('someone@example.net')[0]
         require(external_code == 451 if isolated else external_code in (250, 451), 'unexpected authenticated outbound policy')
@@ -69,14 +70,14 @@ def verify(host, ports, context, user='jw238', password='123123', isolated=False
 
     def open_imap():
         c = imaplib.IMAP4_SSL(host, imap, ssl_context=context, timeout=15)
-        c.login(user, password)
+        c.login(recipient, password)
         require(c.list()[0] == 'OK', 'IMAP LIST failed')
         require(c.select('INBOX', readonly=True)[0] == 'OK', 'IMAP SELECT failed')
         return c
 
     bad = imaplib.IMAP4_SSL(host, imap, ssl_context=context, timeout=15)
     try:
-        bad.login(user, 'wrong-password')
+        bad.login(recipient, 'wrong-password')
         raise AssertionError('bad IMAP password accepted')
     except imaplib.IMAP4.error:
         pass
@@ -103,12 +104,12 @@ def verify(host, ports, context, user='jw238', password='123123', isolated=False
 
     def open_pop():
         p = poplib.POP3_SSL(host, pop, timeout=15, context=context)
-        p.user(user)
+        p.user(recipient)
         p.pass_(password)
         return p
 
     bad = poplib.POP3_SSL(host, pop, timeout=15, context=context)
-    bad.user(user)
+    bad.user(recipient)
     try:
         bad.pass_('wrong-password')
         raise AssertionError('bad POP password accepted')
@@ -118,7 +119,7 @@ def verify(host, ports, context, user='jw238', password='123123', isolated=False
         bad.close()
     p = open_pop()
     locked = poplib.POP3_SSL(host, pop, timeout=15, context=context)
-    locked.user(user)
+    locked.user(recipient)
     try:
         locked.pass_(password)
         raise AssertionError('concurrent POP transaction accepted')
@@ -161,45 +162,45 @@ def verify(host, ports, context, user='jw238', password='123123', isolated=False
     plain_pop = poplib.POP3(host, ports[6], timeout=15)
     require('STLS' in plain_pop.capa(), 'POP STLS capability missing')
     try:
-        plain_pop.user(user)
+        plain_pop.user(recipient)
         plain_pop.pass_(password)
         raise AssertionError('POP accepted credentials before TLS')
     except poplib.error_proto:
         pass
     plain_pop.stls(context=context)
     require('STLS' not in plain_pop.capa(), 'POP advertises STLS after TLS')
-    plain_pop.user(user)
+    plain_pop.user(recipient)
     plain_pop.pass_(password)
     plain_pop.stat()
     plain_pop.quit()
     sasl_pop = poplib.POP3_SSL(host, pop, timeout=15, context=context)
     require('PLAIN' in sasl_pop.capa().get('SASL', []), 'POP SASL PLAIN capability missing')
-    token = base64.b64encode(('\0' + user + '\0' + password).encode()).decode()
+    token = base64.b64encode(('\0' + recipient + '\0' + password).encode()).decode()
     sasl_pop._shortcmd('AUTH PLAIN ' + token)
     sasl_pop.stat()
     sasl_pop.quit()
     plain_imap = imaplib.IMAP4(host, ports[7], timeout=15)
     require('STARTTLS' in plain_imap.capabilities, 'IMAP STARTTLS capability missing')
     try:
-        plain_imap.login(user, password)
+        plain_imap.login(recipient, password)
         raise AssertionError('IMAP accepted credentials before TLS')
     except imaplib.IMAP4.error:
         pass
     plain_imap.starttls(ssl_context=context)
-    plain_imap.login(user, password)
+    plain_imap.login(recipient, password)
     require(plain_imap.select('INBOX', readonly=True)[0] == 'OK', 'IMAP STARTTLS mailbox failed')
     plain_imap.logout()
     print('PASS POP3 STLS / IMAP STARTTLS / plaintext authentication rejected')
     if isolated:
         p = poplib.POP3_SSL(host, pop, timeout=15, context=context)
-        p.user('jw238x')
+        p.user('jw238x@t12e.cc')
         p.pass_('different-password')
         require(p.stat()[0] == 0, 'prefix user can read another mailbox')
         p.quit()
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             def send(i):
                 with smtplib.SMTP_SSL(host, smtps, context=context, timeout=15) as s:
-                    s.login(user, password)
+                    s.login(recipient, password)
                     s.sendmail(recipient, [recipient], payload.replace(marker.encode(), f'concurrent-{i}'.encode()))
             list(pool.map(send, range(12)))
         c = open_imap()
@@ -225,8 +226,9 @@ def attachment_message():
 
 def verify_attachment_mailboxes(host, ports, context, expected):
     for user in ['mime-to', 'mime-cc', 'mime-bcc']:
+        recipient = user + '@t12e.cc'
         with imaplib.IMAP4_SSL(host, ports[4], ssl_context=context, timeout=15) as c:
-            c.login(user, 'mime-password')
+            c.login(recipient, 'mime-password')
             c.select('INBOX', readonly=True)
             ids = c.uid('search', None, 'ALL')[1][0].split()
             require(len(ids) == 1, 'To/Cc/Bcc recipient missing or duplicate delivery: ' + user)
@@ -248,17 +250,17 @@ def verify_attachment_mailboxes(host, ports, context, expected):
             status, partial = c.uid('fetch', ids[0], '(BODY.PEEK[2]<0.64>)')
             require(status == 'OK' and next(item[1] for item in partial if isinstance(item, tuple)) == encoded[:64], 'partial attachment fetch corrupted')
         with closing(poplib.POP3_SSL(host, ports[3], context=context, timeout=15)) as p:
-            p.user(user)
+            p.user(recipient)
             p.pass_('mime-password')
             require(p.stat()[0] == 1, 'POP recipient count mismatch')
             raw = b'\r\n'.join(p.retr(1)[1]) + b'\r\n'
             require(raw == expected and p.stat()[1] == len(raw), 'POP attachment bytes/size mismatch')
     with imaplib.IMAP4_SSL(host, ports[4], ssl_context=context, timeout=15) as c:
-        c.login('mime-header-only', 'mime-password')
+        c.login('mime-header-only@t12e.cc', 'mime-password')
         c.select('INBOX', readonly=True)
         require(c.uid('search', None, 'ALL')[1][0] == b'', 'header-only recipient received mail without RCPT TO')
     with imaplib.IMAP4_SSL(host, ports[4], ssl_context=context, timeout=15) as c:
-        c.login('jw238', '123123')
+        c.login('jw238@t12e.cc', '123123')
         c.select('Sent', readonly=True)
         ids = c.uid('search', None, 'SUBJECT', '"MIME attachments and envelope recipients"')[1][0].split()
         require(len(ids) == 1, 'MIME Sent archive missing')
@@ -314,8 +316,8 @@ def local():
             work = tmp/'empty-workdir'
             work.mkdir(mode=0o500)
             for user,password in [('jw238','123123'),('jw238x','different-password')] + [(u, 'mime-password') for u in ['mime-to', 'mime-cc', 'mime-bcc', 'mime-header-only']]:
-                s3_request(f'/{bucket}/{user}/.password', 'PUT', password.encode())
-                s3_request(f'/{bucket}/{user}/.kind', 'PUT', b'account')
+                s3_request(f'/{bucket}/t12e.cc/{user}/.password', 'PUT', password.encode())
+                s3_request(f'/{bucket}/t12e.cc/{user}/.kind', 'PUT', b'account')
             sockets = [socket.socket() for _ in range(8)]
             for sock in sockets:
                 sock.bind(('127.0.0.1', 0))
@@ -348,17 +350,17 @@ def local():
                 # Freeze boundaries, then let the submitting client remove Bcc from DATA.
                 mime.as_bytes()
                 with smtplib.SMTP_SSL('127.0.0.1', ports[2], context=context) as sender:
-                    sender.login('jw238', '123123')
+                    sender.login('jw238@t12e.cc', '123123')
                     sender.send_message(mime, to_addrs=['mime-to@t12e.cc', 'mime-cc@t12e.cc', 'mime-bcc@t12e.cc', 'mime-cc@t12e.cc'])
                 del mime['Bcc']
                 expected_mime = mime.as_bytes()
                 verify_attachment_mailboxes('127.0.0.1', ports, context, expected_mime)
-                jmap_saved = verify_jmap('127.0.0.1', ports, context, lambda key, data: s3_request(f'/{bucket}/{key}', 'PUT', data))
+                jmap_saved = verify_jmap('127.0.0.1', ports, context, lambda key, data: s3_request(f'/{bucket}/t12e.cc/{key}', 'PUT', data))
                 proc.send_signal(signal.SIGTERM)
                 require(proc.wait(timeout=15) == 0, 'unclean shutdown')
                 proc = start()
                 c = imaplib.IMAP4_SSL('127.0.0.1', ports[4], ssl_context=context)
-                c.login('jw238','123123')
+                c.login('jw238@t12e.cc','123123')
                 c.select('INBOX',readonly=True)
                 ids = c.uid('search',None,'ALL')[1][0].split()
                 require(len(ids)==12 and min(map(int,ids))>=4, 'restart lost mail or reused UID')
@@ -366,9 +368,26 @@ def local():
                 verify_attachment_mailboxes('127.0.0.1', ports, context, expected_mime)
                 verify_jmap_restart('127.0.0.1', ports, jmap_saved)
                 require(list(work.iterdir())==[], 'mail process wrote local files')
-                s3_request(f'/{bucket}/jw238/.password')
-                s3_request(f'/{bucket}/jw238/.jmap/state.json')
+                s3_request(f'/{bucket}/t12e.cc/jw238/.password')
+                s3_request(f'/{bucket}/t12e.cc/jw238/.jmap/state.json')
                 print('PASS S3-only storage / users and certificates in bucket / external credentials / restart / no local files')
+                proc.terminate()
+                require(proc.wait(timeout=15) == 0, 'unclean shutdown before domain discovery test')
+                env['FMA_JMAP_URL'] = ''
+                for domain, password in [('example.com', 'first-domain-password'), ('example.org', 'second-domain-password')]:
+                    s3_request(f'/{bucket}/{domain}/alice/.kind', 'PUT', b'account')
+                    s3_request(f'/{bucket}/{domain}/alice/.password', 'PUT', password.encode())
+                proc = start()
+                domains_saved = verify_domains('127.0.0.1', ports, context)
+                proc.terminate()
+                require(proc.wait(timeout=15) == 0, 'unclean multi-domain shutdown')
+                proc = start()
+                verify_domains('127.0.0.1', ports, context, domains_saved)
+                for domain in ['example.com', 'example.org']:
+                    s3_request(f'/{bucket}/{domain}/alice/.jmap/state.json')
+                    s3_request(f'/{bucket}/{domain}/.lock')
+                require(list(work.iterdir()) == [], 'multi-domain server wrote local files')
+                print('PASS multi-domain prefixes / restart recovery / no local files')
             finally:
                 if proc.poll() is None:
                     proc.terminate()

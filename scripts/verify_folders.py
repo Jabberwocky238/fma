@@ -13,7 +13,7 @@ def verify_folders(host, port, context):
             f'Message-ID: <{name}@t12e.cc>\r\nMIME-Version: 1.0\r\n'
             'Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n中文显示验证\r\n').encode()
     c = imaplib.IMAP4_SSL(host,port,ssl_context=context,timeout=15)
-    c.login('jw238','123123')
+    c.login('jw238@t12e.cc','123123')
     assert 'IDLE' in c.capability()[1][0].decode().split()
     assert 'MOVE' not in c.capability()[1][0].decode().split()
     created=[]
@@ -45,7 +45,7 @@ def verify_folders(host, port, context):
         c.send(idle_tag + b' IDLE\r\n')
         assert c.readline().startswith(b'+')
         other=imaplib.IMAP4_SSL(host,port,ssl_context=context,timeout=15)
-        other.login('jw238','123123')
+        other.login('jw238@t12e.cc','123123')
         try:
             assert other.append(name,None,None,body.replace(name.encode(),b'second-message'))[0]=='OK'
         finally:
@@ -67,7 +67,7 @@ def verify_folders(host, port, context):
         c.close()
         c.logout()
         c=imaplib.IMAP4_SSL(host,port,ssl_context=context,timeout=15)
-        c.login('jw238','123123')
+        c.login('jw238@t12e.cc','123123')
         assert c.select(target)[1]==[b'1']
         assert c.search(None,'FLAGGED')[1]==[b'1'], 'flags lost across sessions'
         assert c.fetch('1','(BODY.PEEK[])')[0]=='OK'

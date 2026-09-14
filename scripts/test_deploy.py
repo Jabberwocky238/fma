@@ -35,14 +35,14 @@ class DeploymentTests(unittest.TestCase):
 
     def test_generation_and_secret_escaping(self):
         # Includes shell substitution and template syntax: neither may execute.
-        secret = 'a "quote" \'single\' $HOME `id` $(touch INJECTED) \\ & @@DOMAIN@@'
+        secret = 'a "quote" \'single\' $HOME `id` $(touch INJECTED) \\ & @@MAIL_HOST@@'
         result = self.generate(self.answers('relay', secret))
         self.assertEqual(result.returncode, 0, result.stderr)
         generated = self.root / 'deploy/generated'
         self.assertEqual(len(list(generated.iterdir())), 8)
         self.assertFalse((self.root / 'INJECTED').exists())
         service = (generated / 'fma.service').read_text()
-        self.assertIn('-domain example.net', service)
+        self.assertNotIn('-domain', service)
         self.assertIn('-cert tls/fullchain.pem -key tls/private.key', service)
         self.assertIn('/home/tester/.local/bin/fma', service)
         self.assertIn('/home/tester/.config/fma/s3.env', service)
@@ -91,11 +91,11 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreaterEqual(result.stderr.count('Please try again'), 6)
         generated = self.root / 'deploy/generated'
-        self.assertIn('-domain example.net', (generated / 'fma.service').read_text())
+        self.assertNotIn('-domain', (generated / 'fma.service').read_text())
         self.assertIn('us-east-1', (generated / 's3.env').read_text())
 
     def test_noninteractive_environment(self):
-        env = {**os.environ, 'FMA_DOMAIN': 'mail.example.net',
+        env = {**os.environ, 'FMA_MAIL_HOST': 'mail.example.net',
                'FMA_DEPLOY_USER': 'tester', 'FMA_DEPLOY_UID': '1000',
                'FMA_DEPLOY_HOME': '/home/tester', 'FMA_S3_ACCESS_KEY_ID': 'access',
                'FMA_S3_SECRET_ACCESS_KEY': 'do-not-print-this-secret'}
@@ -104,7 +104,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('do-not-print-this-secret', result.stdout + result.stderr)
         generated = self.root / 'deploy/generated'
-        self.assertIn('-domain mail.example.net', (generated / 'fma.service').read_text())
+        self.assertNotIn('-domain', (generated / 'fma.service').read_text())
         self.assertIn('us-east-1', (generated / 's3.env').read_text())
         env['FMA_S3_ENDPOINT'] = 'http://999.0.0.1'
         result = subprocess.run(['bash', 'deploy/gen.sh', '--non-interactive'],

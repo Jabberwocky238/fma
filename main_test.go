@@ -151,7 +151,7 @@ func outboundTestDir(t *testing.T) {
 }
 func queuedJob(t *testing.T) (string, *outboundJob) {
 	t.Helper()
-	paths, err := objects.List(outbox + "/")
+	paths, err := objects.List("t12e.cc/" + outbox + "/")
 	var jobs []string
 	for _, key := range paths {
 		if strings.HasSuffix(key, ".json") {
@@ -170,7 +170,7 @@ func TestOutboundRetryAndRestart(t *testing.T) {
 	outboundTestDir(t)
 	relay := newFakeRelay(t, true)
 	body := []byte("From: jw238@t12e.cc\r\nTo: recipient@example.net\r\nSubject: retry\r\n\r\nbody\r\n")
-	checkError(t, queueMail("jw238", "jw238@t12e.cc", nil, []string{"recipient@example.net"}, body))
+	checkError(t, queueMail("t12e.cc/jw238", "jw238@t12e.cc", nil, []string{"recipient@example.net"}, body))
 	path, job := queuedJob(t)
 	if string(job.Body) != string(body) {
 		t.Fatal("body was not preserved")
@@ -197,33 +197,33 @@ func TestOutboundPermanentFailureNotifiesSender(t *testing.T) {
 	outboundTestDir(t)
 	relay := newFakeRelay(t, true)
 	relay.code.Store(550)
-	checkError(t, queueMail("jw238", "jw238@t12e.cc", nil, []string{"missing@example.net"}, []byte("Subject: test\r\n\r\nbody\r\n")))
+	checkError(t, queueMail("t12e.cc/jw238", "jw238@t12e.cc", nil, []string{"missing@example.net"}, []byte("Subject: test\r\n\r\nbody\r\n")))
 	path, _ := queuedJob(t)
 	claimAndProcess(t, path)
 	if _, err := objects.Get(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatal("failed terminal task/preclaim remained", err)
 	}
-	notices, err := messages("jw238")
+	notices, err := messages("t12e.cc/jw238")
 	if err != nil || len(notices) != 1 || !strings.Contains(string(notices[0].Body), "missing@example.net") {
 		t.Fatal("expected one local failure notice", err)
 	}
 }
 func TestExternalRecipientRequiresAuthentication(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, objects.Put("jw238/.kind", []byte("account")))
-	checkError(t, objects.Put("jw238/.password", []byte("123123")))
+	checkError(t, objects.Put("t12e.cc/jw238/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/jw238/.password", []byte("123123")))
 	session := &smtpSession{}
 	if session.Rcpt("recipient@example.net", nil) == nil {
 		t.Fatal("open relay")
 	}
-	session.user = "jw238"
+	session.user = "t12e.cc/jw238"
 	checkError(t, session.Mail("jw238@t12e.cc", nil))
 	checkError(t, session.Rcpt("recipient@example.net", nil))
 	if err := session.Rcpt("unknown@t12e.cc", nil); err == nil {
 		t.Fatal("unknown local recipient sent externally")
 	}
 	session.Reset()
-	if len(session.remote) != 0 || session.from != "" || session.user != "jw238" {
+	if len(session.remote) != 0 || session.from != "" || session.user != "t12e.cc/jw238" {
 		t.Fatal("RSET leaked envelope or cleared authentication")
 	}
 	config.OutboundMode = "disabled"
@@ -279,17 +279,17 @@ func TestOutboundRelaySTARTTLS(t *testing.T) {
 
 func TestSentArchiveDoesNotResurrectDeletedMail(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, queueMail("jw238", "jw238@t12e.cc", nil, []string{"recipient@example.net"}, []byte("Subject: saved\r\n\r\nbody\r\n")))
-	saved, err := messages(testFolderKey(t, "jw238", "Sent"))
+	checkError(t, queueMail("t12e.cc/jw238", "jw238@t12e.cc", nil, []string{"recipient@example.net"}, []byte("Subject: saved\r\n\r\nbody\r\n")))
+	saved, err := messages(testFolderKey(t, "t12e.cc/jw238", "Sent"))
 	if err != nil || len(saved) != 1 {
 		t.Fatal("Sent missing", err)
 	}
-	checkError(t, deleteMessages(testFolderKey(t, "jw238", "Sent"), []uint32{saved[0].Uid}))
+	checkError(t, deleteMessages(testFolderKey(t, "t12e.cc/jw238", "Sent"), []uint32{saved[0].Uid}))
 	_, job := queuedJob(t)
 	if !job.Archived {
 		t.Fatal("Sent archive status not saved in task")
 	}
-	saved, err = messages(testFolderKey(t, "jw238", "Sent"))
+	saved, err = messages(testFolderKey(t, "t12e.cc/jw238", "Sent"))
 	if err != nil || len(saved) != 0 {
 		t.Fatal("deleted Sent message resurrected", err)
 	}
@@ -333,7 +333,7 @@ func TestLoginExchange(t *testing.T) {
 // Configuration is assembled before serving and is not reloaded per message.
 func TestConfigDefaultsAndFlagPrecedence(t *testing.T) {
 	calls := map[string]int{}
-	c, err := loadConfig([]string{"-domain", "example.org", "-outbound", "direct", "-queue-retry", "2s", "-smtps", "127.0.0.1:2465"}, func(key string) string {
+	c, err := loadConfig([]string{"-outbound", "direct", "-queue-retry", "2s", "-smtps", "127.0.0.1:2465"}, func(key string) string {
 		calls[key]++
 		if key == "FMA_OUTBOUND_MODE" {
 			return "relay"
@@ -341,7 +341,7 @@ func TestConfigDefaultsAndFlagPrecedence(t *testing.T) {
 		return ""
 	})
 	checkError(t, err)
-	if c.Domain != "example.org" || c.OutboundMode != "direct" || c.QueueRetry != 2*time.Second || c.SMTPSAddr != "127.0.0.1:2465" || c.POP3SAddr != "127.0.0.1:1995" {
+	if c.OutboundMode != "direct" || c.QueueRetry != 2*time.Second || c.SMTPSAddr != "127.0.0.1:2465" || c.POP3SAddr != "127.0.0.1:1995" {
 		t.Fatal("configuration defaults or flag precedence changed")
 	}
 	if len(calls) != 15 {
@@ -458,9 +458,9 @@ func TestSharedLocalAndQueuedAcceptance(t *testing.T) {
 	outboundTestDir(t)
 	local := []byte("Subject: local\r\n\r\nlocal body\r\n")
 	remote := []byte("Subject: remote\r\n\r\nremote body\r\n")
-	checkError(t, queueMail("jw238", "jw238@t12e.cc", []string{"jw238"}, nil, local))
-	checkError(t, queueMail("jw238", "jw238@t12e.cc", []string{"jw238"}, []string{"recipient@example.net"}, remote))
-	for _, key := range []string{"jw238", testFolderKey(t, "jw238", "Sent")} {
+	checkError(t, queueMail("t12e.cc/jw238", "jw238@t12e.cc", []string{"t12e.cc/jw238"}, nil, local))
+	checkError(t, queueMail("t12e.cc/jw238", "jw238@t12e.cc", []string{"t12e.cc/jw238"}, []string{"recipient@example.net"}, remote))
+	for _, key := range []string{"t12e.cc/jw238", testFolderKey(t, "t12e.cc/jw238", "Sent")} {
 		mail, err := messages(key)
 		if err != nil || len(mail) != 2 || string(mail[0].Body) != string(local) || string(mail[1].Body) != string(remote) {
 			t.Fatalf("shared storage %s: count=%d err=%v", key, len(mail), err)
@@ -470,8 +470,8 @@ func TestSharedLocalAndQueuedAcceptance(t *testing.T) {
 	if len(job.Recipients) != 1 || job.Recipients[0].State != "pending" || string(job.Body) != string(remote) {
 		t.Fatal("queue lost recipient state or original body")
 	}
-	checkError(t, saveSent("jw238", remote))
-	sent, err := messages(testFolderKey(t, "jw238", "Sent"))
+	checkError(t, saveSent("t12e.cc/jw238", remote))
+	sent, err := messages(testFolderKey(t, "t12e.cc/jw238", "Sent"))
 	if err != nil || len(sent) != 2 {
 		t.Fatal("Sent deduplication failed", err)
 	}
@@ -568,7 +568,7 @@ func TestBucketLockExcludesConcurrentWriters(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			release, err := lockBucket(store, time.Now())
+			release, err := lockBucket(store, time.Now(), "t12e.cc")
 			if err == nil {
 				winners.Add(1)
 				releases <- release
@@ -584,13 +584,13 @@ func TestBucketLockExcludesConcurrentWriters(t *testing.T) {
 	for release := range releases {
 		release.release(time.Now())
 	}
-	release, err := lockBucket(store, time.Now())
+	release, err := lockBucket(store, time.Now(), "t12e.cc")
 	checkError(t, err)
 	release.release(time.Now())
 }
 func TestFoldersRenameAndRecreate(t *testing.T) {
 	outboundTestDir(t)
-	user := &imapUser{name: "alice"}
+	user := &imapUser{name: "t12e.cc/alice"}
 	checkError(t, user.CreateMailbox("Work"))
 	box, err := user.GetMailbox("Work")
 	checkError(t, err)
@@ -622,18 +622,18 @@ func TestFoldersRenameAndRecreate(t *testing.T) {
 }
 func TestS3StorageReloadAndPagination(t *testing.T) {
 	outboundTestDir(t)
-	if authenticate("alice", "secret") {
+	if authenticate("alice@t12e.cc", "secret") {
 		t.Fatal("missing account accepted")
 	}
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", []byte("secret")))
-	if !authenticate("alice", "secret") {
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", []byte("secret")))
+	if !authenticate("alice@t12e.cc", "secret") {
 		t.Fatal("external account was not discovered")
 	}
 
-	checkError(t, deliver([]string{"alice"}, []byte("Subject: inbox\r\n\r\nbody")))
-	checkError(t, saveSent("alice", []byte("Subject: sent\r\n\r\nbody")))
-	inboxMessages, err := messages("alice")
+	checkError(t, deliver([]string{"t12e.cc/alice"}, []byte("Subject: inbox\r\n\r\nbody")))
+	checkError(t, saveSent("t12e.cc/alice", []byte("Subject: sent\r\n\r\nbody")))
+	inboxMessages, err := messages("t12e.cc/alice")
 	checkError(t, err)
 	if len(inboxMessages) != 1 {
 		t.Fatal("recursive listing included folder or metadata objects")
@@ -666,7 +666,7 @@ func TestMissingOrUnavailableBucket(t *testing.T) {
 }
 func TestFolderFlagsPersist(t *testing.T) {
 	outboundTestDir(t)
-	user := &imapUser{name: "alice"}
+	user := &imapUser{name: "t12e.cc/alice"}
 	checkError(t, user.CreateMailbox("Test"))
 	box, err := user.GetMailbox("Test")
 	checkError(t, err)
@@ -753,37 +753,37 @@ func (p *prefixedObjects) Swap(k string, b []byte, etag string) error {
 func TestLeaseRenewalExpiryAndStaleRelease(t *testing.T) {
 	outboundTestDir(t)
 	now := time.Now().UTC()
-	first, err := lockBucket(objects, now)
+	first, err := lockBucket(objects, now, "t12e.cc")
 	checkError(t, err)
 	checkError(t, first.renew(now.Add(15*time.Second)))
-	record, _, err := readLock(objects.(versionedStore))
+	record, _, err := readLock(objects.(versionedStore), "t12e.cc")
 	checkError(t, err)
 	if !record.StartedAt.Equal(now) || !record.RenewedAt.Equal(now.Add(15*time.Second)) || !record.ExpiresAt.Equal(now.Add(45*time.Second)) {
 		t.Fatal("incorrect lease timestamps")
 	}
-	if _, err := lockBucket(objects, now.Add(31*time.Second)); err == nil {
+	if _, err := lockBucket(objects, now.Add(31*time.Second), "t12e.cc"); err == nil {
 		t.Fatal("renewed lease stolen")
 	}
-	second, err := lockBucket(objects, now.Add(46*time.Second))
+	second, err := lockBucket(objects, now.Add(46*time.Second), "t12e.cc")
 	checkError(t, err)
 	if first.renew(now.Add(47*time.Second)) == nil {
 		t.Fatal("expired owner renewed")
 	}
 	first.release(now.Add(47 * time.Second))
-	record, _, err = readLock(objects.(versionedStore))
+	record, _, err = readLock(objects.(versionedStore), "t12e.cc")
 	checkError(t, err)
 	if record.Owner != second.record.Owner {
 		t.Fatal("stale release changed successor lock")
 	}
 	second.release(now.Add(47 * time.Second))
-	third, err := lockBucket(objects, now.Add(48*time.Second))
+	third, err := lockBucket(objects, now.Add(48*time.Second), "t12e.cc")
 	checkError(t, err)
 	third.release(now.Add(49 * time.Second))
 }
 func TestExpiredLeaseTakeoverRace(t *testing.T) {
 	outboundTestDir(t)
 	now := time.Now()
-	_, err := lockBucket(objects, now.Add(-time.Minute))
+	_, err := lockBucket(objects, now.Add(-time.Minute), "t12e.cc")
 	checkError(t, err)
 	var wg sync.WaitGroup
 	var winners atomic.Int32
@@ -793,7 +793,7 @@ func TestExpiredLeaseTakeoverRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if _, err := lockBucket(objects, now); err == nil {
+			if _, err := lockBucket(objects, now, "t12e.cc"); err == nil {
 				winners.Add(1)
 			}
 		}()
@@ -806,7 +806,7 @@ func TestExpiredLeaseTakeoverRace(t *testing.T) {
 }
 func TestLeaseLossStopsWriter(t *testing.T) {
 	outboundTestDir(t)
-	lease, err := lockBucket(objects, time.Now())
+	lease, err := lockBucket(objects, time.Now(), "t12e.cc")
 	checkError(t, err)
 	guard := &guardedStore{base: objects, lease: lease}
 	lease.mu.Lock()
@@ -831,12 +831,12 @@ func TestLeaseLossStopsWriter(t *testing.T) {
 
 func TestExternalAccountsWithoutReload(t *testing.T) {
 	outboundTestDir(t)
-	if authenticate("alice", "secret") {
+	if authenticate("alice@t12e.cc", "secret") {
 		t.Fatal("missing account accepted")
 	}
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", []byte("secret\n")))
-	if !authenticate("alice@t12e.cc", "secret") || authenticate("alice", "wrong") {
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", []byte("secret\n")))
+	if !authenticate("alice@t12e.cc", "secret") || authenticate("alice@t12e.cc", "wrong") {
 		t.Fatal("new account authentication failed")
 	}
 	session := &smtpSession{}
@@ -844,18 +844,18 @@ func TestExternalAccountsWithoutReload(t *testing.T) {
 	if session.Rcpt("alicex@t12e.cc", nil) == nil {
 		t.Fatal("prefix isolation failed")
 	}
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", []byte("changed")))
-	if authenticate("alice", "secret") || !authenticate("alice", "changed") {
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", []byte("changed")))
+	if authenticate("alice@t12e.cc", "secret") || !authenticate("alice@t12e.cc", "changed") {
 		t.Fatal("password change required reload")
 	}
-	checkError(t, objects.Delete("alice/.password"))
-	if authenticate("alice", "changed") || session.Rcpt("alice@t12e.cc", nil) == nil {
+	checkError(t, objects.Delete("t12e.cc/alice/.password"))
+	if authenticate("alice@t12e.cc", "changed") || session.Rcpt("alice@t12e.cc", nil) == nil {
 		t.Fatal("deleted account still accepted")
 	}
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", nil))
-	if authenticate("alice", "") || session.Rcpt("alice@t12e.cc", nil) == nil {
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", nil))
+	if authenticate("alice@t12e.cc", "") || session.Rcpt("alice@t12e.cc", nil) == nil {
 		t.Fatal("empty password accepted")
 	}
 }
@@ -872,7 +872,7 @@ func claimAndProcess(t *testing.T, key string) {
 
 func TestPreclaimRaceTimeoutAndStaleCompletion(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, queueMail("alice", "alice@t12e.cc", nil, []string{"r@example.net"}, []byte("Subject: claim\r\n\r\nbody")))
+	checkError(t, queueMail("t12e.cc/alice", "alice@t12e.cc", nil, []string{"r@example.net"}, []byte("Subject: claim\r\n\r\nbody")))
 	key, _ := queuedJob(t)
 	var wg sync.WaitGroup
 	winners := make(chan *claimedTask, 16)
@@ -892,12 +892,12 @@ func TestPreclaimRaceTimeoutAndStaleCompletion(t *testing.T) {
 		t.Fatalf("%d claim winners", len(winners))
 	}
 	old := <-winners
-	if c, err := preclaimTask(key, "other", old.expires.Add(-time.Nanosecond)); err != nil || c != nil {
+	if c, err := preclaimTask(key, "t12e.cc/other", old.expires.Add(-time.Nanosecond)); err != nil || c != nil {
 		t.Fatal("live claim stolen", err)
 	}
-	current, err := preclaimTask(key, "other", old.expires)
+	current, err := preclaimTask(key, "t12e.cc/other", old.expires)
 	checkError(t, err)
-	if current == nil || current.job.Preclaim.Owner != "other" {
+	if current == nil || current.job.Preclaim.Owner != "t12e.cc/other" {
 		t.Fatal("expired preclaim not recovered")
 	}
 	old.job.Complete = true
@@ -907,7 +907,7 @@ func TestPreclaimRaceTimeoutAndStaleCompletion(t *testing.T) {
 	}
 	stored, err := readJSON[*outboundJob](key)
 	checkError(t, err)
-	if stored.Complete || stored.Preclaim.Owner != "other" {
+	if stored.Complete || stored.Preclaim.Owner != "t12e.cc/other" {
 		t.Fatal("successor lost")
 	}
 }
@@ -927,7 +927,7 @@ func (s *failTaskDelete) Delete(k string) error {
 func TestCompletedTaskCleanupAfterCrash(t *testing.T) {
 	outboundTestDir(t)
 	relay := newFakeRelay(t, true)
-	checkError(t, queueMail("alice", "alice@t12e.cc", nil, []string{"r@example.net"}, []byte("Subject: cleanup\r\n\r\nbody")))
+	checkError(t, queueMail("t12e.cc/alice", "alice@t12e.cc", nil, []string{"r@example.net"}, []byte("Subject: cleanup\r\n\r\nbody")))
 	key, _ := queuedJob(t)
 	base := objects
 	fault := &failTaskDelete{objectStore: base, versionedStore: base.(versionedStore), fail: true}
@@ -961,11 +961,11 @@ func TestConcurrentS3MailboxAllocation(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if err := ensureFolders("alice"); err != nil {
+			if err := ensureFolders("t12e.cc/alice"); err != nil {
 				failures <- err
 				return
 			}
-			failures <- appendMessage("alice", fmt.Appendf(nil, "message %d", i), nil, time.Now(), false)
+			failures <- appendMessage("t12e.cc/alice", fmt.Appendf(nil, "message %d", i), nil, time.Now(), false)
 		}(i)
 	}
 	wg.Wait()
@@ -973,7 +973,7 @@ func TestConcurrentS3MailboxAllocation(t *testing.T) {
 	for err := range failures {
 		checkError(t, err)
 	}
-	mail, err := messages("alice")
+	mail, err := messages("t12e.cc/alice")
 	checkError(t, err)
 	if len(mail) != 16 {
 		t.Fatalf("concurrent delivery lost messages: %d", len(mail))
@@ -986,10 +986,10 @@ func TestScannerYieldsAt1024WithoutDroppingClaims(t *testing.T) {
 	// both backends by the takeover tests above.
 	objects = &memoryObjects{data: make(map[string][]byte)}
 	for i := 0; i < maxClaimedTasks+1; i++ {
-		key := fmt.Sprintf("%s/%032x.json", outbox, i)
+		key := fmt.Sprintf("%s/%032x.json", "t12e.cc/"+outbox, i)
 		checkError(t, writeJSON(key, &outboundJob{ID: fmt.Sprintf("%032x", i), Archived: true, Recipients: []outboundRecipient{{Address: "a@example.net", State: "pending"}}}))
 	}
-	lease, err := lockBucket(objects, time.Now())
+	lease, err := lockBucket(objects, time.Now(), "t12e.cc")
 	checkError(t, err)
 	var wg sync.WaitGroup
 	slots := make(chan struct{}, maxClaimedTasks)
@@ -1001,16 +1001,16 @@ func TestScannerYieldsAt1024WithoutDroppingClaims(t *testing.T) {
 		t.Fatalf("incorrect batch: full=%v active=%d", full, len(slots))
 	}
 	lease.release(time.Now())
-	next, err := lockBucket(objects, time.Now())
+	next, err := lockBucket(objects, time.Now(), "t12e.cc")
 	checkError(t, err)
 	defer next.release(time.Now())
-	key := fmt.Sprintf("%s/%032x.json", outbox, maxClaimedTasks)
+	key := fmt.Sprintf("%s/%032x.json", "t12e.cc/"+outbox, maxClaimedTasks)
 	last, err := preclaimTask(key, next.owner(), time.Now())
 	checkError(t, err)
 	if last == nil {
 		t.Fatal("next node could not claim remaining task")
 	}
-	first, err := preclaimTask(fmt.Sprintf("%s/%032x.json", outbox, 0), next.owner(), time.Now())
+	first, err := preclaimTask(fmt.Sprintf("%s/%032x.json", "t12e.cc/"+outbox, 0), next.owner(), time.Now())
 	checkError(t, err)
 	if first != nil {
 		t.Fatal("releasing scanner lock released a live task")
@@ -1019,7 +1019,7 @@ func TestScannerYieldsAt1024WithoutDroppingClaims(t *testing.T) {
 
 func TestPreclaimExecutionCancellationPreservesTask(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, queueMail("alice", "alice@t12e.cc", nil, []string{"a@example.net"}, []byte("Subject: cancel\r\n\r\nbody")))
+	checkError(t, queueMail("t12e.cc/alice", "alice@t12e.cc", nil, []string{"a@example.net"}, []byte("Subject: cancel\r\n\r\nbody")))
 	key, _ := queuedJob(t)
 	c, err := preclaimTask(key, "node", time.Now())
 	checkError(t, err)
@@ -1054,19 +1054,19 @@ func TestConfigEnvironmentPrefixAndOfflineVersion(t *testing.T) {
 
 func TestAliasIdentityAndSharedMailbox(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", []byte("secret")))
-	checkError(t, objects.Put("sales/.kind", []byte("alias")))
-	checkError(t, objects.Put("sales/.alias", []byte("alice\n")))
-	checkError(t, objects.Put("sales/.password", []byte("ignored")))
-	checkError(t, objects.Put("alice/.profile.json", []byte(`{"display_name":"Alice","avatar":"avatar.png"}`)))
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", []byte("secret")))
+	checkError(t, objects.Put("t12e.cc/sales/.kind", []byte("alias")))
+	checkError(t, objects.Put("t12e.cc/sales/.alias", []byte("alice\n")))
+	checkError(t, objects.Put("t12e.cc/sales/.password", []byte("ignored")))
+	checkError(t, objects.Put("t12e.cc/alice/.profile.json", []byte(`{"display_name":"Alice","avatar":"avatar.png"}`)))
 	identity, err := authenticateAccount("sales@t12e.cc", "secret")
 	checkError(t, err)
-	if identity.LoginID != "sales" || identity.RootID != "alice" || authenticate("sales", "ignored") {
+	if identity.LoginID != "t12e.cc/sales" || identity.RootID != "t12e.cc/alice" || authenticate("sales@t12e.cc", "ignored") {
 		t.Fatal("alias identity or credentials incorrect")
 	}
 	sender := &smtpSession{requireAuth: true}
-	checkError(t, sender.authenticate("alice", "sales", "secret"))
+	checkError(t, sender.authenticate("alice@t12e.cc", "sales@t12e.cc", "secret"))
 	checkError(t, sender.Mail("sales@t12e.cc", nil))
 	checkError(t, sender.Rcpt("alice@t12e.cc", nil))
 	checkError(t, sender.Rcpt("sales@t12e.cc", nil))
@@ -1074,44 +1074,44 @@ func TestAliasIdentityAndSharedMailbox(t *testing.T) {
 		t.Fatal("root and alias were not deduplicated")
 	}
 	checkError(t, sender.Data(strings.NewReader("Subject: aliases\r\n\r\nbody\r\n")))
-	mailbox, err := messages("alice")
+	mailbox, err := messages("t12e.cc/alice")
 	checkError(t, err)
 	if len(mailbox) != 1 {
 		t.Fatal("metadata treated as mail or duplicate delivery")
 	}
-	aliasMail, err := messages("sales")
+	aliasMail, err := messages("t12e.cc/sales")
 	checkError(t, err)
 	if len(aliasMail) != 0 {
 		t.Fatal("mail stored under alias prefix")
 	}
-	user, err := (imapBackend{}).Login(nil, "sales", "secret")
+	user, err := (imapBackend{}).Login(nil, "sales@t12e.cc", "secret")
 	checkError(t, err)
-	if user.Username() != "sales" || user.(*imapUser).name != "alice" {
+	if user.Username() != "t12e.cc/sales" || user.(*imapUser).name != "t12e.cc/alice" {
 		t.Fatal("IMAP lost login or root ID")
 	}
 	pop := &popMailbox{deleted: map[int]bool{}}
-	checkError(t, pop.Login(context.Background(), "sales", "secret"))
+	checkError(t, pop.Login(context.Background(), "sales@t12e.cc", "secret"))
 	defer pop.Close()
 	second := &popMailbox{deleted: map[int]bool{}}
-	if second.Login(context.Background(), "alice", "secret") == nil {
+	if second.Login(context.Background(), "alice@t12e.cc", "secret") == nil {
 		second.Close()
 		t.Fatal("alias bypassed root maildrop lock")
 	}
-	if pop.loginID != "sales" || pop.user != "alice" {
+	if pop.loginID != "t12e.cc/sales" || pop.user != "t12e.cc/alice" {
 		t.Fatal("POP identity incorrect")
 	}
 	checkError(t, pop.Dele(context.Background(), 1))
 	checkError(t, pop.Close())
-	mailbox, err = messages("alice")
+	mailbox, err = messages("t12e.cc/alice")
 	checkError(t, err)
 	if len(mailbox) != 1 {
 		t.Fatal("disconnect committed alias deletes")
 	}
-	checkError(t, objects.Put("other/.kind", []byte("account")))
-	checkError(t, objects.Put("other/.password", []byte("different")))
-	checkError(t, objects.Put("sales/.kind", []byte("alias")))
-	checkError(t, objects.Put("sales/.alias", []byte("other")))
-	if authenticate("sales", "secret") || !authenticate("sales", "different") {
+	checkError(t, objects.Put("t12e.cc/other/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/other/.password", []byte("different")))
+	checkError(t, objects.Put("t12e.cc/sales/.kind", []byte("alias")))
+	checkError(t, objects.Put("t12e.cc/sales/.alias", []byte("other")))
+	if authenticate("sales@t12e.cc", "secret") || !authenticate("sales@t12e.cc", "different") {
 		t.Fatal("alias target change not immediate")
 	}
 	if sender.Mail("sales@t12e.cc", nil) == nil {
@@ -1121,23 +1121,23 @@ func TestAliasIdentityAndSharedMailbox(t *testing.T) {
 
 func TestInvalidAliasesFailClosed(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", []byte("secret")))
-	for _, target := range []string{"", "missing", "../alice", "alice@t12e.cc", "sales"} {
-		checkError(t, objects.Put("sales/.kind", []byte("alias")))
-		checkError(t, objects.Put("sales/.alias", []byte(target)))
-		if authenticate("sales", "secret") {
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", []byte("secret")))
+	for _, target := range []string{"", "missing", "../alice", "alice@t12e.cc", "t12e.cc/sales"} {
+		checkError(t, objects.Put("t12e.cc/sales/.kind", []byte("alias")))
+		checkError(t, objects.Put("t12e.cc/sales/.alias", []byte(target)))
+		if authenticate("sales@t12e.cc", "secret") {
 			t.Fatalf("invalid alias accepted: %q", target)
 		}
 		if (&smtpSession{}).Rcpt("sales@t12e.cc", nil) == nil {
 			t.Fatal("invalid alias recipient accepted")
 		}
 	}
-	checkError(t, objects.Put("sales/.kind", []byte("alias")))
-	checkError(t, objects.Put("sales/.alias", []byte("support")))
-	checkError(t, objects.Put("support/.kind", []byte("alias")))
-	checkError(t, objects.Put("support/.alias", []byte("sales")))
-	if authenticate("sales", "secret") {
+	checkError(t, objects.Put("t12e.cc/sales/.kind", []byte("alias")))
+	checkError(t, objects.Put("t12e.cc/sales/.alias", []byte("support")))
+	checkError(t, objects.Put("t12e.cc/support/.kind", []byte("alias")))
+	checkError(t, objects.Put("t12e.cc/support/.alias", []byte("sales")))
+	if authenticate("sales@t12e.cc", "secret") {
 		t.Fatal("alias cycle accepted")
 	}
 }
@@ -1149,7 +1149,7 @@ func TestStartupConfigValidation(t *testing.T) {
 	for _, change := range []func(*Config){
 		func(c *Config) { c.S3.Bucket = "" }, func(c *Config) { c.S3.Region = "" },
 		func(c *Config) { c.S3.AccessKey = "" }, func(c *Config) { c.S3.SecretKey = "" },
-		func(c *Config) { c.S3.Endpoint = "ftp://localhost" }, func(c *Config) { c.Domain = "" },
+		func(c *Config) { c.S3.Endpoint = "ftp://localhost" },
 		func(c *Config) { c.CertFile = "" }, func(c *Config) { c.KeyFile = "" },
 		func(c *Config) { c.SMTPAddr = "localhost:99999" }, func(c *Config) { c.IMAPAddr = c.SMTPAddr },
 	} {
@@ -1162,7 +1162,6 @@ func TestStartupConfigValidation(t *testing.T) {
 	checkError(t, checkConfig(Config{ShowVersion: true}))
 	c := valid
 	c.ShowQueue = true
-	c.Domain = ""
 	c.OutboundMode = "invalid"
 	checkError(t, checkConfig(c))
 }
@@ -1233,36 +1232,36 @@ func TestMountedTLSSecret(t *testing.T) {
 func TestIdentityKindSelectsConfiguration(t *testing.T) {
 	outboundTestDir(t)
 	for key, value := range map[string]string{
-		"slot/.password": "slot-password", "slot/.alias": "root", "slot/.proxy": "remote@example.net",
-		"root/.kind": "account", "root/.password": "root-password",
+		"t12e.cc/slot/.password": "slot-password", "t12e.cc/slot/.alias": "root", "t12e.cc/slot/.proxy": "remote@example.net",
+		"t12e.cc/root/.kind": "account", "t12e.cc/root/.password": "root-password",
 	} {
 		checkError(t, objects.Put(key, []byte(value)))
 	}
 	for _, kind := range []string{"", "unknown", "account alias", "ACCOUNT"} {
-		checkError(t, objects.Put("slot/.kind", []byte(kind)))
-		if authenticate("slot", "slot-password") || (&smtpSession{}).Rcpt("slot@t12e.cc", nil) == nil {
+		checkError(t, objects.Put("t12e.cc/slot/.kind", []byte(kind)))
+		if authenticate("slot@t12e.cc", "slot-password") || (&smtpSession{}).Rcpt("slot@t12e.cc", nil) == nil {
 			t.Fatal("invalid kind accepted", kind)
 		}
 	}
-	checkError(t, objects.Delete("slot/.kind"))
-	if authenticate("slot", "slot-password") {
+	checkError(t, objects.Delete("t12e.cc/slot/.kind"))
+	if authenticate("slot@t12e.cc", "slot-password") {
 		t.Fatal("missing kind inferred from password")
 	}
-	checkError(t, objects.Put("slot/.kind", []byte("account\n")))
-	if !authenticate("slot", "slot-password") || authenticate("slot", "root-password") {
+	checkError(t, objects.Put("t12e.cc/slot/.kind", []byte("account\n")))
+	if !authenticate("slot@t12e.cc", "slot-password") || authenticate("slot@t12e.cc", "root-password") {
 		t.Fatal("account used alias or proxy config")
 	}
 	account := &smtpSession{}
 	checkError(t, account.Rcpt("slot@t12e.cc", nil))
-	if len(account.remote) != 0 || len(account.recipients) != 1 || account.recipients[0] != "slot" {
+	if len(account.remote) != 0 || len(account.recipients) != 1 || account.recipients[0] != "t12e.cc/slot" {
 		t.Fatal("account routed via stale proxy")
 	}
-	checkError(t, objects.Put("slot/.kind", []byte("alias")))
-	if !authenticate("slot", "root-password") || authenticate("slot", "slot-password") {
+	checkError(t, objects.Put("t12e.cc/slot/.kind", []byte("alias")))
+	if !authenticate("slot@t12e.cc", "root-password") || authenticate("slot@t12e.cc", "slot-password") {
 		t.Fatal("alias used stale password")
 	}
-	checkError(t, objects.Put("slot/.kind", []byte("proxy")))
-	if authenticate("slot", "slot-password") || authenticate("slot", "root-password") {
+	checkError(t, objects.Put("t12e.cc/slot/.kind", []byte("proxy")))
+	if authenticate("slot@t12e.cc", "slot-password") || authenticate("slot@t12e.cc", "root-password") {
 		t.Fatal("proxy allowed authentication")
 	}
 	proxy := &smtpSession{}
@@ -1276,9 +1275,9 @@ func TestProxyLocalRoutingAndCycles(t *testing.T) {
 	outboundTestDir(t)
 	config.OutboundMode = "disabled"
 	for key, value := range map[string]string{
-		"forward/.kind": "proxy", "forward/.proxy": "alias@t12e.cc",
-		"alias/.kind": "alias", "alias/.alias": "root",
-		"root/.kind": "account", "root/.password": "secret",
+		"t12e.cc/forward/.kind": "proxy", "t12e.cc/forward/.proxy": "alias@t12e.cc",
+		"t12e.cc/alias/.kind": "alias", "t12e.cc/alias/.alias": "root",
+		"t12e.cc/root/.kind": "account", "t12e.cc/root/.password": "secret",
 	} {
 		checkError(t, objects.Put(key, []byte(value)))
 	}
@@ -1288,24 +1287,24 @@ func TestProxyLocalRoutingAndCycles(t *testing.T) {
 	checkError(t, session.Rcpt("forward@t12e.cc", nil))
 	checkError(t, session.Rcpt("root@t12e.cc", nil))
 	checkError(t, session.Data(bytes.NewReader(body)))
-	mailbox, err := messages("root")
+	mailbox, err := messages("t12e.cc/root")
 	checkError(t, err)
 	if len(mailbox) != 1 || !bytes.Equal(mailbox[0].Body, body) {
 		t.Fatal("local proxy lost or duplicated mail")
 	}
-	mailbox, err = messages("forward")
+	mailbox, err = messages("t12e.cc/forward")
 	checkError(t, err)
 	if len(mailbox) != 0 {
 		t.Fatal("proxy kept a local copy")
 	}
 	for _, target := range []string{"forward@t12e.cc", "bad", "one@example.net,two@example.net", "name <one@example.net>", "../root@t12e.cc", "missing@t12e.cc", "remote@example.net"} {
-		checkError(t, objects.Put("forward/.proxy", []byte(target)))
+		checkError(t, objects.Put("t12e.cc/forward/.proxy", []byte(target)))
 		if (&smtpSession{}).Rcpt("forward@t12e.cc", nil) == nil {
 			t.Fatal("invalid/disabled proxy accepted", target)
 		}
 	}
-	checkError(t, objects.Put("forward/.proxy", []byte("alias@t12e.cc")))
-	checkError(t, objects.Put("alias/.alias", []byte("forward")))
+	checkError(t, objects.Put("t12e.cc/forward/.proxy", []byte("alias@t12e.cc")))
+	checkError(t, objects.Put("t12e.cc/alias/.alias", []byte("forward")))
 	if (&smtpSession{}).Rcpt("forward@t12e.cc", nil) == nil {
 		t.Fatal("mixed alias/proxy loop accepted")
 	}
@@ -1319,7 +1318,7 @@ func TestProxyRemoteDurabilityAndFailure(t *testing.T) {
 			if failure {
 				relay.code.Store(550)
 			}
-			for _, id := range []string{"first", "second"} {
+			for _, id := range []string{"t12e.cc/first", "t12e.cc/second"} {
 				checkError(t, objects.Put(id+"/.kind", []byte("proxy")))
 				checkError(t, objects.Put(id+"/.proxy", []byte("destination@example.net")))
 			}
@@ -1329,7 +1328,7 @@ func TestProxyRemoteDurabilityAndFailure(t *testing.T) {
 			checkError(t, s.Rcpt("first@t12e.cc", nil))
 			checkError(t, s.Rcpt("second@t12e.cc", nil))
 			// Retargeting after RCPT must not alter the accepted routing snapshot.
-			checkError(t, objects.Put("first/.proxy", []byte("changed@example.net")))
+			checkError(t, objects.Put("t12e.cc/first/.proxy", []byte("changed@example.net")))
 			checkError(t, s.Data(bytes.NewReader(body)))
 			key, job := queuedJob(t)
 			if job.User != "" || job.From != "sender@example.net" || len(job.Recipients) != 1 || job.Recipients[0].Address != "destination@example.net" || len(job.Recipients[0].ProxyOwners) != 2 {
@@ -1338,7 +1337,7 @@ func TestProxyRemoteDurabilityAndFailure(t *testing.T) {
 			if !bytes.Equal(job.Body, append([]byte("X-FMA-Proxy-Hops: 1\r\n"), body...)) {
 				t.Fatal("forwarding changed MIME content")
 			}
-			for _, id := range []string{"first", "second"} {
+			for _, id := range []string{"t12e.cc/first", "t12e.cc/second"} {
 				mailbox, err := messages(id)
 				checkError(t, err)
 				if len(mailbox) != 0 {
@@ -1353,7 +1352,7 @@ func TestProxyRemoteDurabilityAndFailure(t *testing.T) {
 				t.Fatal("duplicate proxy delivery")
 			}
 			if failure {
-				for _, id := range []string{"first", "second"} {
+				for _, id := range []string{"t12e.cc/first", "t12e.cc/second"} {
 					report, err := objects.Get(id + "/.proxy-errors/" + job.ID + ".json")
 					checkError(t, err)
 					if !bytes.Contains(report, []byte("destination@example.net")) || bytes.Contains(report, []byte("AAECAwQF")) {
@@ -1403,14 +1402,14 @@ func TestJMAPS3BackendContract(t *testing.T) {
 
 func TestJMAPSharedMailbox(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", []byte("secret")))
 	body := []byte("From: alice@t12e.cc\r\nTo: alice@t12e.cc\r\nSubject: shared\r\nMessage-ID: <shared@t12e.cc>\r\n\r\nhello\r\n")
-	checkError(t, appendMessage("alice", body, nil, time.Now(), false))
+	checkError(t, appendMessage("t12e.cc/alice", body, nil, time.Now(), false))
 	old := useJMAP
 	useJMAP = true
 	t.Cleanup(func() { useJMAP = old })
-	a, err := openJMAPAccount(context.Background(), "alice")
+	a, err := openJMAPAccount(context.Background(), "t12e.cc/alice")
 	checkError(t, err)
 	result, err := a.call(context.Background(), "Email/query", map[string]any{})
 	checkError(t, err)
@@ -1418,12 +1417,12 @@ func TestJMAPSharedMailbox(t *testing.T) {
 	if len(ids) != 1 {
 		t.Fatalf("bootstrap ids: %s", result)
 	}
-	stored, err := messages("alice")
+	stored, err := messages("t12e.cc/alice")
 	checkError(t, err)
 	if len(stored) != 1 || stored[0].Uid != 1 || stored[0].Body != nil {
 		t.Fatalf("shared mailbox: %+v", stored)
 	}
-	refs, err := mailBlobRefs(context.Background(), "alice")
+	refs, err := mailBlobRefs(context.Background(), "t12e.cc/alice")
 	checkError(t, err)
 	r, _, err := openStoredMessage(context.Background(), stored[0], refs)
 	checkError(t, err)
@@ -1435,18 +1434,18 @@ func TestJMAPSharedMailbox(t *testing.T) {
 	}
 	_, err = a.call(context.Background(), "Email/set", map[string]any{"update": map[jmap.Id]any{ids[0]: map[string]any{"keywords/$seen": true}}})
 	checkError(t, err)
-	stored, err = messages("alice")
+	stored, err = messages("t12e.cc/alice")
 	checkError(t, err)
 	if !slices.Contains(stored[0].Flags, imap.SeenFlag) {
 		t.Fatal("JMAP flags not visible in IMAP")
 	}
-	checkError(t, appendMessage("alice", body, nil, time.Now(), false))
-	stored, err = messages("alice")
+	checkError(t, appendMessage("t12e.cc/alice", body, nil, time.Now(), false))
+	stored, err = messages("t12e.cc/alice")
 	checkError(t, err)
 	if len(stored) != 2 || stored[1].Uid != 2 {
 		t.Fatalf("append: %+v", stored)
 	}
-	checkError(t, removeMessage("alice", 1))
+	checkError(t, removeMessage("t12e.cc/alice", 1))
 	result, err = a.call(context.Background(), "Email/query", map[string]any{})
 	checkError(t, err)
 	if len(jvalue[[]jmap.Id](result, "ids")) != 1 {
@@ -1463,7 +1462,7 @@ func TestS3BlobCompression(t *testing.T) {
 	}
 	bucket, err := connectBucket(S3Config{Endpoint: endpoint, Bucket: os.Getenv("TEST_S3_BUCKET"), Region: "us-east-1", AccessKey: "test", SecretKey: "test"})
 	checkError(t, err)
-	root := fmt.Sprintf("compression%d", time.Now().UnixNano())
+	root := fmt.Sprintf("t12e.cc/compression%d", time.Now().UnixNano())
 	blobs := jmapBlobs{store: bucket}
 	acct := jmapAccountID(root)
 	t.Cleanup(func() {
@@ -1566,7 +1565,7 @@ func BenchmarkBlobUploadPipeline(b *testing.B) {
 	b.SetBytes(2 << 30)
 	b.ReportAllocs()
 	for b.Loop() {
-		w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("bench"), digest: sha256.New(), writer: discardObjectUpload{}}
+		w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("t12e.cc/bench"), digest: sha256.New(), writer: discardObjectUpload{}}
 		for range 2048 {
 			if _, err := w.Write(block); err != nil {
 				b.Fatal(err)
@@ -1649,7 +1648,7 @@ func TestCopyStreamShortReadsAndErrors(t *testing.T) {
 }
 func TestBlobWriterAbortReturnsBuffers(t *testing.T) {
 	for _, size := range []int{1, gzipThreshold, gzipThreshold + 1} {
-		w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("test"), digest: sha256.New(), writer: discardObjectUpload{}}
+		w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("t12e.cc/test"), digest: sha256.New(), writer: discardObjectUpload{}}
 		block := make([]byte, 32768)
 		for left := size; left > 0; {
 			n := min(left, len(block))
@@ -1745,16 +1744,16 @@ func TestWaitPoolConcurrentCapacity(t *testing.T) {
 
 func TestNamedBlobKeyEscapesSegments(t *testing.T) {
 	name := blobName{MIME: true, Filename: "../report/#?%.pdf"}
-	key := namedBlobKey("alice", name, []byte("Subject: =?UTF-8?B?5oql5Lu3L+WQiOWQjCAjMQ==?=\r\n\r\nbody"))
+	key := namedBlobKey("t12e.cc/alice", name, []byte("Subject: =?UTF-8?B?5oql5Lu3L+WQiOWQjCAjMQ==?=\r\n\r\nbody"))
 	parts := strings.Split(key, "/")
-	if len(parts) != 4 || parts[0] != "alice" || parts[1] != "mail" {
+	if len(parts) != 5 || parts[0] != "t12e.cc" || parts[1] != "alice" || parts[2] != "mail" {
 		t.Fatalf("unsafe key %q", key)
 	}
-	if !strings.HasPrefix(parts[2], "%E6%8A%A5%E4%BB%B7%2F%E5%90%88%E5%90%8C%20%231_") {
-		t.Fatalf("subject not decoded and escaped: %q", parts[2])
+	if !strings.HasPrefix(parts[3], "%E6%8A%A5%E4%BB%B7%2F%E5%90%88%E5%90%8C%20%231_") {
+		t.Fatalf("subject not decoded and escaped: %q", parts[3])
 	}
-	if parts[3] != "..%2Freport%2F%23%3F%25.pdf" {
-		t.Fatalf("filename not escaped: %q", parts[3])
+	if parts[4] != "..%2Freport%2F%23%3F%25.pdf" {
+		t.Fatalf("filename not escaped: %q", parts[4])
 	}
 	for _, value := range []string{".", "..", "a/b", "a%2Fb", "a?b#c", "\x00\r\n"} {
 		segment := objectNameSegment(value, "untitled")
@@ -1762,19 +1761,19 @@ func TestNamedBlobKeyEscapesSegments(t *testing.T) {
 			t.Fatalf("unsafe segment %q", segment)
 		}
 	}
-	if len(namedBlobKey("alice", blobName{Subject: strings.Repeat("界", 1000), Filename: strings.Repeat("文", 1000)}, nil)) > 1024 {
+	if len(namedBlobKey("t12e.cc/alice", blobName{Subject: strings.Repeat("界", 1000), Filename: strings.Repeat("文", 1000)}, nil)) > 1024 {
 		t.Fatal("S3 key limit exceeded")
 	}
 }
 
 func TestObjectReferenceAccountBoundary(t *testing.T) {
-	for _, target := range []string{"bob/mail/topic/file", "alice/mail/../../bob/file", "alice/.jmap/blobs/Gother", "/alice/mail/topic/file"} {
+	for _, target := range []string{"t12e.cc/bob/mail/topic/file", "t12e.cc/alice/mail/../../bob/file", "t12e.cc/alice/.jmap/blobs/Gother", "/alice/mail/topic/file"} {
 		data := fmt.Appendf(nil, `{"key":%q}`, target)
-		if _, err := decodeObjectReference("alice/.jmap/blobs/Gid", data); err == nil {
+		if _, err := decodeObjectReference("t12e.cc/alice/.jmap/blobs/Gid", data); err == nil {
 			t.Fatalf("accepted %q", target)
 		}
 	}
-	if _, err := decodeObjectReference("alice/.jmap/blobs/Gid", []byte(`{"key":"alice/mail/topic/file","metadata":{"fma-reference":"1"}}`)); err == nil {
+	if _, err := decodeObjectReference("t12e.cc/alice/.jmap/blobs/Gid", []byte(`{"key":"t12e.cc/alice/mail/topic/file","metadata":{"fma-reference":"1"}}`)); err == nil {
 		t.Fatal("accepted nested reference")
 	}
 }
@@ -1783,7 +1782,7 @@ func TestSeparateUploadAndMIMELimits(t *testing.T) {
 	if jmapCore().MaxSizeUpload != 4<<30 || jmapMailCapability().MaxSizeAttachmentsPerEmail != 4<<30 || maxMailSize != 6<<30 {
 		t.Fatal("upload, attachment and MIME limits differ")
 	}
-	w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("alice"), writer: discardObjectUpload{}, digest: sha256.New(), size: maxMailSize}
+	w := &jmapBlobWriter{ctx: context.Background(), account: jmapAccountID("t12e.cc/alice"), writer: discardObjectUpload{}, digest: sha256.New(), size: maxMailSize}
 	if _, err := w.Write([]byte{1}); err == nil {
 		t.Fatal("oversized MIME accepted")
 	}
@@ -1796,7 +1795,7 @@ func TestS3NamedObjectCollisionAndLegacyRead(t *testing.T) {
 	}
 	bucket, err := connectBucket(S3Config{Endpoint: endpoint, Bucket: os.Getenv("TEST_S3_BUCKET"), Region: "us-east-1", AccessKey: "test", SecretKey: "test"})
 	checkError(t, err)
-	root := fmt.Sprintf("names%d", time.Now().UnixNano())
+	root := fmt.Sprintf("t12e.cc/names%d", time.Now().UnixNano())
 	t.Cleanup(func() {
 		for _, account := range []string{root, root + "b"} {
 			keys, _ := bucket.List(account + "/")
@@ -1845,7 +1844,7 @@ func TestS3NamedObjectCollisionAndLegacyRead(t *testing.T) {
 	if n != 8 || string(data) != "original" {
 		t.Fatal("collision replaced original data")
 	}
-	destination := root + "b/.jmap/blobs/" + path.Base(index)
+	destination := root + "t12e.cc/b/.jmap/blobs/" + path.Base(index)
 	checkError(t, bucket.CopyStream(ctx, index, destination))
 	checkError(t, bucket.CopyStream(ctx, index, destination))
 	r, n, err = bucket.OpenStream(ctx, destination)
@@ -1861,7 +1860,7 @@ func TestS3NamedObjectCollisionAndLegacyRead(t *testing.T) {
 	emptyIndex := root + "/.jmap/blobs/G" + strings.Repeat("b", 43)
 	checkError(t, empty.Commit(emptyIndex, nil))
 	checkError(t, empty.Abort())
-	emptyDestination := root + "b/.jmap/blobs/" + path.Base(emptyIndex)
+	emptyDestination := root + "t12e.cc/b/.jmap/blobs/" + path.Base(emptyIndex)
 	checkError(t, bucket.CopyStream(ctx, emptyIndex, emptyDestination))
 	r, n, err = bucket.OpenStream(ctx, emptyDestination)
 	checkError(t, err)
@@ -2147,9 +2146,9 @@ func TestS3PartBufferBlocksAndRetry(t *testing.T) {
 func TestS3CopyStreamStaysOnServer(t *testing.T) {
 	for _, physicalSize := range []int64{16 << 20, 6 << 30} {
 		t.Run(fmt.Sprint(physicalSize), func(t *testing.T) {
-			source := "alice/.jmap/blobs/G" + strings.Repeat("a", 43)
-			destination := "bob/.jmap/blobs/G" + strings.Repeat("a", 43)
-			physical := "alice/mail/topic_123/message.eml"
+			source := "t12e.cc/alice/.jmap/blobs/G" + strings.Repeat("a", 43)
+			destination := "t12e.cc/bob/.jmap/blobs/G" + strings.Repeat("a", 43)
+			physical := "t12e.cc/alice/mail/topic_123/message.eml"
 			ref := namedObjectReference{Key: physical, Metadata: map[string]string{"fma-encoding": "gzip", "fma-size": "2147483648"}}
 			data, err := json.Marshal(ref)
 			checkError(t, err)
@@ -2198,7 +2197,7 @@ func TestS3CopyStreamStaysOnServer(t *testing.T) {
 				case r.Method == "PUT":
 					if key == destination {
 						var copied namedObjectReference
-						if err := json.NewDecoder(r.Body).Decode(&copied); err != nil || copied.Key != "bob/mail/topic_123/message.eml" || copied.Metadata["fma-encoding"] != "gzip" {
+						if err := json.NewDecoder(r.Body).Decode(&copied); err != nil || copied.Key != "t12e.cc/bob/mail/topic_123/message.eml" || copied.Metadata["fma-encoding"] != "gzip" {
 							t.Error("invalid destination reference", err)
 						}
 					}
@@ -2246,15 +2245,15 @@ func (s *denyMIMEStore) Get(key string) ([]byte, error) {
 }
 func TestJMAPStoredPartsFirstRead(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", []byte("secret")))
 	old := useJMAP
 	useJMAP = true
 	t.Cleanup(func() { useJMAP = old })
 	ctx := context.Background()
-	a, err := openJMAPAccount(ctx, "alice")
+	a, err := openJMAPAccount(ctx, "t12e.cc/alice")
 	checkError(t, err)
-	box, err := a.mailbox(ctx, "alice")
+	box, err := a.mailbox(ctx, "t12e.cc/alice")
 	checkError(t, err)
 	raw := []byte("From: a@example.com\r\nSubject: stored / ?\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nhello\r\n--x\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"../same.bin\"\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAwQ=\r\n--x--\r\n")
 	id, err := a.importMail(ctx, box, raw, nil, time.Now())
@@ -2265,7 +2264,7 @@ func TestJMAPStoredPartsFirstRead(t *testing.T) {
 	sourceKey, err := a.blobs.key(a.id, source)
 	checkError(t, err)
 	store := &denyMIMEStore{objectStore: a.blobs.store, denied: sourceKey}
-	reopened, err := newJMAPAccount("alice", store)
+	reopened, err := newJMAPAccount("t12e.cc/alice", store)
 	checkError(t, err)
 	result, err := reopened.call(ctx, "Email/get", map[string]any{"ids": []jmap.Id{id}, "properties": []string{"id", "attachments"}})
 	checkError(t, err)
@@ -2278,7 +2277,7 @@ func TestJMAPStoredPartsFirstRead(t *testing.T) {
 	if len(parts) != 1 || parts[0].Size != 5 {
 		t.Fatalf("parts: %+v", parts)
 	}
-	checkError(t, reopened.materializePart(ctx, parts[0].BlobID, "alice"))
+	checkError(t, reopened.materializePart(ctx, parts[0].BlobID, "t12e.cc/alice"))
 	r, n, err := reopened.blobs.Open(ctx, reopened.id, parts[0].BlobID)
 	checkError(t, err)
 	got, err := io.ReadAll(r)
@@ -2287,9 +2286,9 @@ func TestJMAPStoredPartsFirstRead(t *testing.T) {
 	if n != 5 || !bytes.Equal(got, []byte{0, 1, 2, 3, 4}) || store.reads != 0 {
 		t.Fatalf("first read: %x, MIME reads=%d", got, store.reads)
 	}
-	bob, err := newJMAPAccount("bob", store)
+	bob, err := newJMAPAccount("t12e.cc/bob", store)
 	checkError(t, err)
-	if err = bob.materializePart(ctx, parts[0].BlobID, "bob"); err == nil {
+	if err = bob.materializePart(ctx, parts[0].BlobID, "t12e.cc/bob"); err == nil {
 		t.Fatal("cross-account attachment access")
 	}
 }
@@ -2550,17 +2549,17 @@ func ownerTestSnapshot(t *testing.T, s *jmapOwnerState) map[string][]byte {
 }
 func TestJMAPOwnerColdRecoveryAndLayout(t *testing.T) {
 	outboundTestDir(t)
-	checkError(t, objects.Put("alice/.kind", []byte("account")))
-	checkError(t, objects.Put("alice/.password", []byte("secret")))
+	checkError(t, objects.Put("t12e.cc/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("t12e.cc/alice/.password", []byte("secret")))
 	ctx := context.Background()
-	a, err := openJMAPAccount(ctx, "alice")
+	a, err := openJMAPAccount(ctx, "t12e.cc/alice")
 	checkError(t, err)
-	box, err := a.mailbox(ctx, "alice")
+	box, err := a.mailbox(ctx, "t12e.cc/alice")
 	checkError(t, err)
 	body := []byte("From: sender@example.com\r\nSubject: owner storage\r\nMessage-ID: <owner@example.com>\r\n\r\nhello\r\n")
 	id, err := a.importMail(ctx, box, body, nil, time.Now())
 	checkError(t, err)
-	backend := &jmapBackend{key: "alice/.jmap/state.json", store: objects}
+	backend := &jmapBackend{key: "t12e.cc/alice/.jmap/state.json", store: objects}
 	state, err := backend.owner()
 	checkError(t, err)
 	expected := ownerTestSnapshot(t, state)
@@ -2578,13 +2577,13 @@ func TestJMAPOwnerColdRecoveryAndLayout(t *testing.T) {
 			t.Fatal("account retained mail or indexes")
 		}
 	}
-	keys, err := objects.List("alice/")
+	keys, err := objects.List("t12e.cc/alice/")
 	checkError(t, err)
 	for _, key := range keys {
-		if key == state.key || key == "alice/.kind" || key == "alice/.password" {
+		if key == state.key || key == "t12e.cc/alice/.kind" || key == "t12e.cc/alice/.password" {
 			continue
 		}
-		if !strings.HasPrefix(key, "alice/mail/") {
+		if !strings.HasPrefix(key, "t12e.cc/alice/mail/") {
 			t.Fatalf("mail escaped prefix: %s", key)
 		}
 		if strings.HasSuffix(key, ".origin.json") {
@@ -2604,7 +2603,7 @@ func TestJMAPOwnerColdRecoveryAndLayout(t *testing.T) {
 	}
 	// Do not flush first: a killed process must recover the published decision.
 	remote := &ownerTestStore{objectStore: objects, versionedStore: objects.(versionedStore)}
-	cold, err := newJMAPAccount("alice", remote)
+	cold, err := newJMAPAccount("t12e.cc/alice", remote)
 	checkError(t, err)
 	coldBackend := &jmapBackend{key: state.key, store: remote}
 	recovered, err := coldBackend.owner()
@@ -2644,7 +2643,7 @@ func TestJMAPOwnerAtomicFailureAndIncrementalWrites(t *testing.T) {
 	base := &memoryObjects{data: map[string][]byte{}}
 	store := &ownerTestStore{objectStore: base, versionedStore: base}
 	ctx := context.Background()
-	b := &jmapBackend{key: "alice/.jmap/state.json", store: store}
+	b := &jmapBackend{key: "t12e.cc/alice/.jmap/state.json", store: store}
 	batch := &jbackend.Batch{}
 	userKey := jmapIndexKey("Aalice", "q")
 	mailKey := jmapIndexKey("Aalice", "o", "Thread", "T1")
@@ -2709,9 +2708,9 @@ func BenchmarkJMAPMetadataGet(b *testing.B) {
 				store := &memoryObjects{data: map[string][]byte{}}
 				var backend jbackend.Backend
 				if kind == "legacy" {
-					backend = &jmapLegacyBackend{key: "alice/.jmap/state.json", store: store}
+					backend = &jmapLegacyBackend{key: "t12e.cc/alice/.jmap/state.json", store: store}
 				} else {
-					backend = &jmapBackend{key: "alice/.jmap/state.json", store: store}
+					backend = &jmapBackend{key: "t12e.cc/alice/.jmap/state.json", store: store}
 				}
 				ctx := context.Background()
 				batch := &jbackend.Batch{}
@@ -2738,12 +2737,12 @@ func BenchmarkJMAPMetadataGet(b *testing.B) {
 func TestJMAPOwnerSubmissionDiscoveryAfterRestart(t *testing.T) {
 	base := &memoryObjects{data: map[string][]byte{}}
 	ctx := context.Background()
-	be := &jmapBackend{key: "alice/.jmap/state.json", store: base}
+	be := &jmapBackend{key: "t12e.cc/alice/.jmap/state.json", store: base}
 	batch := &jbackend.Batch{}
-	batch.Set(jmapIndexKey(string(jmapAccountID("alice")), "o", "EmailSubmission", "S1"), []byte(`{"id":"S1","undoStatus":"pending","sendAt":"2050-01-01T00:00:00Z"}`))
+	batch.Set(jmapIndexKey(string(jmapAccountID("t12e.cc/alice")), "o", "EmailSubmission", "S1"), []byte(`{"id":"S1","undoStatus":"pending","sendAt":"2050-01-01T00:00:00Z"}`))
 	checkError(t, be.WriteBatch(ctx, batch))
 	remote := &ownerTestStore{objectStore: base, versionedStore: base}
-	a, err := newJMAPAccount("alice", remote)
+	a, err := newJMAPAccount("t12e.cc/alice", remote)
 	checkError(t, err)
 	accounts, err := a.db.TaggedAccounts(ctx, "mail:submission-queued")
 	checkError(t, err)
@@ -2752,7 +2751,7 @@ func TestJMAPOwnerSubmissionDiscoveryAfterRestart(t *testing.T) {
 	}
 	roots, err := jmapAccountRoots(remote)
 	checkError(t, err)
-	if !slices.Contains(roots, "alice") {
+	if !slices.Contains(roots, "t12e.cc/alice") {
 		t.Fatal("account prefix discovery failed")
 	}
 	keys, err := base.List(".jmap-queue/")
@@ -2770,7 +2769,7 @@ type ownerNodeStore struct {
 func TestJMAPOwnerConcurrentNodes(t *testing.T) {
 	base := &memoryObjects{data: map[string][]byte{}}
 	ctx := context.Background()
-	initial := &jmapBackend{key: "alice/.jmap/state.json", store: base}
+	initial := &jmapBackend{key: "t12e.cc/alice/.jmap/state.json", store: base}
 	key := jmapIndexKey("Aalice", "q")
 	record := jmapIndexKey("Aalice", "o", "Thread", "T1")
 	batch := &jbackend.Batch{}
@@ -2840,14 +2839,14 @@ func TestJMAPOwnerConcurrentNodes(t *testing.T) {
 func TestJMAPLegacyPartLocatorIsMemoryOnly(t *testing.T) {
 	base := &memoryObjects{data: map[string][]byte{}}
 	blobs := jmapBlobs{store: base}
-	account := jmapAccountID("alice")
+	account := jmapAccountID("t12e.cc/alice")
 	source := jmap.Id("G" + strings.Repeat("a", 43))
 	partID := jmap.Id("G" + strings.Repeat("b", 43))
-	checkError(t, base.Put("alice/.jmap/blobs/"+string(source), []byte("Content-Type: text/plain\r\n\r\nhello")))
+	checkError(t, base.Put("t12e.cc/alice/.jmap/blobs/"+string(source), []byte("Content-Type: text/plain\r\n\r\nhello")))
 	writer := jmapPartWriter{store: blobs, account: account, id: partID, part: jmapPartManifest{Source: source, Size: 5}}
 	_, err := writer.Commit()
 	checkError(t, err)
-	keys, err := base.List("alice/")
+	keys, err := base.List("t12e.cc/alice/")
 	checkError(t, err)
 	if len(keys) != 1 {
 		t.Fatalf("locator persisted: %v", keys)
@@ -2859,5 +2858,267 @@ func TestJMAPLegacyPartLocatorIsMemoryOnly(t *testing.T) {
 	checkError(t, err)
 	if size != 5 || string(data) != "hello" {
 		t.Fatalf("bad legacy part: %d %q", size, data)
+	}
+}
+
+func TestDomainConfigurationRemoved(t *testing.T) {
+	for _, flag := range []string{"-domain", "-domains"} {
+		if _, err := loadConfig([]string{flag, "example.com"}, func(string) string { return "" }); err == nil {
+			t.Fatal("obsolete domain configuration accepted")
+		}
+	}
+}
+
+func multipleDomainTestStore(t *testing.T) {
+	outboundTestDir(t)
+	for _, domain := range []string{"example.com", "example.org"} {
+		checkError(t, objects.Put(domain+"/alice/.kind", []byte("account")))
+		checkError(t, objects.Put(domain+"/alice/.password", []byte(domain)))
+		checkError(t, objects.Put(domain+"/alias/.kind", []byte("alias")))
+		checkError(t, objects.Put(domain+"/alias/.alias", []byte("alice")))
+	}
+}
+
+func TestMultipleDomainIdentityIsolation(t *testing.T) {
+	multipleDomainTestStore(t)
+	for _, domain := range []string{"example.com", "example.org"} {
+		identity, err := authenticateAccount("ALICE@"+strings.ToUpper(domain), domain)
+		checkError(t, err)
+		if identity.RootID != domain+"/alice" {
+			t.Fatal(identity)
+		}
+		alias, err := authenticateAccount("alias@"+domain, domain)
+		checkError(t, err)
+		if alias.RootID != identity.RootID || alias.LoginID != domain+"/alias" {
+			t.Fatal(alias)
+		}
+	}
+	for _, address := range []string{"alice@example.net", "example.com/alice", "../alice@example.com", "alice@mail.example.org", "alice@example.com/../example.org"} {
+		if _, err := authenticateAccount(address, "example.com"); err == nil {
+			t.Fatalf("accepted %q", address)
+		}
+	}
+	if _, err := authenticateAccount("alice@example.org", "example.com"); err == nil {
+		t.Fatal("password crossed domain")
+	}
+	if localUser("alice") != "" {
+		t.Fatal("ambiguous bare name accepted")
+	}
+	checkError(t, objects.Put("example.com/alias/.alias", []byte("alice@example.org")))
+	if _, err := resolveIdentity("alias@example.com"); err == nil {
+		t.Fatal("alias crossed domain")
+	}
+	session := &smtpSession{requireAuth: true}
+	checkError(t, session.authenticate("", "alice@example.com", "example.com"))
+	if session.Mail("alice@example.org", nil) == nil {
+		t.Fatal("spoofed sender in another domain")
+	}
+	checkError(t, session.Mail("alice@example.com", nil))
+	checkError(t, session.Rcpt("alice@example.org", nil))
+	if !slices.Equal(session.recipients, []string{"example.org/alice"}) || len(session.remote) != 0 {
+		t.Fatal("hosted recipient routed externally")
+	}
+	if session.Rcpt("missing@example.org", nil) == nil {
+		t.Fatal("missing local account accepted")
+	}
+	if err := session.Rcpt("unsupported+tag@example.org", nil); err == nil {
+		t.Fatal("unsupported local account fell back to relay")
+	}
+	for _, root := range []string{"example.com/alice", "example.org/alice"} {
+		id := jmapAccountID(root)
+		got, err := jmapRoot(id)
+		checkError(t, err)
+		if got != root {
+			t.Fatal("account ID lost domain")
+		}
+	}
+	for _, key := range []string{"example.com/alice/mail/a/message.eml", "example.org/alice/.jmap/blobs/Gx"} {
+		bad, _ := json.Marshal(namedObjectReference{Key: "example.com/bob/mail/a/message.eml"})
+		if _, err := decodeObjectReference(key, bad); err == nil {
+			t.Fatal("reference escaped account")
+		}
+	}
+	bad, _ := json.Marshal(namedObjectReference{Key: "example.org/alice/mail/a/message.eml"})
+	if _, err := decodeObjectReference("example.com/alice/mail/a/ref", bad); err == nil {
+		t.Fatal("reference crossed domain")
+	}
+}
+
+func TestMultipleDomainSharedProtocolsAndRecovery(t *testing.T) {
+	multipleDomainTestStore(t)
+	old := useJMAP
+	useJMAP = true
+	t.Cleanup(func() { useJMAP = old })
+	ctx := context.Background()
+	body := "From: sender@outside.example\r\nTo: alice@example.org\r\nSubject: domain isolation\r\n\r\n" + strings.Repeat("hello\r\n", 100)
+	session := &smtpSession{}
+	checkError(t, session.Mail("sender@outside.example", nil))
+	checkError(t, session.Rcpt("alice@example.org", nil))
+	checkError(t, session.Data(strings.NewReader(body)))
+	a, err := openJMAPAccount(ctx, "example.com/alice")
+	checkError(t, err)
+	b, err := openJMAPAccount(ctx, "example.org/alice")
+	checkError(t, err)
+	for _, account := range []*jmapAccount{a, b} {
+		if account.CanSendAs(ctx, account.id, "alice@"+accountDomain(account.root)) != true {
+			t.Fatal("own sender denied")
+		}
+		other := "alice@example.org"
+		if account == b {
+			other = "alice@example.com"
+		}
+		if account.CanSendAs(ctx, account.id, other) {
+			t.Fatal("JMAP sender crossed domain")
+		}
+	}
+	first, err := messages(a.root)
+	checkError(t, err)
+	second, err := messages(b.root)
+	checkError(t, err)
+	if len(first) != 0 || len(second) != 1 || second[0].Uid != 1 {
+		t.Fatal("mailboxes not isolated")
+	}
+	refs, err := mailBlobRefs(ctx, b.root)
+	checkError(t, err)
+	r, _, err := openStoredMessage(ctx, second[0], refs)
+	checkError(t, err)
+	got, err := io.ReadAll(r)
+	r.Close()
+	checkError(t, err)
+	if string(got) != body {
+		t.Fatal("mail body differs")
+	}
+	// Explicit delivery between hosted domains must copy into the recipient's namespace.
+	session = &smtpSession{requireAuth: true}
+	checkError(t, session.authenticate("", "alice@example.com", "example.com"))
+	checkError(t, session.Mail("alice@example.com", nil))
+	checkError(t, session.Rcpt("alice@example.org", nil))
+	checkError(t, session.Data(strings.NewReader(body)))
+	second, err = messages(b.root)
+	checkError(t, err)
+	if len(second) != 2 || second[1].Uid != 2 {
+		t.Fatal("cross-domain delivery lost mail")
+	}
+	checkError(t, removeMessage(b.root, 1))
+	first, err = messages(a.root)
+	checkError(t, err)
+	if len(first) != 0 {
+		t.Fatal("recipient deletion changed sender inbox")
+	}
+	roots, err := jmapAccountRoots(objects)
+	checkError(t, err)
+	if !slices.Equal(roots, []string{"example.com/alias", a.root, "example.org/alias", b.root}) {
+		t.Fatal("account discovery", roots)
+	}
+	roots, err = jmapAccountRoots(objects, "example.org")
+	checkError(t, err)
+	if !slices.Equal(roots, []string{"example.org/alias", b.root}) {
+		t.Fatal("domain discovery", roots)
+	}
+	remote := &ownerTestStore{objectStore: objects, versionedStore: objects.(versionedStore)}
+	cold, err := newJMAPAccount(b.root, remote)
+	checkError(t, err)
+	result, err := cold.call(ctx, "Email/query", map[string]any{})
+	checkError(t, err)
+	if len(jvalue[[]jmap.Id](result, "ids")) != 1 {
+		t.Fatal("domain recovery lost email")
+	}
+	// A valid login for one domain must not authorize another domain's upload URL.
+	req := httptest.NewRequest(http.MethodPost, "http://localhost/upload/"+string(b.id), strings.NewReader("forbidden"))
+	req.SetBasicAuth("alice@example.com", "example.com")
+	rec := httptest.NewRecorder()
+	serveJMAP(rec, req)
+	if rec.Code < 400 {
+		t.Fatalf("cross-domain upload accepted: %d", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "http://localhost/.well-known/jmap", nil)
+	req.SetBasicAuth("alice@example.org", "example.org")
+	rec = httptest.NewRecorder()
+	serveJMAP(rec, req)
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), "https://mail.example.org") || !strings.Contains(rec.Body.String(), "alice@example.org") {
+		t.Fatal(rec.Code, rec.Body.String())
+	}
+	keys, err := objects.List("")
+	checkError(t, err)
+	for _, key := range keys {
+		if !strings.HasPrefix(key, "example.com/") && !strings.HasPrefix(key, "example.org/") {
+			t.Fatal("data escaped domains", key)
+		}
+	}
+}
+
+func TestMultipleDomainQueueAndLeaseIsolation(t *testing.T) {
+	multipleDomainTestStore(t)
+	old := useJMAP
+	useJMAP = false
+	t.Cleanup(func() { useJMAP = old })
+	now := time.Now()
+	a, err := lockBucket(objects, now, "example.com")
+	checkError(t, err)
+	b, err := lockBucket(objects, now, "example.org")
+	checkError(t, err)
+	if _, err := lockBucket(objects, now, "example.com"); !errors.Is(err, fs.ErrExist) {
+		t.Fatal("domain lease not exclusive", err)
+	}
+	checkError(t, a.renew(now.Add(time.Second)))
+	a.release(now.Add(2 * time.Second))
+	if !b.valid(now.Add(2 * time.Second)) {
+		t.Fatal("release crossed domains")
+	}
+	a, err = lockBucket(objects, now.Add(3*time.Second), "example.com")
+	checkError(t, err)
+	for _, domain := range []string{"example.com", "example.org"} {
+		checkError(t, queueMail(domain+"/alice", "alice@"+domain, nil, []string{"remote@outside.example"}, []byte("From: alice@"+domain+"\r\n\r\nhello")))
+	}
+	var workers sync.WaitGroup
+	var seen []string
+	_, err = scanTasks(context.Background(), a, make(chan struct{}, 2), &workers, func(c *claimedTask) error { seen = append(seen, c.key); return nil })
+	checkError(t, err)
+	workers.Wait()
+	if len(seen) != 1 || !strings.HasPrefix(seen[0], "example.com/.outbox/") {
+		t.Fatal("scanner crossed domains", seen)
+	}
+	keys, err := objects.List("example.org/.outbox/")
+	checkError(t, err)
+	if len(keys) != 1 {
+		t.Fatal(keys)
+	}
+	job, err := readJSON[*outboundJob](keys[0])
+	checkError(t, err)
+	if job.Preclaim != nil {
+		t.Fatal("other domain task was claimed")
+	}
+}
+
+func TestDomainPrefixDiscoveryWithoutConfiguration(t *testing.T) {
+	outboundTestDir(t)
+	// Old bucket-root credentials never serve as an implicit default domain.
+	checkError(t, objects.Put("alice/.kind", []byte("account")))
+	checkError(t, objects.Put("alice/.password", []byte("old")))
+	if authenticate("alice", "old") || authenticate("alice@t12e.cc", "old") {
+		t.Fatal("old bucket layout accepted")
+	}
+	if root, err := deliveryUser("alice@new.example"); err != nil || root != "" {
+		t.Fatal(root, err)
+	}
+	checkError(t, objects.Put("new.example/alice/.kind", []byte("account")))
+	checkError(t, objects.Put("new.example/alice/.password", []byte("new")))
+	if !authenticate("alice@new.example", "new") {
+		t.Fatal("new domain requires restart")
+	}
+	root, err := deliveryUser("missing@new.example")
+	checkError(t, err)
+	if root != "new.example/missing" {
+		t.Fatal("hosted missing account would be routed externally")
+	}
+	domains, err := domainNamespaces()
+	checkError(t, err)
+	if !slices.Contains(domains, "new.example") {
+		t.Fatal("scanner discovery missed new domain", domains)
+	}
+	checkError(t, objects.Delete("new.example/alice/.kind"))
+	checkError(t, objects.Delete("new.example/alice/.password"))
+	if root, err := deliveryUser("alice@new.example"); err != nil || root != "" {
+		t.Fatal("removed domain remained hosted", root, err)
 	}
 }

@@ -31,7 +31,7 @@ class Client:
     def request(self, path, data=None, content_type='application/json', expected=200, auth=True):
         headers = {'Content-Type': content_type}
         if auth:
-            headers['Authorization'] = 'Basic ' + base64.b64encode(f'{self.user}:{self.password}'.encode()).decode()
+            headers['Authorization'] = 'Basic ' + base64.b64encode(f'{self.user}@t12e.cc:{self.password}'.encode()).decode()
         req = urllib.request.Request(self.base + path, data=data, headers=headers)
         try:
             response = urllib.request.urlopen(req, timeout=45)
@@ -143,7 +143,7 @@ def verify_jmap(host, ports, tls, provision):
     print('PASS JMAP MIME import / binary and empty attachments / exact downloads / search / snippets / threads / pagination / state sync')
 
     with imaplib.IMAP4_SSL(host, ports[4], ssl_context=tls, timeout=45) as im:
-        im.login('jmap-alice', 'jmap-password')
+        im.login('jmap-alice@t12e.cc', 'jmap-password')
         assert im.select('INBOX')[0] == 'OK'
         uid = im.uid('search', None, 'HEADER', 'Message-ID', '<jmap-attachments@t12e.cc>')[1][0]
         assert uid
@@ -153,13 +153,13 @@ def verify_jmap(host, ports, tls, provision):
     assert a.call('Email/get', {'ids': [email_id]})['list'][0]['keywords']['$flagged']
     pop = poplib.POP3_SSL(host, ports[3], context=tls, timeout=45)
     try:
-        pop.user('jmap-alice'); pop.pass_('jmap-password')
+        pop.user('jmap-alice@t12e.cc'); pop.pass_('jmap-password')
         assert pop.stat()[0] == 1
         assert b'\r\n'.join(pop.retr(1)[1]) + b'\r\n' == raw
     finally:
         pop.quit()
     with smtplib.SMTP_SSL(host, ports[2], context=tls, timeout=45) as smtp:
-        smtp.login('jmap-bob', 'jmap-password')
+        smtp.login('jmap-bob@t12e.cc', 'jmap-password')
         smtp.sendmail('jmap-bob@t12e.cc', ['jmap-alice@t12e.cc'], b'From: jmap-bob@t12e.cc\r\nTo: jmap-alice@t12e.cc\r\nSubject: SMTP to JMAP\r\n\r\ninterop\r\n')
     assert a.call('Email/query', {'filter': {'subject': 'SMTP to JMAP'}})['ids']
     print('PASS shared JMAP / SMTP / IMAP / POP3 storage and flags')

@@ -29,8 +29,6 @@ services:
       FMA_RELAY_TLS: ${FMA_RELAY_TLS:-starttls}
       FMA_RELAY_CA_FILE: ${FMA_RELAY_CA_FILE:-}
     command:
-      - -domain
-      - ${FMA_DOMAIN:?Set FMA_DOMAIN in .env}
       - -cert
       - ${FMA_CERT_KEY:-cert.pem}
       - -key

@@ -8,7 +8,7 @@
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Jabberwocky238/fma/main/install.sh | bash
-FMA_S3_BUCKET=fma FMA_S3_ACCESS_KEY_ID=your-key FMA_S3_SECRET_ACCESS_KEY=your-secret fma -domain example.com
+FMA_S3_BUCKET=fma FMA_S3_ACCESS_KEY_ID=your-key FMA_S3_SECRET_ACCESS_KEY=your-secret fma
 ```
 
 **目录**
@@ -59,9 +59,9 @@ JMAP 与其他协议共用邮件记录和 MIME 对象。邮件相关数据保存
 
 ### 任务归属与故障恢复
 
-多个节点可以共享同一个桶。`.lock` 只控制外发任务扫描与领取，不阻塞协议流量或已领取任务。租约记录持有者、启动时间、续期时间和过期时间，每 15 秒续期，30 秒过期。释放时使用条件写标记过期，防止删掉后继节点的锁。节点时钟需要同步。
+多个节点可以共享同一个桶。`<domain>/.lock` 只控制外发任务扫描与领取，不阻塞协议流量或已领取任务。租约记录持有者、启动时间、续期时间和过期时间，每 15 秒续期，30 秒过期。释放时使用条件写标记过期，防止删掉后继节点的锁。节点时钟需要同步。
 
-锁持有者立即扫描 `.outbox/`，之后每 15 秒补扫一次。执行前使用条件 PUT 写入 preclaim。每节点最多持有 1024 个活动任务；一批领取 1024 个或达到容量时，立即释放扫描锁，下一轮扫描时再竞争。已经领取的任务继续执行。
+锁持有者立即扫描 `<domain>/.outbox/`，之后每 15 秒补扫一次。执行前使用条件 PUT 写入 preclaim。每节点最多持有 1024 个活动任务；一批领取 1024 个或达到容量时，立即释放扫描锁，下一轮扫描时再竞争。已经领取的任务继续执行。
 
 Preclaim 记录持有者、开始时间和固定 20 秒超时，不续期。到期取消执行，任务留在 S3，供下一轮重新领取；扫描节点宕机还需等待扫描锁过期。旧执行者无法通过过期 ETag 覆盖新执行者。
 
@@ -81,7 +81,6 @@ S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节�
 
 | 参数 | 二进制读取的环境变量 | 默认值 | 含义 |
 | --- | --- | --- | --- |
-| `-domain` | `—` | `t12e.cc` | 本地邮件域名 |
 | `-s3-endpoint` | `FMA_S3_ENDPOINT` | `empty / 空` | S3 端点；为空时使用 AWS |
 | `-s3-bucket` | `FMA_S3_BUCKET` | `required / 必填` | 已存在的桶 |
 | `-s3-region` | `FMA_S3_REGION` | `us-east-1` | S3 region |
@@ -118,8 +117,8 @@ S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节�
 
 | 生成器环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `FMA_DOMAIN` | `required / 必填` | Mail domain / 邮件域名 |
-| `FMA_JMAP_URL` | `https://mail.<domain>` | Public JMAP origin / JMAP 公开地址 |
+| `FMA_MAIL_HOST` | `required / 必填` | 生成 Nginx 和证书路径所用的公共服务主机名，不是托管域列表 |
+| `FMA_JMAP_URL` | `https://<mail-host>` | Public JMAP origin / JMAP 公开地址 |
 | `FMA_DEPLOY_USER` | `current user / 当前用户` | Service user / 服务用户 |
 | `FMA_DEPLOY_UID` | `selected user UID / 所选用户 UID` | Service UID / 服务 UID |
 | `FMA_DEPLOY_HOME` | `selected user home / 所选用户主目录` | Service home / 服务主目录 |
@@ -138,7 +137,7 @@ S3 和远端 SMTP 之间没有共同事务：远端已经接受邮件，但节�
 | `FMA_IMAP_PORT` | `1143` | Loopback listener port / 回环监听端口 |
 | `FMA_IMAPS_PORT` | `1993` | Loopback listener port / 回环监听端口 |
 | `FMA_HTTP_PORT` | `8080` | Loopback listener port / 回环监听端口 |
-| `FMA_LINEAGE` | `/etc/letsencrypt/live/mail.<domain>` | Certbot certificate directory / Certbot 证书目录 |
+| `FMA_LINEAGE` | `/etc/letsencrypt/live/<mail-host>` | Certbot certificate directory / Certbot 证书目录 |
 | `FMA_WEBROOT` | `/var/www/certbot` | ACME webroot / ACME 验证目录 |
 | `FMA_OVERWRITE` | `no` | Allow replacing generated configuration / 是否覆盖生成配置 |
 
@@ -240,7 +239,7 @@ make install
 每次询问前先读取对应环境变量；已设置时直接校验并使用，不再询问。环境变量无效时直接报错退出，日志不打印密钥。Kubernetes 或其他自动化环境可使用：
 
 ```sh
-export FMA_DOMAIN=example.com
+export FMA_MAIL_HOST=mail.example.com
 export FMA_S3_ENDPOINT=https://s3.example.com
 export FMA_S3_BUCKET=fma
 export FMA_S3_ACCESS_KEY_ID=your-access-key
@@ -253,7 +252,7 @@ bash deploy/gen.sh --non-interactive
 
 在 Linux 目标机上以生成配置中选定的用户执行 `make install`，它读取生成配置、编译二进制、安装对应的 systemd 服务和环境文件，再启用并重启服务。配置缺失会在编译或安装前报错。安装路径取自生成的 `install.mk`，修改路径需要重新生成。
 
-将生成的 `nginx-http.conf`、`nginx-https.conf` 放入 Nginx HTTP 上下文；`nginx-stream.conf` 放在顶层，位于 `http {}` 外。公开端口为标准邮件端口，上游回环端口与服务一致。HTTPS 证书需覆盖域名、`www.<domain>` 和 `mail.<domain>`。服务启动前上传初始证书和账户密码对象。
+将生成的 `nginx-http.conf`、`nginx-https.conf` 放入 Nginx HTTP 上下文；`nginx-stream.conf` 放在顶层，位于 `http {}` 外。公开端口为标准邮件端口，上游回环端口与服务一致。证书需覆盖公共服务主机名及客户端连接时使用的全部主机名。服务启动前上传初始证书和账户密码对象。
 
 将生成的 `renew-hook.sh` 安装为 root 执行的 Certbot deploy hook，使用服务用户的 S3 配置上传续期证书并重启用户服务。该集成需要 Bash、AWS CLI、Nginx、`runuser` 和 systemd；生成器本身只需要 Bash 和常规 Unix 工具。Nginx 配置和 root hook 需单独安装。
 
@@ -331,7 +330,7 @@ JMAP 使用 `fma-http` ClusterIP Service 和 `ingress.yaml`，HTTPS 证书同样
 JMAP 客户端使用 `https://mail.example.com/.well-known/jmap` 发现会话，通过 HTTP Basic 使用已有账户或别名及密码认证。从返回值读取 `apiUrl`、`uploadUrl`、`downloadUrl` 和 `primaryAccounts`，账户 ID 是不透明标识，不是登录名。公开地址不同时设置 `FMA_JMAP_URL`。HTTP 后端应放在 HTTPS 代理之后；`/` 仍是无需认证的活性检查。
 
 ```sh
-export JMAP_USER=alice
+export JMAP_USER=alice@example.com
 export JMAP_PASSWORD='your-password'
 curl --fail --user "$JMAP_USER:$JMAP_PASSWORD" \
   https://mail.example.com/.well-known/jmap
@@ -446,9 +445,17 @@ goreleaser release --snapshot --clean
 
 ## 6. 桶布局
 
+### 多邮件域名
+
+从桶的一级 prefix 自动发现托管域，不需要 `-domain`、`-domains` 或域名列表环境变量。创建 `example.com/alice/.password` 和 `example.com/alice/.kind`，即可使用 `alice@example.com`；在 `example.org/` 下配置同名账户，两者密码和邮箱独立。登录必须填写完整邮箱地址。新增域和账户可立即收信，外发扫描器每 15 秒发现新域。
+
+账户状态、邮件和附件保存在 `<域名>/<账户>/` 内；每个域独立使用 `.outbox/` 和 `.lock`，JMAP account ID 和缓存也包含域名。正常跨域投递或显式 proxy 转发会在目标账户保存数据。托管域中的未知账户直接拒绝，不转为外部投递。
+
+不兼容旧的桶根账户布局，不执行迁移，请直接按新布局配置账户。证书和中继连接配置仍由整个服务共用，保留在域 prefix 外。证书须覆盖客户端实际连接的主机名，中继须允许所有托管域的发件地址。`FMA_JMAP_URL` 可指定所有账户共用的 JMAP 入口；未指定时按账户域公布 `https://mail.<域名>`。SMTP greeting/EHLO 使用 JMAP URL 的主机名，未配置 URL 时使用操作系统主机名。
+
 ### 账户类型
 
-每个 ID 都是桶根目录下的前缀。**必须存在 `<id>/.kind`**，且只允许以下三种类型。类型唯一决定行为，其他类型残留的配置文件不会生效，避免冲突。
+每个账户位于 `<domain>/<id>/`。**必须存在 `<domain>/<id>/.kind`**，且只允许以下三种类型。类型唯一决定行为，其他类型残留的配置文件不会生效，避免冲突。
 
 | `.kind` | 具体配置 | 行为 |
 | --- | --- | --- |
@@ -460,46 +467,46 @@ goreleaser release --snapshot --clean
 
 ```sh
 printf '%s' 'your-password' | curl -f -X PUT --data-binary @- \
-  http://127.0.0.1:9000/fma/alice/.password
+  http://127.0.0.1:9000/fma/example.com/alice/.password
 printf '%s' account | curl -f -X PUT --data-binary @- \
-  http://127.0.0.1:9000/fma/alice/.kind
+  http://127.0.0.1:9000/fma/example.com/alice/.kind
 ```
 
 设置 `.kind=account` 后，覆盖 `.password` 修改密码，删除密码对象后新的登录与本地 SMTP 收件人检查会被拒绝，无需重启。已认证会话不会自动撤销。
 
-用户名为 1–64 个小写字母、数字、点、连字符或下划线，首字符必须是字母或数字。密码不能为空或包含内嵌换行，末尾 CR/LF 会被去除。密码以明文对象存储，依靠桶的访问控制保护。每次认证和本地收件人检查均读取 S3，没有账户列表或密码缓存。
+登录必须使用完整邮箱地址，例如 `alice@example.com`；不接受裸用户名或存储路径。本地用户名为 1–64 个小写字母、数字、点、连字符或下划线，首字符必须是字母或数字。密码不能为空或包含内嵌换行，末尾 CR/LF 会被去除。密码以明文对象存储，依靠桶的访问控制保护。每次认证和本地收件人检查均读取 S3，没有账户列表或密码缓存。
 
-设置 `<alias>/.kind=alias`，在 `<alias>/.alias` 写入目标本地 ID，即可在外部配置别名。别名保留自己的前缀，使用根账户密码并共享根邮箱。每次登录和收件人检查都会解析别名链，拒绝循环引用和不存在的账户。`.profile.json` 等隐藏元信息对象不会被当作邮件。协议会话区分登录 ID 与根 ID；SMTP、POP3 和 IMAP 不提供头像或个人资料管理 API。
+设置 `<domain>/<alias>/.kind=alias`，在 `<domain>/<alias>/.alias` 写入同域的目标本地 ID，即可在外部配置别名。跨域转发使用 proxy 的完整目标地址。别名保留自己的前缀，使用根账户密码并共享根邮箱。每次登录和收件人检查都会解析别名链，拒绝循环引用和不存在的账户。`.profile.json` 等隐藏元信息对象不会被当作邮件。协议会话区分登录 ID 与根 ID；SMTP、POP3 和 IMAP 不提供头像或个人资料管理 API。
 
-代理设置为 `<id>/.kind=proxy`，在 `.proxy` 中写入一个完整目标邮箱地址。本地目标直接解析投递；外部目标进入 S3 持久化队列，需要启用 `direct` 或 `relay`。未经认证的外部来信可以投递到已配置的本地代理，但不能自行选择任意外部目标。
+代理设置为 `<domain>/<id>/.kind=proxy`，在 `.proxy` 中写入一个完整目标邮箱地址。本地目标直接解析投递；外部目标进入 S3 持久化队列，需要启用 `direct` 或 `relay`。未经认证的外部来信可以投递到已配置的本地代理，但不能自行选择任意外部目标。
 
 转发保持 MIME 正文和附件不变，对外转发时只增加 `X-FMA-Proxy-Hops` 头用于限制循环。别名/代理本地解析最多 16 跳，外部代理转发最多 16 跳。每次 RCPT 都读取 S3 路由，接受邮件后任务保存当时的目标，修改代理不影响已入队邮件。多个收件人指向同一目标时只投递一次。
 
-转发保留原信封发件人，尚未实现 SRS 重写，目标方的发件人策略仍可能拒绝转发邮件。永久失败会把不含邮件正文的诊断信息保存到 `<proxy>/.proxy-errors/<task-id>.json`，随后同步删除任务及 preclaim，不给代理创建实体邮箱。
+转发保留原信封发件人，尚未实现 SRS 重写，目标方的发件人策略仍可能拒绝转发邮件。永久失败会把不含邮件正文的诊断信息保存到 `<domain>/<proxy>/.proxy-errors/<task-id>.json`，随后同步删除任务及 preclaim，不给代理创建实体邮箱。
 
 `.kind` 缺失或值无效时拒绝登录和投递。**已有账户需通过外部工具补上 `.kind=account`，已有别名补上 `.kind=alias`。** 不提供自动迁移或注册 API。切换类型时先准备新类型配置，最后替换 `.kind`。
 
 | 对象键 | 内容 |
 | --- | --- |
-| `<id>/.kind` | account / alias / proxy |
-| `<account>/.password` | Account password / 账户密码 |
-| `<alias>/.alias` | Target local ID / 目标本地 ID |
-| `<proxy>/.proxy` | Forwarding address / 转发邮箱地址 |
-| `<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body / 无正文的失败诊断 |
-| `<account>/.jmap/state.json` | 最小账户状态：文件夹、身份、UID/状态计数、账户租约和当前事务决定；不保存邮件记录或查询索引 |
-| `<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | 流式写入的不可变 MIME 或上传附件；超过 10 MiB 使用 gzip |
+| `<domain>/<id>/.kind` | account / alias / proxy |
+| `<domain>/<account>/.password` | Account password / 账户密码 |
+| `<domain>/<alias>/.alias` | Target local ID / 目标本地 ID |
+| `<domain>/<proxy>/.proxy` | Forwarding address / 转发邮箱地址 |
+| `<domain>/<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body / 无正文的失败诊断 |
+| `<domain>/<account>/.jmap/state.json` | 最小账户状态：文件夹、身份、UID/状态计数、账户租约和当前事务决定；不保存邮件记录或查询索引 |
+| `<domain>/<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | 流式写入的不可变 MIME 或上传附件；超过 10 MiB 使用 gzip |
 | `<physical-object>.blob-<blobId>.json` | 与正文/附件同目录的不可变 blob 描述，记录物理对象和编码/大小；blobId 到描述文件的查找表仅在内存中 |
-| `<account>/mail/<mail-id>/attachments/<part-id>/<escaped-filename>` | 解码后的 MIME 部件，超过 1 MiB 使用 gzip |
+| `<domain>/<account>/mail/<mail-id>/attachments/<part-id>/<escaped-filename>` | 解码后的 MIME 部件，超过 1 MiB 使用 gzip |
 | `<blob-descriptor>.mime.json` | 同邮件 prefix 内的 MIME 结构、部件哈希、大小和预览 |
-| `<account>/mail/<mail-id>/.fma/*.fma.json` | 邮件记录及单邮件变更历史 |
-| `<account>/mail/.records/`, `mail/.history/`, `mail/.uploads/` | 线程/提交记录、批量变更历史、正文发布前登记的上传记录 |
+| `<domain>/<account>/mail/<mail-id>/.fma/*.fma.json` | 邮件记录及单邮件变更历史 |
+| `<domain>/<account>/mail/.records/`, `mail/.history/`, `mail/.uploads/` | 线程/提交记录、批量变更历史、正文发布前登记的上传记录 |
 | `<owner-record>.prepare.<transaction>` | 条件提交前写入的不可变事务记录；不属于查询索引 |
-| `<account>/.jmap/blobs/*` | 旧版正文、描述、MIME 元数据和部件定位记录的兼容读取路径 |
-| `.outbox/<id>.json` | SMTP outbound task and embedded preclaim / SMTP 外发任务及内嵌 preclaim |
-| `.lock` | Shared 15-second scan/renewal lease / 共享的 15 秒扫描与续期租约 |
+| `<domain>/<account>/.jmap/blobs/*` | 旧版正文、描述、MIME 元数据和部件定位记录的兼容读取路径 |
+| `<domain>/.outbox/<id>.json` | SMTP outbound task and embedded preclaim / SMTP 外发任务及内嵌 preclaim |
+| `<domain>/.lock` | Shared 15-second scan/renewal lease / 共享的 15 秒扫描与续期租约 |
 | `cert.pem, key.pem` | TLS certificate and key unless mounted from a Secret / TLS 证书与私钥，Secret 挂载时不需要 |
 
-旧版本的 `<account>/<uid>.json`、`next`、`folders` 和 `.folders/` 在该账户第一次访问时转换为共享元数据，保留原始对象。新元数据完整生成后才通过条件创建发布，失败不会发布半个邮箱；UID 和已有文件夹存储标识保留。升级前停止所有旧版本节点，不能混跑旧存储写入器和新版本。旧对象不会再接收更新，可在验证备份及新邮箱后通过外部工具清理。二进制不提供注册或管理命令。未引用的上传与 MIME 对象留在 S3，不使用本地临时文件或新增后台清理器。
+服务只使用域名/账户布局，不发现或迁移旧的桶根邮箱。二进制不提供注册或管理命令。未引用的上传与 MIME 对象留在 S3，不使用本地暂存目录或后台清理器。
 
 邮件物理目录 ID 使用 `subject + UTC timestamp`，时间戳精确到纳秒。
 主题先解码 RFC 2047，再与文件名分别做百分号转义；`/`、`%`、`?`、`#`、Unicode、单独的 `.` 和 `..` 不会改变路径层级，并限制各段长度。S3 条件创建保证时间戳或名称碰撞时报错，不覆盖已有内容。

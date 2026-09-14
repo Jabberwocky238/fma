@@ -1,7 +1,7 @@
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
-    server_name @@DOMAIN@@ www.@@DOMAIN@@ mail.@@DOMAIN@@;
+    server_name @@MAIL_HOST@@;
     ssl_certificate @@LINEAGE@@/fullchain.pem;
     ssl_certificate_key @@LINEAGE@@/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;

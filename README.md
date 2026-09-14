@@ -67,13 +67,13 @@ JMAP and the other protocols share mail records and MIME objects under each acco
 
 ### Queue ownership and recovery
 
-Multiple nodes may share a bucket. `.lock` controls outbound scanning and claiming;
+Multiple nodes may share a bucket. `<domain>/.lock` controls outbound scanning and claiming;
 it does not block protocol traffic or previously claimed jobs. The lease records
 its owner, start time, renewal time, and expiry. It renews every 15 seconds and expires
 after 30 seconds, allowing one interval of renewal slack. Release conditionally marks
 the lease expired, avoiding deletion of a successor's lock. Keep node clocks synchronized.
 
-The holder scans `.outbox/` immediately and every 15 seconds. Before execution, it
+The holder scans `<domain>/.outbox/` immediately and every 15 seconds. Before execution, it
 claims each eligible task with a conditional PUT. A node holds at most 1024 active
 tasks. Claiming a batch of 1024 or reaching capacity immediately releases the scanner
 lease; the node waits until the next scan interval before competing again. Already
@@ -109,7 +109,6 @@ Command-line values override the corresponding environment variables, then defau
 
 | Flag | Environment read by the binary | Default | Meaning |
 | --- | --- | --- | --- |
-| `-domain` | `—` | `t12e.cc` | Local mail domain |
 | `-s3-endpoint` | `FMA_S3_ENDPOINT` | `empty` | S3 endpoint; empty selects AWS |
 | `-s3-bucket` | `FMA_S3_BUCKET` | `required` | Existing bucket |
 | `-s3-region` | `FMA_S3_REGION` | `us-east-1` | S3 region |
@@ -146,8 +145,8 @@ The generator also reads the table below. S3, relay, outbound and logging enviro
 
 | Generator environment variable | Default | Purpose |
 | --- | --- | --- |
-| `FMA_DOMAIN` | `required` | Mail domain |
-| `FMA_JMAP_URL` | `https://mail.<domain>` | Public JMAP origin |
+| `FMA_MAIL_HOST` | `required` | Public service hostname for generated Nginx and certificate paths; not a hosted-domain list |
+| `FMA_JMAP_URL` | `https://<mail-host>` | Public JMAP origin |
 | `FMA_DEPLOY_USER` | `current user` | Service user |
 | `FMA_DEPLOY_UID` | `selected user UID` | Service UID |
 | `FMA_DEPLOY_HOME` | `selected user home` | Service home |
@@ -166,7 +165,7 @@ The generator also reads the table below. S3, relay, outbound and logging enviro
 | `FMA_IMAP_PORT` | `1143` | Loopback listener port |
 | `FMA_IMAPS_PORT` | `1993` | Loopback listener port |
 | `FMA_HTTP_PORT` | `8080` | Loopback listener port |
-| `FMA_LINEAGE` | `/etc/letsencrypt/live/mail.<domain>` | Certbot certificate directory |
+| `FMA_LINEAGE` | `/etc/letsencrypt/live/<mail-host>` | Certbot certificate directory |
 | `FMA_WEBROOT` | `/var/www/certbot` | ACME webroot |
 | `FMA_OVERWRITE` | `no` | Allow replacing generated configuration |
 
@@ -297,12 +296,12 @@ bash deploy/gen.sh
 make install
 ```
 
-The generator asks for the domain, Linux service user and UID, installation paths,
+The generator asks for the public service hostname, Linux service user and UID, installation paths,
 S3 connection and credentials, certificate object keys, outbound settings, retry
 delay, local protocol ports, and Certbot paths. Secret input is hidden on a terminal.
 Each field is checked before continuing. Malformed domains, IPv4/IPv6 addresses,
 endpoint URLs, relay addresses, paths and ports show an error and repeat that prompt.
-Non-secret surrounding whitespace is trimmed and mail domains are lowercased.
+Non-secret surrounding whitespace is trimmed and the service hostname is lowercased.
 Press Enter to accept defaults such as region `us-east-1`; secrets are preserved
 verbatim. Validation checks syntax, while the server checks S3 access at startup.
 Templates live in `deploy/template/` and use `@@NAME@@` placeholders. Generated
@@ -315,7 +314,7 @@ validated and used without asking; invalid environment values fail immediately a
 secrets are not echoed. For unattended deployments (including Kubernetes setup):
 
 ```sh
-export FMA_DOMAIN=example.com
+export FMA_MAIL_HOST=mail.example.com
 export FMA_S3_ENDPOINT=https://s3.example.com
 export FMA_S3_BUCKET=fma
 export FMA_S3_ACCESS_KEY_ID=your-access-key
@@ -339,8 +338,7 @@ generated `install.mk`; regenerate configuration to change them.
 Install `nginx-http.conf` and `nginx-https.conf` from `deploy/generated/` in the Nginx
 HTTP context. The generated `nginx-stream.conf` belongs at the top level, outside
 `http {}`. Public mail ports are standard; upstream loopback ports match the generated
-service. The HTTPS certificate must cover the configured domain, `www.<domain>`,
-and `mail.<domain>`. Upload the initial TLS certificate and account password objects
+service. The certificate must cover the configured service hostname and every hostname used by mail clients. Upload the initial TLS certificate and account password objects
 to S3 before starting the mail service.
 
 Install `deploy/generated/renew-hook.sh` as a root-run Certbot deploy hook. It uploads
@@ -360,7 +358,7 @@ See [Docker's multi-stage build documentation](https://docs.docker.com/build/bui
 
 ```sh
 cp .env.example .env
-# Edit .env: set your domain, S3 endpoint/bucket and credentials.
+# Edit .env: set your JMAP service URL, S3 endpoint/bucket and credentials.
 # Upload cert.pem, key.pem and account objects to that bucket first.
 docker compose up -d --build
 docker compose logs -f fma
@@ -402,7 +400,7 @@ They share the same S3 bucket. The TCP Service exposes the seven mail ports; a s
 connects the JMAP backend to the Ingress. Your cluster must support LoadBalancer services, or you can
 adapt its type to your existing TCP entry point.
 
-Edit `deploy/kubernetes/configmap.yaml` for your domain and S3 endpoint/bucket.
+Edit `deploy/kubernetes/configmap.yaml` for your public JMAP URL and S3 endpoint/bucket.
 TLS comes directly from the Kubernetes `fma-tls` Secret (`kubernetes.io/tls`), mounted
 read-only at `/run/fma/tls`. Use an existing cert-manager Secret by changing
 `secretName` in `deployment.yaml`, or create one before applying the deployment:
@@ -453,7 +451,7 @@ IDs are opaque, not the login name. Set `FMA_JMAP_URL` when the public origin di
 The HTTP listener is behind your HTTPS proxy; `/` remains the unauthenticated health check.
 
 ```sh
-export JMAP_USER=alice
+export JMAP_USER=alice@example.com
 export JMAP_PASSWORD='your-password'
 curl --fail --user "$JMAP_USER:$JMAP_PASSWORD" \
   https://mail.example.com/.well-known/jmap
@@ -652,9 +650,17 @@ These workflows expect this project directory to be the GitHub repository root.
 
 ## 6. Bucket layout
 
+### Multiple mail domains
+
+Hosted domains are discovered from the bucket's first-level prefixes. There is no `-domain`, `-domains`, or domain-list environment setting. Provision `example.com/alice/.password` and `example.com/alice/.kind`; provision the same paths under `example.org/` for an independent `alice@example.org` account. Log in with the complete address. New accounts and domains can receive mail immediately; outbound scanners discover new domains every 15 seconds.
+
+All account state, messages and attachments stay inside `<domain>/<account>/`. Each domain has its own `.outbox/` and `.lock`; JMAP account IDs and caches include both domain and account. Delivery or explicit proxy forwarding between hosted domains creates data in the destination account. An unknown account in a hosted domain is rejected rather than forwarded externally.
+
+Old bucket-root account layouts are not supported or migrated. Create accounts using the new layout. Certificates and relay connection settings remain service-wide, outside domain prefixes. A common certificate must cover the hostnames clients use, and a shared relay must permit all sending domains. `FMA_JMAP_URL` optionally selects one public JMAP origin for all accounts; otherwise each account advertises `https://mail.<its-domain>`. SMTP greeting/EHLO uses the configured JMAP hostname, or the OS hostname when no URL is configured.
+
 ### Account kinds
 
-Each ID is a bucket-root prefix. **`<id>/.kind` is required** and selects exactly
+Each account lives under `<domain>/<id>/`. **`<domain>/<id>/.kind` is required** and selects exactly
 one type; configuration files for other types are ignored, so stale files cannot
 silently change routing or authentication.
 
@@ -669,30 +675,30 @@ Prepare the type-specific object first, then write `.kind` to activate it:
 
 ```sh
 printf '%s' 'your-password' | curl -f -X PUT --data-binary @- \
-  http://127.0.0.1:9000/fma/alice/.password
+  http://127.0.0.1:9000/fma/example.com/alice/.password
 printf '%s' account | curl -f -X PUT --data-binary @- \
-  http://127.0.0.1:9000/fma/alice/.kind
+  http://127.0.0.1:9000/fma/example.com/alice/.kind
 ```
 
 Once `.kind=account` exists, overwriting `.password` changes the password;
 deleting it rejects subsequent logins and local SMTP recipient checks. No server
 restart is needed. Existing authenticated sessions are not automatically revoked.
 
-Usernames contain 1–64 lowercase letters, digits, dots, hyphens, or underscores,
+Log in with the full email address, such as `alice@example.com`; bare usernames and storage paths are rejected. The local part contains 1–64 lowercase letters, digits, dots, hyphens, or underscores,
 starting with a letter or digit. Passwords must be nonempty and contain no embedded
 newlines; trailing CR/LF characters are stripped. Password objects contain plaintext
 credentials, protected by the bucket's access controls. Authentication and local
 recipient checks read S3 on every request, without an account list or password cache.
 
-Alias accounts are provisioned externally: set `<alias>/.kind` to `alias` and put
-the target local ID in `<alias>/.alias`.
+Alias accounts are provisioned externally: set `<domain>/<alias>/.kind` to `alias` and put
+the target local ID in `<domain>/<alias>/.alias`. Aliases stay within their own domain; use an explicit proxy address for forwarding between domains.
 The alias keeps its own prefix and uses the root account password and mailbox.
 Alias chains are resolved on each login and recipient lookup; cycles and missing
 accounts are rejected. Hidden metadata objects such as `.profile.json` are excluded
 from mail listings. Protocol logins retain the login ID separately from the root ID;
 SMTP, POP3 and IMAP do not expose an avatar/profile management API.
 
-For forwarding, write the destination address to `<id>/.proxy` and set `.kind` to
+For forwarding, write the destination address to `<domain>/<id>/.proxy` and set `.kind` to
 `proxy`. The destination may be local or external. Local targets resolve immediately;
 external forwarding uses the durable S3 outbound queue and requires `direct` or `relay`.
 Unauthenticated inbound SMTP may deliver to a configured local proxy, but cannot
@@ -705,7 +711,7 @@ proxy affects later SMTP transactions, not already queued mail. Multiple recipie
 forwarding to the same destination produce one delivery. Forwarding preserves the
 original envelope sender; no SRS rewriting is implemented, so the destination's
 sender policy can still reject forwarded mail. Permanent failures are recorded as
-metadata under `<proxy>/.proxy-errors/<task-id>.json`, without retaining the message
+metadata under `<domain>/<proxy>/.proxy-errors/<task-id>.json`, without retaining the message
 body. The completed task and its preclaim are then removed together.
 
 Missing or invalid `.kind` values reject login and delivery. **Existing accounts
@@ -715,25 +721,25 @@ type, prepare its new configuration first and replace `.kind` last.
 
 | Object key | Contents |
 | --- | --- |
-| `<id>/.kind` | account / alias / proxy |
-| `<account>/.password` | Account password |
-| `<alias>/.alias` | Target local ID |
-| `<proxy>/.proxy` | Forwarding address |
-| `<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body |
-| `<account>/.jmap/state.json` | Minimal account state: folders, identities, UID/state counters, lease and current transaction decision; no mail records or query indexes |
-| `<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | Immutable streamed MIME or uploaded attachment bytes; gzip above 10 MiB |
+| `<domain>/<id>/.kind` | account / alias / proxy |
+| `<domain>/<account>/.password` | Account password |
+| `<domain>/<alias>/.alias` | Target local ID |
+| `<domain>/<proxy>/.proxy` | Forwarding address |
+| `<domain>/<proxy>/.proxy-errors/<id>.json` | Failure diagnostic without body |
+| `<domain>/<account>/.jmap/state.json` | Minimal account state: folders, identities, UID/state counters, lease and current transaction decision; no mail records or query indexes |
+| `<domain>/<account>/mail/<escaped-subject>_<timestamp>/<escaped-filename>` | Immutable streamed MIME or uploaded attachment bytes; gzip above 10 MiB |
 | `<physical-object>.blob-<blobId>.json` | Immutable blob descriptor beside its bytes, recording the physical object and encoding/size; the ID lookup table exists only in memory |
-| `<account>/mail/<mail-id>/attachments/<part-id>/<escaped-filename>` | Decoded MIME parts; gzip above 1 MiB |
+| `<domain>/<account>/mail/<mail-id>/attachments/<part-id>/<escaped-filename>` | Decoded MIME parts; gzip above 1 MiB |
 | `<blob-descriptor>.mime.json` | MIME structure, part identities, sizes and preview under the same mail prefix |
-| `<account>/mail/<mail-id>/.fma/*.fma.json` | Email records and single-message change history |
-| `<account>/mail/.records/`, `mail/.history/`, `mail/.uploads/` | Threads/submissions, batch change history and upload records registered before content publication |
+| `<domain>/<account>/mail/<mail-id>/.fma/*.fma.json` | Email records and single-message change history |
+| `<domain>/<account>/mail/.records/`, `mail/.history/`, `mail/.uploads/` | Threads/submissions, batch change history and upload records registered before content publication |
 | `<owner-record>.prepare.<transaction>` | Immutable transaction record written before conditional publication; not a query index |
-| `<account>/.jmap/blobs/*` | Compatibility reads of legacy content, descriptors, MIME metadata and part locators |
-| `.outbox/<id>.json` | SMTP outbound task and embedded preclaim |
-| `.lock` | Shared 15-second scan/renewal lease |
+| `<domain>/<account>/.jmap/blobs/*` | Compatibility reads of legacy content, descriptors, MIME metadata and part locators |
+| `<domain>/.outbox/<id>.json` | SMTP outbound task and embedded preclaim |
+| `<domain>/.lock` | Shared 15-second scan/renewal lease |
 | `cert.pem, key.pem` | TLS certificate and key unless mounted from a Secret |
 
-Legacy `<account>/<uid>.json`, `next`, `folders` and `.folders/` data is converted on the account's first access, retaining the original objects. A conditional create publishes the complete metadata image; failures cannot publish a partial mailbox. Existing UIDs and folder storage identities are preserved. Stop every old-version node before upgrading; do not mix legacy writers with the new version. Old objects no longer receive updates and may be cleaned externally after verifying backups and the new mailbox. The binary exposes no registration or management commands. Unreferenced uploads and MIME objects remain in S3; no local temporary files or new background garbage collector are used.
+The server uses only the domain/account layout; it does not discover or migrate old bucket-root mailboxes. The binary exposes no registration or management commands. Unreferenced uploads and MIME objects remain in S3; no local spool or background garbage collector is used.
 
 Physical mail directory IDs are `subject + UTC timestamp` with nanosecond precision.
 RFC 2047 subjects are decoded, and each subject/filename path segment is percent-escaped

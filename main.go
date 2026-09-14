@@ -83,7 +83,7 @@ import (
 // Config is loaded once before startup; serving code only reads this snapshot.
 type Config struct {
 	StreamWorkers                                          int
-	Domain, CertFile, KeyFile, TLSDir, JMAPURL             string
+	CertFile, KeyFile, TLSDir, JMAPURL                     string
 	SMTPAddr, SubmissionAddr, SMTPSAddr                    string
 	POP3Addr, POP3SAddr, IMAPAddr, IMAPSAddr, HTTPAddr     string
 	OutboundMode                                           string
@@ -166,7 +166,6 @@ func loadConfig(args []string, lookupEnv func(string) string) (Config, error) {
 	f := flag.NewFlagSet("fma", flag.ContinueOnError)
 	var streamWorkers string
 	f.StringVar(&streamWorkers, "stream-workers", getenv("STREAM_WORKERS", strconv.Itoa(defaultStreamWorkers)), "parallel MIME ingestion workers (1-128)")
-	f.StringVar(&c.Domain, "domain", "t12e.cc", "local email domain")
 	f.StringVar(&c.S3.Endpoint, "s3-endpoint", getenv("S3_ENDPOINT", ""), "S3 endpoint URL; empty for AWS")
 	f.StringVar(&c.S3.Bucket, "s3-bucket", getenv("S3_BUCKET", ""), "existing S3 bucket for all persistent data")
 	f.StringVar(&c.S3.Region, "s3-region", getenv("S3_REGION", "us-east-1"), "S3 region")
@@ -220,17 +219,8 @@ func checkConfig(c Config) error {
 			return fmt.Errorf("FMA_S3_ENDPOINT must be an HTTP(S) URL without credentials, query or fragment")
 		}
 	}
-	// Queue inspection does not need an outbound transport.
 	if c.ShowQueue {
 		return nil
-	}
-	if c.Domain == "" || len(c.Domain) > 253 {
-		return fmt.Errorf("domain is required and must be a DNS name")
-	}
-	for _, label := range strings.Split(c.Domain, ".") {
-		if !regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`).MatchString(label) {
-			return fmt.Errorf("invalid mail domain")
-		}
 	}
 	if c.JMAPURL != "" {
 		u, err := url.Parse(c.JMAPURL)
@@ -384,7 +374,7 @@ func run() error {
 	for i := 0; i < 3; i++ {
 		s := smtp.NewServer(smtpBackend{requireAuth: i != 0})
 		s.ErrorLog = slog.NewLogLogger(logger.Handler(), slog.LevelError)
-		s.Domain = "mail." + config.Domain
+		s.Domain = serverHostname()
 		s.TLSConfig = cfg
 		s.MaxMessageBytes = maxMailSize
 		s.MaxRecipients = 100
@@ -635,15 +625,16 @@ type lockRecord struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 type bucketLease struct {
-	store    objectStore
-	versions versionedStore
-	mu       sync.Mutex
-	record   lockRecord
-	lost     error
+	namespace string
+	store     objectStore
+	versions  versionedStore
+	mu        sync.Mutex
+	record    lockRecord
+	lost      error
 }
 
-func readLock(store versionedStore) (lockRecord, string, error) {
-	data, etag, err := store.GetVersion(".lock")
+func readLock(store versionedStore, namespace string) (lockRecord, string, error) {
+	data, etag, err := store.GetVersion(leaseKey(namespace))
 	if err != nil {
 		return lockRecord{}, "", err
 	}
@@ -653,7 +644,12 @@ func readLock(store versionedStore) (lockRecord, string, error) {
 	}
 	return record, etag, nil
 }
-func lockBucket(store objectStore, now time.Time) (*bucketLease, error) {
+func leaseKey(namespace string) string { return namespace + "/.lock" }
+func lockBucket(store objectStore, now time.Time, domain string) (*bucketLease, error) {
+	if !validMailDomain(domain) {
+		return nil, fmt.Errorf("invalid scanner domain")
+	}
+	key := leaseKey(domain)
 	versions, ok := store.(versionedStore)
 	if !ok {
 		return nil, fmt.Errorf("S3 backend requires ETags and conditional updates")
@@ -664,21 +660,21 @@ func lockBucket(store objectStore, now time.Time) (*bucketLease, error) {
 	}
 	record := lockRecord{Owner: hex.EncodeToString(id[:]), StartedAt: now.UTC(), RenewedAt: now.UTC(), ExpiresAt: now.Add(leaseTTL).UTC()}
 	data, _ := json.Marshal(record)
-	previous, etag, err := readLock(versions)
+	previous, etag, err := readLock(versions, domain)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		err = store.Create(".lock", data)
+		err = store.Create(key, data)
 	case err != nil:
 		return nil, err
 	case now.Before(previous.ExpiresAt):
 		return nil, fmt.Errorf("scanner locked until %s: %w", previous.ExpiresAt.Format(time.RFC3339Nano), fs.ErrExist)
 	default:
-		err = versions.Swap(".lock", data, etag)
+		err = versions.Swap(key, data, etag)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("acquire bucket lease: %w", err)
 	}
-	return &bucketLease{store: store, versions: versions, record: record}, nil
+	return &bucketLease{namespace: domain, store: store, versions: versions, record: record}, nil
 }
 func (l *bucketLease) owner() string {
 	l.mu.Lock()
@@ -707,7 +703,7 @@ func (l *bucketLease) renew(now time.Time) error {
 	if !l.valid(now) {
 		return fmt.Errorf("bucket lease expired")
 	}
-	current, etag, err := readLock(l.versions)
+	current, etag, err := readLock(l.versions, l.namespace)
 	if err != nil {
 		return err
 	}
@@ -720,7 +716,7 @@ func (l *bucketLease) renew(now time.Time) error {
 	current.RenewedAt = now.UTC()
 	current.ExpiresAt = now.Add(leaseTTL).UTC()
 	data, _ := json.Marshal(current)
-	if err := l.versions.Swap(".lock", data, etag); err != nil {
+	if err := l.versions.Swap(leaseKey(l.namespace), data, etag); err != nil {
 		return err
 	}
 	l.mu.Lock()
@@ -729,7 +725,7 @@ func (l *bucketLease) renew(now time.Time) error {
 	return nil
 }
 func (l *bucketLease) release(now time.Time) {
-	current, etag, err := readLock(l.versions)
+	current, etag, err := readLock(l.versions, l.namespace)
 	l.mu.Lock()
 	owner := l.record.Owner
 	l.mu.Unlock()
@@ -739,7 +735,7 @@ func (l *bucketLease) release(now time.Time) {
 	current.ExpiresAt = now.UTC()
 	data, _ := json.Marshal(current)
 	// An expired record remains so release cannot race a new owner via DELETE.
-	if err := l.versions.Swap(".lock", data, etag); err != nil && !errors.Is(err, fs.ErrExist) {
+	if err := l.versions.Swap(leaseKey(l.namespace), data, etag); err != nil && !errors.Is(err, fs.ErrExist) {
 		logger.Error(fmt.Sprintf("release bucket lease: %v", err))
 	}
 }
@@ -834,15 +830,100 @@ func loadRelayObjects(c *Config) error {
 var mu sync.Mutex
 var usernameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
+// Domain/account is the only account layout. Protocol usernames are complete
+// email addresses; accepting a storage path here would bypass address validation.
+var domainLabelRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+func validMailDomain(domain string) bool {
+	if domain == "" || len(domain) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if !domainLabelRE.MatchString(label) {
+			return false
+		}
+	}
+	return true
+}
+
+// SMTP identifies the service host, independently of the domains it hosts.
+func serverHostname() string {
+	if u, err := url.Parse(config.JMAPURL); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	name, err := os.Hostname()
+	if err == nil && validMailDomain(strings.ToLower(name)) {
+		return strings.ToLower(name)
+	}
+	return "localhost"
+}
+func accountRoot(domain, user string) string { return domain + "/" + user }
+func validAccountRoot(root string) bool {
+	domain, user, ok := strings.Cut(root, "/")
+	return ok && validMailDomain(domain) && usernameRE.MatchString(user)
+}
+func accountDomain(root string) string {
+	domain, _, ok := strings.Cut(root, "/")
+	if ok && validMailDomain(domain) {
+		return domain
+	}
+	return ""
+}
+func accountAddress(root string) string { return path.Base(root) + "@" + accountDomain(root) }
+func accountFromKey(key string) string {
+	domain, rest, _ := strings.Cut(key, "/")
+	user, _, _ := strings.Cut(rest, "/")
+	return domain + "/" + user
+}
 func localUser(address string) string {
-	parts := strings.Split(strings.ToLower(address), "@")
-	if len(parts) > 2 || len(parts) == 2 && parts[1] != config.Domain && parts[1] != "mail."+config.Domain {
+	user, domain, ok := strings.Cut(strings.ToLower(address), "@")
+	if !ok || !usernameRE.MatchString(user) || !validMailDomain(domain) {
 		return ""
 	}
-	if !usernameRE.MatchString(parts[0]) {
-		return ""
+	return accountRoot(domain, user)
+}
+
+// Check only whether a domain prefix exists, not whether a particular recipient
+// exists. Unknown accounts in hosted domains must never fall back to external SMTP.
+func domainHasObjects(store objectStore, domain string) (bool, error) {
+	if guard, ok := store.(*guardedStore); ok {
+		guard.mu.RLock()
+		defer guard.mu.RUnlock()
+		if guard.closed {
+			return false, net.ErrClosed
+		}
+		return domainHasObjects(guard.base, domain)
 	}
-	return parts[0]
+	prefix := domain + "/"
+	if bucket, ok := store.(*s3Bucket); ok {
+		ctx, cancel := bucket.requestContext()
+		defer cancel()
+		result, err := bucket.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket.bucket, Prefix: &prefix, MaxKeys: aws.Int32(1)})
+		if err != nil {
+			return false, err
+		}
+		return len(result.Contents) > 0, nil
+	}
+	keys, err := store.List(prefix)
+	return len(keys) > 0, err
+}
+func deliveryUser(address string) (string, error) {
+	_, domain, ok := strings.Cut(strings.ToLower(address), "@")
+	if !ok || !validMailDomain(domain) {
+		return "", nil
+	}
+	local, err := domainHasObjects(objects, domain)
+	if err != nil {
+		return "", err
+	}
+	if !local {
+		return "", nil
+	}
+	root := localUser(address)
+	if root == "" {
+		return "", fs.ErrNotExist
+	}
+	return root, nil
 }
 
 type identityKind string
@@ -854,7 +935,7 @@ const (
 )
 
 func readKind(id string) (identityKind, error) {
-	if !usernameRE.MatchString(id) {
+	if !validAccountRoot(id) {
 		return "", fs.ErrNotExist
 	}
 	data, err := objects.Get(path.Join(id, ".kind"))
@@ -877,7 +958,7 @@ func aliasTarget(id string) (string, error) {
 	if !usernameRE.MatchString(target) {
 		return "", fs.ErrNotExist
 	}
-	return target, nil
+	return accountRoot(accountDomain(id), target), nil
 }
 
 // Aliases keep their own prefix; credentials and mailbox data belong to RootID.
@@ -937,7 +1018,7 @@ func authenticateAccount(address, password string) (accountIdentity, error) {
 
 // Read credentials on every login/RCPT; external S3 changes take effect at once.
 func userPassword(user string) ([]byte, error) {
-	if !usernameRE.MatchString(user) {
+	if !validAccountRoot(user) {
 		return nil, fs.ErrNotExist
 	}
 	data, err := objects.Get(path.Join(user, ".password"))
@@ -1492,12 +1573,11 @@ func resolveDelivery(user string) (local, remote, owner string, err error) {
 			if owner == "" {
 				owner = user
 			}
-			next := localUser(target)
+			next, routeErr := deliveryUser(target)
+			if routeErr != nil {
+				return "", "", "", routeErr
+			}
 			if next == "" {
-				domain := strings.ToLower(target[strings.LastIndex(target, "@")+1:])
-				if domain == config.Domain || domain == "mail."+config.Domain {
-					return "", "", "", fs.ErrNotExist
-				}
 				return "", target, owner, nil
 			}
 			user = next
@@ -1525,15 +1605,17 @@ func proxyBody(body []byte) ([]byte, error) {
 func (s *smtpSession) Rcpt(to string, _ *smtp.RcptOptions) error {
 	mu.Lock()
 	defer mu.Unlock()
-	u := localUser(to)
+	u, routeErr := deliveryUser(to)
+	if routeErr != nil {
+		if errors.Is(routeErr, fs.ErrNotExist) {
+			return &smtp.SMTPError{Code: 550, Message: "unknown local recipient"}
+		}
+		return &smtp.SMTPError{Code: 451, Message: "domain storage unavailable"}
+	}
 	if u == "" {
 		address, err := mail.ParseAddress(to)
 		if err != nil || address.Address != to || !strings.Contains(to, "@") || strings.ContainsAny(to, "\r\n") {
 			return &smtp.SMTPError{Code: 553, Message: "invalid recipient"}
-		}
-		target := strings.ToLower(to[strings.LastIndex(to, "@")+1:])
-		if target == config.Domain || target == "mail."+config.Domain {
-			return &smtp.SMTPError{Code: 550, Message: "unknown local recipient"}
 		}
 		if s.user == "" {
 			return &smtp.SMTPError{Code: 550, Message: "authentication required for external delivery"}
@@ -1695,7 +1777,7 @@ func (p *popMailbox) AuthenticateMechanisms() []string { return []string{"PLAIN"
 func (p *popMailbox) AuthenticatePlain(ctx context.Context, identity, user, password string) error {
 	if identity != "" {
 		a, err := resolveIdentity(identity)
-		b, otherErr := resolveIdentity(user)
+		b, otherErr := resolveIdentity(accountAddress(user))
 		if err != nil || otherErr != nil || a.RootID != b.RootID {
 			return &pop3server.Error{Code: "AUTH", Message: "identity mismatch"}
 		}
@@ -2177,6 +2259,23 @@ func (h *mailboxSelect) Handle(c server.Conn) error {
 
 const outbox = ".outbox"
 
+// Discover hosted domains from bucket prefixes on each scheduler sweep.
+func domainNamespaces() ([]string, error) {
+	prefixes, err := storePrefixes(objects, "")
+	if err != nil {
+		return nil, err
+	}
+	var domains []string
+	for _, prefix := range prefixes {
+		domain := strings.TrimSuffix(prefix, "/")
+		if validMailDomain(domain) {
+			domains = append(domains, domain)
+		}
+	}
+	return domains, nil
+}
+func queueDirectory(root string) string { return path.Join(accountDomain(root), outbox) }
+
 type outboundRecipient struct {
 	ProxyOwners []string `json:"proxy_owners,omitempty"`
 	Address     string
@@ -2242,7 +2341,14 @@ func queueMail(user, from string, local, remote []string, body []byte, proxies .
 		return err
 	}
 	job.Archived = true
-	if err := writeJSON(path.Join(outbox, job.ID+".json"), job); err != nil {
+	owner := user
+	if owner == "" && len(proxies) > 0 {
+		owner = proxies[0].Owner
+	}
+	if owner == "" && len(local) > 0 {
+		owner = local[0]
+	}
+	if err := writeJSON(path.Join(queueDirectory(owner), job.ID+".json"), job); err != nil {
 		return err
 	}
 	logger.Info(fmt.Sprintf("outbound queued id=%s recipients=%d", job.ID, len(remote)))
@@ -2250,16 +2356,27 @@ func queueMail(user, from string, local, remote []string, body []byte, proxies .
 }
 
 func listQueue() error {
-	return eachJSON(outbox, func(_ string, job *outboundJob, err error) error {
+	namespaces, err := domainNamespaces()
+	if err != nil {
+		return err
+	}
+	for _, namespace := range namespaces {
+		err := eachJSON(path.Join(namespace, outbox), func(_ string, job *outboundJob, err error) error {
+			if err != nil {
+				return err
+			}
+			for _, r := range job.Recipients {
+				fmt.Printf("%s %s %s attempts=%d next=%s error=%q\n", path.Join(namespace, job.ID), r.Address, r.State, r.Attempts, r.Next.Format(time.RFC3339), r.Error)
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		for _, r := range job.Recipients {
-			fmt.Printf("%s %s %s attempts=%d next=%s error=%q\n", job.ID, r.Address, r.State, r.Attempts, r.Next.Format(time.RFC3339), r.Error)
-		}
-		return nil
-	})
+	}
+	return nil
 }
+
 func (claim *claimedTask) process(ctx context.Context) error {
 	job := claim.job
 	if !job.Archived {
@@ -2333,7 +2450,7 @@ func (claim *claimedTask) process(ctx context.Context) error {
 			}
 		}
 		for user, failed := range notices {
-			notice := fmt.Sprintf("From: mailer-daemon@%s\r\nTo: %s@%s\r\nDate: %s\r\nMessage-ID: <%s-failure@mail.%s>\r\nSubject: Delivery failed [%s]\r\nContent-Type: text/plain; charset=utf-8\r\nAuto-Submitted: auto-replied\r\n\r\nOutbound delivery failed. Queue ID: %s\r\n%s\r\n", config.Domain, user, config.Domain, time.Now().Format(time.RFC1123Z), job.ID, config.Domain, job.ID, job.ID, strings.Join(failed, "\r\n"))
+			notice := fmt.Sprintf("From: mailer-daemon@%s\r\nTo: %s@%s\r\nDate: %s\r\nMessage-ID: <%s-failure@mail.%s>\r\nSubject: Delivery failed [%s]\r\nContent-Type: text/plain; charset=utf-8\r\nAuto-Submitted: auto-replied\r\n\r\nOutbound delivery failed. Queue ID: %s\r\n%s\r\n", accountDomain(user), path.Base(user), accountDomain(user), time.Now().Format(time.RFC1123Z), job.ID, accountDomain(user), job.ID, job.ID, strings.Join(failed, "\r\n"))
 			// Failure notices stay local and never re-enter proxy routing.
 			if err := deliver([]string{user}, []byte(notice)); err != nil {
 				return err
@@ -2446,7 +2563,8 @@ func scanTasks(ctx context.Context, lease *bucketLease, slots chan struct{}, wor
 	if !lease.valid(time.Now()) {
 		return false, fmt.Errorf("scanner lease expired")
 	}
-	keys, err := objects.List(outbox + "/")
+	directory := path.Join(lease.namespace, outbox)
+	keys, err := objects.List(directory + "/")
 	if err != nil {
 		return false, err
 	}
@@ -2455,7 +2573,7 @@ func scanTasks(ctx context.Context, lease *bucketLease, slots chan struct{}, wor
 		if ctx.Err() != nil || !lease.valid(time.Now()) {
 			break
 		}
-		if path.Dir(key) != outbox || !strings.HasSuffix(key, ".json") {
+		if path.Dir(key) != directory || !strings.HasSuffix(key, ".json") {
 			continue
 		}
 		if len(slots) == cap(slots) || claimed == maxClaimedTasks {
@@ -2469,7 +2587,11 @@ func scanTasks(ctx context.Context, lease *bucketLease, slots chan struct{}, wor
 			continue
 		}
 		claimed++
-		slots <- struct{}{}
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
@@ -2490,10 +2612,55 @@ func scanTasks(ctx context.Context, lease *bucketLease, slots chan struct{}, wor
 }
 
 func serveQueue(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	active := map[string]context.CancelFunc{}
+	defer func() { cancel(); workers.Wait() }()
+	ticker := time.NewTicker(taskScanEvery)
+	defer ticker.Stop()
+	failures := make(chan error, 1)
+	slots := make(chan struct{}, maxClaimedTasks)
+	for {
+		domains, err := domainNamespaces()
+		if err != nil {
+			return fmt.Errorf("discover mail domains: %w", err)
+		}
+		for domain, stop := range active {
+			if !slices.Contains(domains, domain) {
+				stop()
+				delete(active, domain)
+			}
+		}
+		for _, domain := range domains {
+			if _, exists := active[domain]; exists {
+				continue
+			}
+			domainCtx, stop := context.WithCancel(ctx)
+			active[domain] = stop
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				if err := serveDomainQueue(domainCtx, domain, slots); err != nil {
+					select {
+					case failures <- err:
+					default:
+					}
+				}
+			}()
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-failures:
+			return err
+		case <-ticker.C:
+		}
+	}
+}
+func serveDomainQueue(ctx context.Context, namespace string, slots chan struct{}) error {
 	ticker := time.NewTicker(taskScanEvery)
 	defer ticker.Stop()
 	var workers sync.WaitGroup
-	slots := make(chan struct{}, maxClaimedTasks)
 	var lease *bucketLease
 	var stop context.CancelFunc
 	var done <-chan struct{}
@@ -2517,7 +2684,7 @@ func serveQueue(ctx context.Context) error {
 			}
 			if lease == nil && len(slots) < maxClaimedTasks {
 				var err error
-				lease, err = lockBucket(objects, time.Now())
+				lease, err = lockBucket(objects, time.Now(), namespace)
 				if err == nil {
 					var leaseCtx context.Context
 					leaseCtx, stop = context.WithCancel(ctx)
@@ -2613,7 +2780,7 @@ func sendSMTP(ctx context.Context, address string, job *outboundJob, recipient s
 		return err
 	}
 	defer client.Close()
-	if err = client.Hello("mail." + config.Domain); err != nil {
+	if err = client.Hello(serverHostname()); err != nil {
 		return err
 	}
 	if !implicit {
@@ -3617,7 +3784,7 @@ func jmapRoot(acct jmap.Id) (string, error) {
 	}
 	data, err := hex.DecodeString(string(acct)[1:])
 	root := string(data)
-	if err != nil || !usernameRE.MatchString(root) {
+	if err != nil || !validAccountRoot(root) {
 		return "", jauth.ErrUnauthenticated
 	}
 	return root, nil
@@ -4191,7 +4358,7 @@ func newJMAPAccount(root string, store objectStore) (*jmapAccount, error) {
 	for _, err := range []error{
 		jmail.RegisterMailbox(a.proc, jmail.MailboxConfig{DB: a.db, Core: core}),
 		jmail.RegisterThread(a.proc, jmail.ThreadConfig{DB: a.db, Core: core}),
-		jmail.RegisterEmail(a.proc, jmail.EmailConfig{DB: a.db, Store: a.blobs, Core: core, AccountCapability: jmapMailCapability(), Searcher: jsearch.New(a.blobs, jsearch.DefaultConfig()), MessageIDDomain: config.Domain, InternalProperties: map[string]jdescriptor.Property{"fmaUIDs": {Kind: jdescriptor.KindObject, Default: json.RawMessage(`{}`)}}}),
+		jmail.RegisterEmail(a.proc, jmail.EmailConfig{DB: a.db, Store: a.blobs, Core: core, AccountCapability: jmapMailCapability(), Searcher: jsearch.New(a.blobs, jsearch.DefaultConfig()), MessageIDDomain: accountDomain(root), InternalProperties: map[string]jdescriptor.Property{"fmaUIDs": {Kind: jdescriptor.KindObject, Default: json.RawMessage(`{}`)}}}),
 		jmail.RegisterIdentity(a.proc, jmail.IdentityConfig{DB: a.db, Core: core, Policy: a}),
 	} {
 		if err != nil {
@@ -4285,7 +4452,7 @@ func jmapCore() jmap.CoreCapabilities {
 	return c
 }
 func (a *jmapAccount) identity() *jauth.Identity {
-	return &jauth.Identity{Username: a.root, Primary: a.id, Accounts: map[jmap.Id]jauth.Access{a.id: {Name: a.root + "@" + config.Domain, Personal: true}}}
+	return &jauth.Identity{Username: a.root, Primary: a.id, Accounts: map[jmap.Id]jauth.Access{a.id: {Name: accountAddress(a.root), Personal: true}}}
 }
 func (a *jmapAccount) CanSend(ctx context.Context, id jmap.Id) (bool, string) {
 	if err := ctx.Err(); err != nil {
@@ -4294,7 +4461,7 @@ func (a *jmapAccount) CanSend(ctx context.Context, id jmap.Id) (bool, string) {
 	if id != a.id {
 		return false, "account not accessible"
 	}
-	root, err := resolveIdentity(a.root)
+	root, err := resolveIdentity(accountAddress(a.root))
 	return err == nil && root.RootID == a.root, "account is unavailable"
 }
 func (a *jmapAccount) CanSendAs(ctx context.Context, id jmap.Id, address string) bool {
@@ -4305,7 +4472,7 @@ func (a *jmapAccount) CanSendAs(ctx context.Context, id jmap.Id, address string)
 	if user == "" {
 		return false
 	}
-	root, err := resolveIdentity(user)
+	root, err := resolveIdentity(accountAddress(user))
 	return err == nil && root.RootID == a.root
 }
 func jraw(value any) json.RawMessage {
@@ -4565,7 +4732,7 @@ func (a *jmapAccount) messages(ctx context.Context, key string) ([]*memory.Messa
 	return result, ids, nil
 }
 func jmapForKey(key string) (*jmapAccount, error) {
-	return openJMAPAccount(context.Background(), strings.SplitN(key, "/", 2)[0])
+	return openJMAPAccount(context.Background(), accountFromKey(key))
 }
 func jmapUpdateCatalog(user string, change func(map[string]folderMeta) error) error {
 	ctx := context.Background()
@@ -4683,7 +4850,7 @@ var jmapAccounts = struct {
 }{items: map[jmapOwnerCacheKey]*jmapAccountReady{}}
 
 func openJMAPAccount(ctx context.Context, root string) (*jmapAccount, error) {
-	if !usernameRE.MatchString(root) {
+	if !validAccountRoot(root) {
 		return nil, jauth.ErrUnauthenticated
 	}
 	key := jmapOwnerCacheKey{objects, root}
@@ -4748,7 +4915,7 @@ func serveJMAPOwnerFlush(ctx context.Context) error {
 	}
 }
 func openJMAPAccountUncached(ctx context.Context, root string) (*jmapAccount, error) {
-	if !usernameRE.MatchString(root) {
+	if !validAccountRoot(root) {
 		return nil, jauth.ErrUnauthenticated
 	}
 	key := root + "/.jmap/state.json"
@@ -4817,7 +4984,7 @@ func openJMAPAccountUncached(ctx context.Context, root string) (*jmapAccount, er
 			return nil, err
 		}
 	}
-	if _, err = a.call(ctx, "Identity/set", jmapSetRequest[jmapIdentityCreate]{Create: map[string]jmapIdentityCreate{"fma": {Name: root, Email: root + "@" + config.Domain}}}); err != nil {
+	if _, err = a.call(ctx, "Identity/set", jmapSetRequest[jmapIdentityCreate]{Create: map[string]jmapIdentityCreate{"fma": {Name: root, Email: accountAddress(root)}}}); err != nil {
 		return nil, err
 	}
 	if err = ctx.Err(); err != nil {
@@ -4972,7 +5139,7 @@ func serveJMAP(w http.ResponseWriter, r *http.Request) {
 	auth.Username = identity.LoginID
 	base := config.JMAPURL
 	if base == "" {
-		base = "https://mail." + config.Domain
+		base = "https://mail." + accountDomain(identity.RootID)
 	}
 	srv, err := jruntime.NewServer(jmapAuth{auth}, a.proc, base, jmapCore())
 	if err != nil {
@@ -5073,7 +5240,11 @@ func (sender jmapSubmitter) Submit(ctx context.Context, env jsubmit.Envelope, r 
 		}
 		var sendErr error
 		address := rcpt.Email
-		if user := localUser(address); user != "" {
+		user, routeErr := deliveryUser(address)
+		if routeErr != nil {
+			return results, routeErr
+		}
+		if user != "" {
 			local, remote, _, err := resolveDelivery(user)
 			if err != nil {
 				sendErr = &textproto.Error{Code: 550, Msg: "recipient unavailable"}
@@ -5090,7 +5261,7 @@ func (sender jmapSubmitter) Submit(ctx context.Context, env jsubmit.Envelope, r 
 			if !outboundEnabled() {
 				sendErr = &textproto.Error{Code: 550, Msg: "external delivery disabled"}
 			} else {
-				sendErr = sendRemote(ctx, &outboundJob{From: env.MailFrom, Blob: ref}, address)
+				sendErr = sendRemote(ctx, &outboundJob{User: sender.root, From: env.MailFrom, Blob: ref}, address)
 			}
 		}
 		result := jsubmit.Result{Recipient: rcpt.Email, Outcome: jmail.Accepted, Reply: "250 2.0.0 delivered"}
@@ -5110,43 +5281,69 @@ func (sender jmapSubmitter) Submit(ctx context.Context, env jsubmit.Envelope, r 
 
 // Delimiter listing discovers accounts without listing every message and
 // without a persistent queue/account index. Small test stores use flat listing.
-func jmapAccountRoots(store objectStore) ([]string, error) {
+// Delimiter listing bounds discovery to one directory level on real S3.
+func storePrefixes(store objectStore, prefix string) ([]string, error) {
 	if guard, ok := store.(*guardedStore); ok {
 		guard.mu.RLock()
 		defer guard.mu.RUnlock()
-		if guard.closed || guard.lease != nil && !guard.lease.valid(time.Now()) {
+		if guard.closed {
 			return nil, net.ErrClosed
 		}
-		return jmapAccountRoots(guard.base)
+		return storePrefixes(guard.base, prefix)
 	}
+	found := map[string]bool{}
 	if bucket, ok := store.(*s3Bucket); ok {
 		ctx, cancel := bucket.requestContext()
 		defer cancel()
-		pages := s3.NewListObjectsV2Paginator(bucket.client, &s3.ListObjectsV2Input{Bucket: &bucket.bucket, Delimiter: aws.String("/")})
-		var roots []string
+		pages := s3.NewListObjectsV2Paginator(bucket.client, &s3.ListObjectsV2Input{Bucket: &bucket.bucket, Prefix: &prefix, Delimiter: aws.String("/")})
 		for pages.HasMorePages() {
 			page, err := pages.NextPage(ctx)
 			if err != nil {
 				return nil, err
 			}
-			for _, prefix := range page.CommonPrefixes {
-				root := strings.TrimSuffix(aws.ToString(prefix.Prefix), "/")
-				if usernameRE.MatchString(root) {
-					roots = append(roots, root)
-				}
+			for _, item := range page.CommonPrefixes {
+				found[aws.ToString(item.Prefix)] = true
 			}
 		}
-		return roots, nil
+	} else {
+		keys, err := store.List(prefix)
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range keys {
+			rest := strings.TrimPrefix(key, prefix)
+			part, _, ok := strings.Cut(rest, "/")
+			if ok {
+				found[prefix+part+"/"] = true
+			}
+		}
 	}
-	keys, err := store.List("")
-	if err != nil {
-		return nil, err
+	return slices.Sorted(maps.Keys(found)), nil
+}
+func jmapAccountRoots(store objectStore, namespaces ...string) ([]string, error) {
+	if len(namespaces) == 0 {
+		prefixes, err := storePrefixes(store, "")
+		if err != nil {
+			return nil, err
+		}
+		for _, prefix := range prefixes {
+			domain := strings.TrimSuffix(prefix, "/")
+			if validMailDomain(domain) {
+				namespaces = append(namespaces, domain)
+			}
+		}
 	}
 	var roots []string
-	for _, key := range keys {
-		root, suffix, _ := strings.Cut(key, "/")
-		if suffix == ".jmap/state.json" && usernameRE.MatchString(root) {
-			roots = append(roots, root)
+	for _, namespace := range namespaces {
+		prefixes, err := storePrefixes(store, namespace+"/")
+		if err != nil {
+			return nil, err
+		}
+		for _, prefix := range prefixes {
+			root := strings.TrimSuffix(prefix, "/")
+			if validAccountRoot(root) {
+				roots = append(roots, root)
+			}
 		}
 	}
 	return roots, nil
@@ -5156,12 +5353,15 @@ func scanJMAPTasks(ctx context.Context, lease *bucketLease, limit int) (int, err
 	if limit <= 0 {
 		return 0, nil
 	}
-	roots, err := jmapAccountRoots(objects)
+	roots, err := jmapAccountRoots(objects, lease.namespace)
 	if err != nil {
 		return 0, err
 	}
 	count := 0
 	for _, root := range roots {
+		if accountDomain(root) != lease.namespace {
+			continue
+		}
 		if ctx.Err() != nil || !lease.valid(time.Now()) || count >= limit {
 			break
 		}
@@ -5764,8 +5964,8 @@ func decodeObjectReference(key string, data []byte) (namedObjectReference, error
 	if err := json.Unmarshal(data, &ref); err != nil {
 		return ref, err
 	}
-	root, _, _ := strings.Cut(key, "/")
-	if !usernameRE.MatchString(root) || !strings.HasPrefix(ref.Key, root+"/mail/") || path.Clean(ref.Key) != ref.Key || len(ref.Key) > 1024 {
+	root := accountFromKey(key)
+	if !validAccountRoot(root) || !strings.HasPrefix(ref.Key, root+"/mail/") || path.Clean(ref.Key) != ref.Key || len(ref.Key) > 1024 {
 		return ref, fmt.Errorf("object reference escapes account")
 	}
 	if ref.Metadata["fma-reference"] != "" {
@@ -5857,9 +6057,9 @@ func (b *s3Bucket) CopyStream(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return err
 	}
-	srcRoot, _, _ := strings.Cut(src, "/")
-	dstRoot, _, _ := strings.Cut(dst, "/")
-	if !usernameRE.MatchString(dstRoot) {
+	srcRoot := accountFromKey(src)
+	dstRoot := accountFromKey(dst)
+	if !validAccountRoot(dstRoot) {
 		return fmt.Errorf("invalid destination account")
 	}
 	if srcRoot != dstRoot {
@@ -6775,7 +6975,7 @@ func (s *smtpSession) streamData(r io.Reader) error {
 		job.Recipients = append(job.Recipients, recipient)
 	}
 	if len(job.Recipients) > 0 {
-		if err = writeJSON(path.Join(outbox, job.ID+".json"), job); err != nil {
+		if err = writeJSON(path.Join(queueDirectory(owner), job.ID+".json"), job); err != nil {
 			return err
 		}
 	}
